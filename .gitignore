@@ -51,3 +51,4 @@ data/test/kuairand-1k*
 tmp/
 docker/requirements*
 experiments/
+ft_scripts/
