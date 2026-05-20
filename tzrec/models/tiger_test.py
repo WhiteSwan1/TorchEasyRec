@@ -334,17 +334,9 @@ class TigerSepInjectionTest(unittest.TestCase):
 
 
 class TigerConfigResolutionTest(unittest.TestCase):
-    """Verify the group/feature-name resolution from config works correctly.
+    """Group/feature-name resolution from model_config.feature_groups."""
 
-    Tiger reads `cfg.history_group_name` (default "history") and
-    `cfg.user_group_name` (default "user") from its proto, then looks
-    those up in `model_config.feature_groups` to discover the actual
-    feature_name. This decouples Tiger from hardcoded naming
-    conventions; users can rename freely.
-    """
-
-    def test_custom_history_group_and_feature_names(self) -> None:
-        """User renames both group and feature — Tiger should adapt."""
+    def test_custom_group_and_feature_names(self) -> None:
         torch.manual_seed(0)
         mc = _build_proto(
             codebook="8,8,8",
@@ -352,145 +344,38 @@ class TigerConfigResolutionTest(unittest.TestCase):
             history_feature_name="encoded_user_history",
         )
         model = Tiger(mc, features=[], labels=["label_sids"])
-        self.assertEqual(model._history_data_group, "my_sid_seq")
+        self.assertEqual(model._history_group_name, "my_sid_seq")
         self.assertEqual(model._history_feature_name, "encoded_user_history")
-
-        # Forward pass with the custom names.
-        history_values = torch.tensor([1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4], dtype=torch.long)
-        history_lengths = torch.tensor([6, 6], dtype=torch.long)
         history_kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["encoded_user_history"],  # match the renamed feature
-            values=history_values,
-            lengths=history_lengths,
+            keys=["encoded_user_history"],
+            values=torch.tensor(
+                [1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4], dtype=torch.long
+            ),
+            lengths=torch.tensor([6, 6], dtype=torch.long),
         )
         label_jt = JaggedTensor(
             values=torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long),
             lengths=torch.tensor([3, 3], dtype=torch.long),
         )
         batch = Batch(
-            sparse_features={"my_sid_seq": history_kjt},  # match renamed group
+            sparse_features={"my_sid_seq": history_kjt},
             jagged_labels={"label_sids": label_jt},
         )
         model.train()
         out = model.predict(batch)
         self.assertEqual(out[DECODER_HIDDEN_KEY].shape, (2, 3, 16))
 
-    def test_history_lookup_robust_to_extra_groups(self) -> None:
-        """Adding an unrelated group before 'history' doesn't fool the lookup."""
-        torch.manual_seed(0)
-        mc = _build_proto(codebook="8,8,8")
-        model = Tiger(mc, features=[], labels=["label_sids"])
-        model.train()
-        batch = _build_batch(
-            history_sids_per_user=[[1, 2, 3, 4, 5, 6], [7, 0, 1, 2, 3, 4]],
-            label_sids_per_user=[[1, 2, 3], [4, 5, 6]],
-        )
-        sentinel_kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["sentinel"],
-            values=torch.tensor([99, 98, 97, 96], dtype=torch.long),
-            lengths=torch.tensor([2, 2], dtype=torch.long),
-        )
-        # "sideinfo" placed BEFORE "history" in dict-insertion order.
-        batch.sparse_features = {
-            "sideinfo": sentinel_kjt,
-            "history": batch.sparse_features["history"],
-        }
-        out = model.predict(batch)
-        self.assertEqual(out[DECODER_HIDDEN_KEY].shape, (2, 3, 16))
-
-    def test_missing_history_group_in_config_raises_at_init(self) -> None:
-        """If cfg.history_group_name doesn't match any feature_groups entry,
-        Tiger.__init__ should error clearly — not at first forward."""
-        tiger_msg = TigerProto(
-            embed_dim=16,
-            num_heads=2,
-            d_kv=8,
-            hidden_dims="32",
-            num_encoder_layers=1,
-            num_decoder_layers=1,
-            dropout_rate=0.0,
-            codebook="8,8,8",
-            num_user_bins=0,
-            use_sep_token=True,
-            beam_width=4,
-            history_group_name="not_present_in_config",
-        )
-        mc = ModelConfig()
-        mc.tiger.CopyFrom(tiger_msg)
-        # Note: NO feature_groups added that match.
-        with self.assertRaises(ValueError) as cm:
-            Tiger(mc, features=[], labels=["label_sids"])
-        self.assertIn("not_present_in_config", str(cm.exception))
-        self.assertIn("history", str(cm.exception))
-
-    def test_history_group_with_empty_feature_names_raises(self) -> None:
-        """A feature_group with no feature_names is a config error."""
+    def test_unknown_group_raises_at_init(self) -> None:
         tiger_msg = TigerProto(
             embed_dim=16, num_heads=2, d_kv=8, hidden_dims="32",
             num_encoder_layers=1, num_decoder_layers=1, dropout_rate=0.0,
             codebook="8,8,8", num_user_bins=0, use_sep_token=True,
-            beam_width=4, history_group_name="history",
+            beam_width=4, history_group_name="missing",
         )
         mc = ModelConfig()
         mc.tiger.CopyFrom(tiger_msg)
-        empty_fg = mc.feature_groups.add()
-        empty_fg.group_name = "history"
-        # No feature_names appended.
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(KeyError):
             Tiger(mc, features=[], labels=["label_sids"])
-        self.assertIn("empty feature_names", str(cm.exception))
-
-    def test_missing_history_group_at_batch_time_raises_clear_keyerror(
-        self,
-    ) -> None:
-        """Config valid at init, but batch is missing the resolved group."""
-        torch.manual_seed(0)
-        mc = _build_proto(codebook="8,8,8")
-        model = Tiger(mc, features=[], labels=["label_sids"])
-        model.train()
-        wrong_kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["history_sids"],
-            values=torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long),
-            lengths=torch.tensor([6], dtype=torch.long),
-        )
-        bad_batch = Batch(
-            sparse_features={"wrong_group_name": wrong_kjt},
-            jagged_labels={
-                "label_sids": JaggedTensor(
-                    values=torch.tensor([1, 2, 3], dtype=torch.long),
-                    lengths=torch.tensor([3], dtype=torch.long),
-                )
-            },
-        )
-        with self.assertRaises(KeyError) as cm:
-            model.predict(bad_batch)
-        self.assertIn("history", str(cm.exception))
-        self.assertIn("wrong_group_name", str(cm.exception))
-
-    def test_missing_history_feature_inside_kjt_raises_clear_keyerror(
-        self,
-    ) -> None:
-        torch.manual_seed(0)
-        mc = _build_proto(codebook="8,8,8")
-        model = Tiger(mc, features=[], labels=["label_sids"])
-        model.train()
-        wrong_feature_kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["typo_history_sids"],
-            values=torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long),
-            lengths=torch.tensor([6], dtype=torch.long),
-        )
-        bad_batch = Batch(
-            sparse_features={"history": wrong_feature_kjt},
-            jagged_labels={
-                "label_sids": JaggedTensor(
-                    values=torch.tensor([1, 2, 3], dtype=torch.long),
-                    lengths=torch.tensor([3], dtype=torch.long),
-                )
-            },
-        )
-        with self.assertRaises(KeyError) as cm:
-            model.predict(bad_batch)
-        self.assertIn("history_sids", str(cm.exception))
 
 
 class TigerMetricTest(unittest.TestCase):
