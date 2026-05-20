@@ -1,0 +1,71 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Tiger: generative recommendation model that decodes the next item's
+// Semantic ID (SID) from a user's pre-SID-encoded history sequence.
+//
+// Architecture (mirrors GRID's SemanticIDEncoderDecoder):
+//   - T5 encoder (embed_tokens deleted) over a flat SID-token stream
+//   - T5Stack decoder (embed_tokens deleted) with cross-attention
+//   - Single compact `sum(codebook_sizes)`-row SID embedding table shared
+//     by encoder and decoder via the per-hierarchy offset trick
+//   - Per-hierarchy decoder MLP heads, each Linear(embed_dim, codebook_sizes[h])
+//
+// Data contract:
+//   - history_sids: list<int64> of length (num_items * num_hierarchies);
+//     codes 0-indexed in [0, codebook_sizes[h]) per hierarchy slot
+//   - label_sids: list<int64> of length num_hierarchies; 0-indexed
+//
+// See ai_report/tiger_migration_design.md for the full design.
+message Tiger {
+    // === Backbone shape ===
+    // Hidden / embedding width (T5's d_model).
+    optional uint32 embed_dim = 1 [default = 128];
+    // Attention heads per T5 block.
+    optional uint32 num_heads = 2 [default = 6];
+    // Per-head key/value dim.
+    optional uint32 d_kv = 3 [default = 64];
+    // Comma-separated feed-forward hidden widths, e.g. "1024" (stock T5 FF)
+    // or "1024,1024" (2-hidden-layer T5MultiLayerFF swap). Length = number of
+    // hidden layers in each FF block; values = per-layer width.
+    optional string hidden_dims = 4 [default = "1024"];
+    // Number of T5Blocks in the encoder.
+    optional uint32 num_encoder_layers = 5 [default = 4];
+    // Number of T5Blocks in the decoder.
+    optional uint32 num_decoder_layers = 6 [default = 4];
+    // Dropout applied inside attention + FF blocks.
+    optional float dropout_rate = 7 [default = 0.15];
+
+    // === SID structure ===
+    // Per-hierarchy code count, comma-separated, e.g. "256,256,256,256".
+    // Length is the number of hierarchies; values are per-layer widths.
+    // Non-uniform codebooks (e.g. "256,256,256,128") supported.
+    // Must match the SID encoding produced by the offline pipeline.
+    optional string codebook = 10 [default = "256,256,256,256"];
+
+    // Field number 11 reserved for v2 `semantic_id_path` (see design §0.1).
+
+    // === Optional user features ===
+    // 0 disables the user-id branch entirely. >0 enables a learned
+    // nn.Embedding(num_user_bins, embed_dim) with remainder-hashed user IDs,
+    // prepended to the encoder input sequence.
+    optional uint32 num_user_bins = 12 [default = 0];
+
+    // === Forward-pass toggles ===
+    // Insert a learnable SEP token between every item's n SID tokens in the
+    // encoder sequence.
+    optional bool use_sep_token = 20 [default = true];
+
+    // Field number 21 reserved for v2 `weight_tying` (removed in v1 as a no-op).
+
+    // === Beam search / generation ===
+    // Beam width K during unconstrained autoregressive decoding.
+    optional uint32 beam_width = 30 [default = 10];
+
+    // Field number 31 reserved for v2 `constrained_beam_search`.
+
+    // Feature wiring is via ModelConfig.feature_groups (declared at the
+    // ModelConfig level, not here). Convention: declare two named groups —
+    // "history" (the sequence_feature carrying history_sids) and "user" (the
+    // id_feature carrying user_id, required only if num_user_bins > 0).
+}

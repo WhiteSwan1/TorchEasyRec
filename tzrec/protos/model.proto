@@ -6,6 +6,7 @@ import "tzrec/protos/models/multi_task_rank.proto";
 import "tzrec/protos/models/match_model.proto";
 import "tzrec/protos/models/general_rank_model.proto";
 import "tzrec/protos/models/sid_model.proto";
+import "tzrec/protos/models/tiger.proto";
 import "tzrec/protos/loss.proto";
 import "tzrec/protos/metric.proto";
 import "tzrec/protos/seq_encoder.proto";
@@ -81,6 +82,9 @@ message ModelConfig {
         // SID generation models
         SidRqvae sid_rqvae = 600;
         SidRqkmeans sid_rqkmeans = 601;
+
+        // Generative recommendation with semantic IDs
+        Tiger tiger = 700;
     }
 
     optional uint32 num_class = 2 [default = 1];
