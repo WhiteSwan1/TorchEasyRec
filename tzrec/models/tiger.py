@@ -132,6 +132,32 @@ class Tiger(BaseModel):
         hidden_dims = parse_int_list(cfg.hidden_dims)
         assert len(hidden_dims) >= 1, "hidden_dims must list at least one size"
 
+        # --- Resolve feature-name lookups from feature_groups in config ---
+        # `model_config.feature_groups` lists named groups; each group's
+        # `feature_names[0]` is the feature Tiger consumes from that group.
+        # We pin the *group_name* via proto (cfg.history_group_name /
+        # cfg.user_group_name) and resolve the underlying feature name from
+        # the matching FeatureGroupConfig entry — so the user can rename
+        # both the group and the feature without touching this model code.
+        self._history_data_group, self._history_feature_name = (
+            self._resolve_group_and_feature(
+                cfg.history_group_name,
+                must_exist=True,
+                purpose="history sequence",
+            )
+        )
+        if self._num_user_bins > 0:
+            self._user_data_group, self._user_feature_name = (
+                self._resolve_group_and_feature(
+                    cfg.user_group_name,
+                    must_exist=True,
+                    purpose="user_id (num_user_bins > 0)",
+                )
+            )
+        else:
+            self._user_data_group = None
+            self._user_feature_name = None
+
         # Precomputed offsets for the per-hierarchy index shift (§3.6 of
         # design): lookup_idx[h] = c[h] + cumsum(codebook_sizes[:h]).
         offsets = [0]
@@ -212,6 +238,48 @@ class Tiger(BaseModel):
         )
 
     # ------------------------------------------------------------------
+    # Config resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_group_and_feature(
+        self,
+        group_name: str,
+        must_exist: bool,
+        purpose: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Look up `group_name` in `model_config.feature_groups`.
+
+        Returns `(data_group, feature_name)` where `data_group` equals
+        `group_name` (tzrec uses these interchangeably — the data parser
+        keys `batch.sparse_features` by group_name) and `feature_name` is
+        the first entry in the group's `feature_names`.
+
+        Args:
+            group_name: the `FeatureGroupConfig.group_name` to find.
+            must_exist: if True, raises ValueError when not found.
+            purpose: human-readable label used in the error message.
+        """
+        feature_groups = list(self._base_model_config.feature_groups)
+        for fg in feature_groups:
+            if fg.group_name == group_name:
+                if len(fg.feature_names) == 0:
+                    raise ValueError(
+                        f"feature_group '{group_name}' (for Tiger {purpose}) "
+                        "has empty feature_names — declare at least one "
+                        "feature_name inside it."
+                    )
+                return group_name, fg.feature_names[0]
+        if must_exist:
+            available = [fg.group_name for fg in feature_groups]
+            raise ValueError(
+                f"Tiger needs a feature_group named '{group_name}' for "
+                f"{purpose}, but model_config.feature_groups has groups "
+                f"{available}. Either add the group or set the matching "
+                f"proto field (history_group_name / user_group_name)."
+            )
+        return None, None
+
+    # ------------------------------------------------------------------
     # Batch extraction
     # ------------------------------------------------------------------
 
@@ -220,6 +288,15 @@ class Tiger(BaseModel):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Densify the history_sids KJT into a (B, L_tokens) tensor + mask.
 
+        Looks up the KJT by **data group name** (`HISTORY_DATA_GROUP`,
+        default `"history"`) and the feature by **name within the KJT**
+        (`HISTORY_FEATURE_NAME`, default `"history_sids"`). Robust to:
+          (a) reordering of feature_configs entries in the pipeline,
+          (b) additional unrelated data groups co-existing in the batch
+              (e.g. a side-info group added by an extending model),
+          (c) the user accidentally placing extra features inside the
+              "history" group — we only consume `"history_sids"`.
+
         Returns:
             history_sids: (B, L_tokens) int64. L_tokens is the max
                 sequence length in this batch, rounded to a multiple of
@@ -227,12 +304,34 @@ class Tiger(BaseModel):
                 padding positions hold 0 (a value that may collide with
                 real code-0-at-hierarchy-0; the mask blocks attention).
             attention_mask: (B, L_tokens) int64 (1=real, 0=pad).
+
+        Raises:
+            KeyError: if either the data group or the feature name is
+                absent from the batch — a clear "you misconfigured your
+                feature_configs" signal rather than silent fallback.
         """
-        # First sparse_features value is the history group's KJT.
-        history_kjt = next(iter(batch.sparse_features.values()))
+        group = self._history_data_group
+        feat_name = self._history_feature_name
+        if group not in batch.sparse_features:
+            raise KeyError(
+                f"Tiger expects a sparse-feature data group named "
+                f"'{group}' in the batch (configured via "
+                f"`tiger.history_group_name`), but got "
+                f"{sorted(batch.sparse_features.keys())}. Add a "
+                f"FeatureGroupConfig with group_name '{group}' to "
+                f"ModelConfig.feature_groups."
+            )
+        history_kjt = batch.sparse_features[group]
         feat_dict = history_kjt.to_dict()
-        # In the conventional setup the history group has exactly one key.
-        jt = next(iter(feat_dict.values()))
+        if feat_name not in feat_dict:
+            raise KeyError(
+                f"Tiger expects feature '{feat_name}' (resolved from "
+                f"feature_groups['{group}'].feature_names[0]) inside the "
+                f"'{group}' KJT, but the KJT has keys "
+                f"{sorted(feat_dict.keys())}. Check feature_configs and "
+                f"the feature_group's feature_names declaration."
+            )
+        jt = feat_dict[feat_name]
         values = jt.values()  # (sum_lengths,) int64
         lengths = jt.lengths()  # (B,) int64
 
@@ -266,17 +365,30 @@ class Tiger(BaseModel):
         return history_sids, attention_mask
 
     def _extract_user_id(self, batch: Batch) -> Optional[torch.Tensor]:
-        """Read user_id from batch.sparse_features['user'] if present."""
-        if self.user_embedding is None:
+        """Read user_id from `batch.sparse_features[self._user_data_group]`.
+
+        Group + feature names are resolved at `__init__` time from
+        `cfg.user_group_name` and the matching `feature_groups` entry.
+
+        Returns `None` (and the encoder skips the user-id prepend) if:
+          - the model was built with `num_user_bins == 0` (no user
+            embedding, so the group lookup was never resolved), or
+          - the batch has no entry for the resolved data group, or
+          - the data group's KJT does not contain the resolved feature.
+
+        We look up by name on both axes so additional features in either
+        the user group or the model's batch can co-exist without
+        confusing the lookup.
+        """
+        if self.user_embedding is None or self._user_data_group is None:
             return None
-        if "user" not in batch.sparse_features:
+        if self._user_data_group not in batch.sparse_features:
             return None
-        user_kjt = batch.sparse_features["user"]
-        feat_dict = user_kjt.to_dict()
-        if not feat_dict:
+        feat_dict = batch.sparse_features[self._user_data_group].to_dict()
+        if self._user_feature_name not in feat_dict:
             return None
-        jt = next(iter(feat_dict.values()))
-        # Length 1 per sample by convention; squeeze.
+        jt = feat_dict[self._user_feature_name]
+        # Length 1 per sample by convention; values() is already (B,).
         return jt.values().long()
 
     def _extract_target_sids(self, batch: Batch) -> Optional[torch.Tensor]:

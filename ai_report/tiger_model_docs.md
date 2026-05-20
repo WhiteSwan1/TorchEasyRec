@@ -62,9 +62,40 @@ embed_dim)` is prepended to the encoder input.
 | `num_user_bins` | 0 | 0 = no user-id branch. `> 0` enables remainder-hashed user embedding. |
 | `use_sep_token` | true | Insert a learnable SEP between every item's SID block in the encoder sequence. |
 | `beam_width` | 10 | K for top-K beam search. |
+| `history_group_name` | `"history"` | `FeatureGroupConfig.group_name` to look up for the SID-history sequence. Tiger consumes the first `feature_name` in that group. |
+| `user_group_name` | `"user"` | `FeatureGroupConfig.group_name` to look up for `user_id` (used only when `num_user_bins > 0`). |
 
 Field numbers 11 / 21 / 31 are reserved for v2 (`semantic_id_path`,
 `weight_tying`, `constrained_beam_search`).
+
+## Feature wiring
+
+`feature_groups` are declared at the **ModelConfig** level. Tiger reads
+`history_group_name` (and optionally `user_group_name`) from its proto,
+matches against the `group_name` in each `feature_groups` entry, and
+consumes the **first** `feature_name` listed in the matching group. So
+the user can rename freely:
+
+```
+model_config {
+    feature_groups {
+        group_name: "my_renamed_sid_seq"
+        feature_names: "my_encoded_history"
+        group_type: DEEP
+    }
+    tiger {
+        history_group_name: "my_renamed_sid_seq"
+        ...
+    }
+}
+```
+
+Inside the model, the resolution happens in `__init__` via
+`_resolve_group_and_feature` — Tiger validates at construction time
+(not at first forward) that the named group exists in
+`model_config.feature_groups` and that it has at least one
+`feature_name`. Misconfiguration produces a clear `ValueError`
+identifying the missing group.
 
 ## End-to-end workflow
 

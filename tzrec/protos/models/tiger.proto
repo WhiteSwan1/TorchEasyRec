@@ -64,8 +64,33 @@ message Tiger {
 
     // Field number 31 reserved for v2 `constrained_beam_search`.
 
-    // Feature wiring is via ModelConfig.feature_groups (declared at the
-    // ModelConfig level, not here). Convention: declare two named groups —
-    // "history" (the sequence_feature carrying history_sids) and "user" (the
-    // id_feature carrying user_id, required only if num_user_bins > 0).
+    // === Feature wiring ===
+    // Feature_groups themselves are declared at the ModelConfig level
+    // (`ModelConfig.feature_groups`). Tiger needs to know WHICH of those
+    // groups carries the SID-history sequence and (optionally) which
+    // carries the user_id. The two fields below pin that mapping by
+    // group_name — Tiger reads the first feature_name in the matching
+    // group as the actual feature to consume. This decouples Tiger from
+    // any particular naming convention on the user's side.
+    //
+    // Example pipeline config:
+    //   model_config {
+    //     feature_groups { group_name: "sid_seq"  feature_names: "user_sid_history" group_type: DEEP }
+    //     feature_groups { group_name: "uid"      feature_names: "user_pin"          group_type: DEEP }
+    //     tiger {
+    //       history_group_name: "sid_seq"
+    //       user_group_name:    "uid"
+    //       num_user_bins:      100000
+    //       ...
+    //     }
+    //   }
+
+    // group_name of the feature_group carrying the SID-encoded history
+    // sequence. Tiger reads `feature_names[0]` of the matching group as
+    // the actual feature it consumes.
+    optional string history_group_name = 60 [default = "history"];
+
+    // group_name of the feature_group carrying the user_id. Consulted
+    // only when num_user_bins > 0; otherwise ignored.
+    optional string user_group_name = 61 [default = "user"];
 }

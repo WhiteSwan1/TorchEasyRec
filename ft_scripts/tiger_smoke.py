@@ -86,9 +86,16 @@ def _build_proto(
         num_user_bins=0,
         use_sep_token=True,
         beam_width=beam_width,
+        # New: explicit group_name plumbing. Tiger will resolve the
+        # actual feature_name via feature_groups below.
+        history_group_name="history",
     )
     mc = ModelConfig()
     mc.tiger.CopyFrom(tiger_msg)
+    # Declare matching feature_groups so Tiger's resolver can find them.
+    hist_fg = mc.feature_groups.add()
+    hist_fg.group_name = "history"
+    hist_fg.feature_names.append("history_sids")
     return mc
 
 
