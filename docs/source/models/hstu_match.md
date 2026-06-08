@@ -16,7 +16,7 @@ data_config {
     negative_sampler {
         input_path: "odps://{PROJECT}/tables/taobao_ad_feature_gl_bucketized_v1"
         num_sample: 128
-        attr_fields: "cand_seq__video_id"
+        attr_fields: "video_id"
         item_id_field: "cand_seq__video_id"
         attr_delimiter: "\t"
     }
@@ -104,6 +104,12 @@ feature_configs {
         }
     }
 }
+feature_configs {
+    raw_feature {
+        feature_name: "request_time"
+        expression: "user:request_time"
+    }
+}
 model_config {
     feature_groups {
         group_name: "contextual"
@@ -139,6 +145,11 @@ model_config {
         group_name: "uih_timestamp"
         feature_names: "uih_seq__action_timestamp"
         group_type: JAGGED_SEQUENCE
+    }
+    feature_groups {
+        group_name: "query_time"
+        feature_names: "request_time"
+        group_type: DEEP
     }
     hstu_match {
         user_tower {
@@ -211,6 +222,8 @@ model_config {
 
 - data_config: 数据配置，其中需要配置负采样 Sampler，负采样 Sampler 的配置详见 [DSSM](dssm.md) 文档中的**负采样配置**章节
 
+  - HSTUMatch 的候选侧是 `sequence_feature` 的子特征。在 `negative_sampler` 中，`item_id_field` 写为带 `sequence_name` 前缀的名（例如 `cand_seq__video_id`），`attr_fields` 写为不带前缀的子特征名（例如 `video_id`）。
+
 - feature_groups: 特征组
 
   - uih: 用户历史行为序列，可增加 side info；类型为 JAGGED_SEQUENCE，**必填**
@@ -219,6 +232,7 @@ model_config {
   - uih_action: 用户历史交互的行为事件序列，注: 该行为事件按位存储，如 expr, click, add, buy 三个行为，则一般 expr=0, click=1, add=2, buy=4；类型为 JAGGED_SEQUENCE，当 `uih_preprocessor.action_encoder` 配置时必填
   - uih_watchtime: 用户历史交互的行为时长序列；类型为 JAGGED_SEQUENCE，当 action encoder 需要 watchtime 时必填
   - uih_timestamp: 用户历史交互的行为时间戳序列；类型为 JAGGED_SEQUENCE，当 `positional_encoder.use_time_encoding=true` 时必填
+  - query_time: 每行一个标量的请求时间 raw 特征 (需与 uih_timestamp 同单位)；类型为 DEEP，可选。配置后时间编码以请求时间为基准 (`ts_gap = query_time - 行为时间戳`)，否则回退到最后一个 UIH 行为时间
 
   **group_name 不能变**，user_tower/item_tower 通过 group_name 索引对应的 feature_group
 
@@ -254,13 +268,16 @@ model_config {
 
 ## 模型导出
 
-HSTU Match 模型导出时需要设置环境变量 `ENABLE_AOT=1` 启用 AOT Inductor 导出。例如:
+HSTU Match 模型导出时，若使用 Triton kernel，需要设置环境变量 `ENABLE_AOT=1` 启用 AOT Inductor 导出。
+
+同时需要通过命令行参数 `--item_input_path` 指定 item 侧的输入数据路径（一行一个 item 的 parquet，schema 与候选序列子特征对齐，例如包含 `video_id` 列）。item tower 导出时会从该路径读取一个样本 batch 用于 trace；user tower 不受影响，仍使用 `train_input_path`。例如：
 
 ```
 ENABLE_AOT=1 torchrun --master_addr=localhost --master_port=32555 \
     --nnodes=1 --nproc-per-node=1 --node_rank=0 \
     -m tzrec.export \
     --pipeline_config_path experiments/hstu_match/pipeline.config \
+    --item_input_path experiments/hstu_match/item_data/*.parquet \
     --export_dir experiments/hstu_match/export
 ```
 

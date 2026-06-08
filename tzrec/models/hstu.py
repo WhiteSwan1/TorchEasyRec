@@ -15,8 +15,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tzrec.datasets.utils import CAND_POS_LENGTHS, HARD_NEG_INDICES, Batch
-from tzrec.features.feature import BaseFeature
+from tzrec.datasets.utils import (
+    BASE_DATA_GROUP,
+    CAND_POS_LENGTHS,
+    HARD_NEG_INDICES,
+    Batch,
+)
+from tzrec.features.feature import (
+    BaseFeature,
+    create_features,
+    project_grouped_sequence_feature_to_scalar,
+)
 from tzrec.models.match_model import MatchModel, MatchTowerWoEG
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.gr.hstu_transducer import HSTUMatchEncoder
@@ -87,6 +96,17 @@ class HSTUUserTower(MatchTowerWoEG):
             contextual_feature_dim = contextual_dims[0]
             max_contextual_seq_len = len(contextual_dims)
 
+        # Optional `query_time` DEEP group: per-row request-time anchor for the
+        # HSTU time bias (absent -> anchor on the last UIH timestamp).
+        query_time_key = next(
+            (
+                feature_group.group_name
+                for feature_group in feature_groups
+                if feature_group.group_name == "query_time"
+            ),
+            "",
+        )
+
         self._hstu_encoder: HSTUMatchEncoder = HSTUMatchEncoder(
             uih_embedding_dim=embedding_group.group_total_dim(
                 f"{tower_config.input}.sequence"
@@ -96,6 +116,7 @@ class HSTUUserTower(MatchTowerWoEG):
             contextual_group_name=contextual_group_name,
             scaling_seqlen=tower_config.max_seq_len,
             is_inference=False,
+            query_time_key=query_time_key,
             **config_to_kwargs(tower_config.hstu),
         )
         if self._output_dim > 0:
@@ -151,8 +172,18 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         # tower_config.input names on the user-tower proto). Use the item-side
         # tower_config.input here, which equals feature_groups[0].group_name.
         self._group_name = tower_config.input
+        # MLP sized off the training candidate group; the scalar view has
+        # identical per-feature embedding dim.
         candidate_dims = embedding_group.group_dims(f"{self._group_name}.sequence")
         candidate_total_dim = sum(candidate_dims)
+
+        # Lazy caches for the scalar export view (populated on first
+        # property access after `set_is_inference(True)`).
+        self._features_scalar: Optional[List[BaseFeature]] = None
+        self._feature_groups_scalar: Optional[List[model_pb2.FeatureGroupConfig]] = None
+        # `MatchTowerWoEG` derives from `nn.Module`, not `BaseModule`,
+        # so init `_is_inference` here.
+        self._is_inference: bool = False
         if tower_config.HasField("mlp"):
             self.mlp: torch.nn.Module = MLP(
                 in_features=candidate_total_dim,
@@ -166,6 +197,48 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         if self._output_dim > 0:
             self.output = nn.Linear(mlp_out_dim, output_dim)
 
+    @property
+    def features(self) -> List[BaseFeature]:
+        """Item features (training: grouped sub-features; export: scalar projection)."""
+        if self._is_inference:
+            if self._features_scalar is None:
+                self._build_scalar_features()
+            return self._features_scalar
+        return self._features
+
+    @property
+    def feature_groups(self) -> List[model_pb2.FeatureGroupConfig]:
+        """Item feature_groups in the current view (see ``features``)."""
+        if self._is_inference:
+            if self._feature_groups_scalar is None:
+                self._build_scalar_features()
+            return self._feature_groups_scalar
+        return self._feature_groups
+
+    def _build_scalar_features(self) -> None:
+        """Project each grouped sequence sub-feature into a scalar export feature."""
+        scalar_configs = [
+            project_grouped_sequence_feature_to_scalar(f) for f in self._features
+        ]
+        source = self._features[0]
+        scalar_features = create_features(
+            scalar_configs,
+            fg_mode=source.fg_mode,
+            neg_fields=None,
+            fg_encoded_multival_sep=source._fg_encoded_multival_sep,
+            force_base_data_group=any(
+                f.data_group == BASE_DATA_GROUP for f in self._features
+            ),
+        )
+        self._features_scalar = scalar_features
+        self._feature_groups_scalar = [
+            model_pb2.FeatureGroupConfig(
+                group_name=self._group_name,
+                feature_names=[f.name for f in scalar_features],
+                group_type=model_pb2.JAGGED_SEQUENCE,
+            )
+        ]
+
     def forward(self, grouped_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Forward the item tower.
 
@@ -175,7 +248,9 @@ class HSTUMatchItemTower(MatchTowerWoEG):
         Returns:
             item embeddings of shape (sum_candidates, D).
         """
-        cand_emb = grouped_features[f"{self._group_name}.sequence"]
+        # `.sequence` (jagged) at training, `.query` (scalar) at export.
+        suffix = ".query" if self._is_inference else ".sequence"
+        cand_emb = grouped_features[self._group_name + suffix]
         item_emb = self.mlp(cand_emb)
         if self._output_dim > 0:
             item_emb = self.output(item_emb)
@@ -203,6 +278,9 @@ class HSTUMatch(MatchModel):
           UIHPreprocessor's action_encoder and the HSTU positional
           encoder's time bias. Required when `uih_preprocessor.action_encoder`
           is configured.
+        - "query_time" (optional, DEEP): a single per-row scalar request-time
+          raw feature used as the HSTU time-bias anchor; absent, the anchor
+          falls back to the last UIH timestamp.
 
     User tower returns the last-position UIH embedding per user; it is compared
     against candidate embeddings via the configured similarity at both train and

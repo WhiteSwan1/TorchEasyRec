@@ -14,6 +14,7 @@ import os
 from typing import Any, Dict, List, Optional, Set, Union
 
 import torch
+import torch._inductor.codecache  # noqa: F401 -- populate torch._inductor.codecache so torch.export.pt2_archive._package._load_aoti can read it on PPU torch (host torch auto-imports it; PPU's tzrec-test:1.1-ppu image does not).
 from torch import nn
 
 from tzrec.acc.utils import is_autotune_with_sample_inputs, is_unified_aot_predict
@@ -303,8 +304,8 @@ def _build_dynamic_shapes(
 
     Args:
         data: input tensor dict from Batch.to_dict().
-        features: list of BaseFeature from model._features.
-        feature_groups: list of FeatureGroupConfig from model._feature_groups.
+        features: list of BaseFeature from model.features.
+        feature_groups: list of FeatureGroupConfig from model.feature_groups.
 
     Returns:
         dynamic_shapes dict for torch.export.export().
@@ -467,14 +468,14 @@ def export_unified_model_aot(
 
     # Pad any 0-size non-sequence sparse .values tensors so torch.export
     # doesn't specialize on the empty size (which conflicts with dynamic Dims).
-    seq_feat_names = {f.name for f in model._features if f.is_sequence}
+    seq_feat_names = {f.name for f in model.features if f.is_sequence}
     data = _pad_empty_sparse_values(data, seq_feat_names)
 
     # Build dynamic shapes using feature metadata for correct Dim grouping
     dynamic_shapes = _build_dynamic_shapes(
         data,
-        features=model._features,
-        feature_groups=model._feature_groups,
+        features=model.features,
+        feature_groups=model.feature_groups,
     )
     logger.info("dynamic shapes=%s" % dynamic_shapes)
 
@@ -491,6 +492,7 @@ def export_unified_model_aot(
 
     # Compile with AOTI
     logger.info("compiling unified model with AOTI...")
+    _backport_pt178147_int_array_dedup()
     with torch._inductor.config.patch(_aoti_compile_cfg()):
         aoti_dir = os.path.join(save_dir, "aoti")
         os.makedirs(aoti_dir, exist_ok=True)

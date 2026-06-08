@@ -34,12 +34,16 @@ from torchrec.distributed.train_pipeline.utils import Tracer
 from torchrec.inference.modules import quantize_embeddings
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
     EmbeddingBagCollectionInterface,
     EmbeddingCollection,
     EmbeddingCollectionInterface,
 )
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
+)
+from torchrec.quant.embedding_modules import (
+    quant_prep_enable_cache_features_order,
 )
 from torchrec.sparse import jagged_tensor
 
@@ -80,8 +84,13 @@ def export_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    data_input_path: Optional[str] = None,
 ) -> None:
-    """Export a EasyRec model, may be a part of model in PipelineConfig."""
+    """Export a EasyRec model, may be a part of model in PipelineConfig.
+
+    `data_input_path` (optional): override for the predict-mode dataloader
+    input path; falls back to `pipeline_config.train_input_path` when None.
+    """
     use_rtp = env_util.use_rtp()
 
     impl = export_rtp_model if use_rtp else export_model_normal
@@ -100,6 +109,7 @@ def export_model(
         assets=assets,
         use_local_cache_dir=use_local_cache_dir,
         additional_export_config=additional_export_config,
+        data_input_path=data_input_path,
     )
     if use_local_cache_dir and int(os.environ.get("LOCAL_RANK", 0)) == 0:
         logger.info(f"uploading {local_path} to {save_dir}.")
@@ -142,6 +152,7 @@ def export_model_normal(
     save_dir: str,
     assets: Optional[List[str]] = None,
     additional_export_config: Optional[Dict[str, str]] = None,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on aliyun."""
@@ -161,16 +172,15 @@ def export_model_normal(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     if acc_utils.is_cuda_export():
         # export batch_size too large may OOM in compile phase
         max_batch_size = acc_utils.get_max_export_batch_size()
         data_config.batch_size = min(data_config.batch_size, max_batch_size)
         logger.info("using new batch_size: %s in export", data_config.batch_size)
     data_config.num_workers = 1
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
 
     ckpt_param_map_path = None
     if checkpoint_path:
@@ -190,8 +200,6 @@ def export_model_normal(
     if is_rank_zero:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        model.set_is_inference(True)
-
         init_parameters(model, torch.device("cpu"))
         checkpoint_util.restore_model(
             checkpoint_path, model, ckpt_param_map_path=ckpt_param_map_path
@@ -209,9 +217,16 @@ def export_model_normal(
             logger.info("quantize embeddings...")
             additional_qconfig_spec_keys = []
             additional_mapping = {}
+            cache_order_types = [EmbeddingBagCollection]
             if acc_utils.is_ec_quant():
                 additional_qconfig_spec_keys.append(EmbeddingCollection)
                 additional_mapping[EmbeddingCollection] = QuantEmbeddingCollection
+                cache_order_types.append(EmbeddingCollection)
+            # Cache the feature-permute order as an on-device buffer instead of
+            # rebuilding `torch.tensor(order, device=cuda)` (a blocking H2D copy)
+            # on every forward. Must run before quantize_embeddings so the quant
+            # modules pick it up via `from_float`.
+            quant_prep_enable_cache_features_order(model, cache_order_types)
             quantize_embeddings(
                 model,
                 dtype=acc_utils.quant_dtype(),
@@ -327,6 +342,26 @@ def _get_sharded_leaf_module_names(model: torch.nn.Module) -> List[str]:
         leaf_module_names,
     )
     return list(leaf_module_names)
+
+
+def _get_dense_embedding_leaf_module_names(model: torch.nn.Module) -> List[str]:
+    """Get dense-embedding modules to keep as FX leaf modules during export.
+
+    ``AutoDisEmbedding`` / ``MLPEmbedding`` override ``state_dict`` /
+    ``_load_from_state_dict`` with split per-feature names. Tracing them as
+    leaves keeps the class so ``reset_parameters`` and the custom restore run
+    after the graph is flattened; otherwise their params stay uninitialized.
+    """
+    from tzrec.modules.dense_embedding_collection import (
+        AutoDisEmbedding,
+        MLPEmbedding,
+    )
+
+    names = []
+    for path, module in model.named_modules():
+        if isinstance(module, (AutoDisEmbedding, MLPEmbedding)):
+            names.append(path)
+    return names
 
 
 def _get_rtp_feature_to_embedding_info(
@@ -666,6 +701,7 @@ def export_rtp_model(
     save_dir: str,
     assets: Optional[List[str]] = None,
     use_local_cache_dir: bool = False,
+    data_input_path: Optional[str] = None,
     **kwargs: Any,
 ) -> None:
     """Export a EasyRec model on RTP."""
@@ -711,16 +747,13 @@ def export_rtp_model(
 
     # make dataparser to get user feats before create model
     data_config = copy.deepcopy(pipeline_config.data_config)
-    features = cast(List[BaseFeature], model._features)
+    features = cast(List[BaseFeature], model.features)
     data_config.num_workers = 1
     data_config.batch_size = acc_utils.get_max_export_batch_size()
-    dataloader = create_dataloader(
-        data_config, features, pipeline_config.train_input_path, mode=Mode.PREDICT
-    )
+    input_path = data_input_path or pipeline_config.train_input_path
+    dataloader = create_dataloader(data_config, features, input_path, mode=Mode.PREDICT)
     batch = next(iter(dataloader))
     data = batch.to(device).to_dict(sparse_dtype=torch.int64)
-
-    model.set_is_inference(True)
 
     # Build Sharded Model
     planner = create_planner(
@@ -752,7 +785,10 @@ def export_rtp_model(
 
     # Trace Sharded Model
     unwrap_model = dmp_model.module
-    tracer = Tracer(leaf_modules=_get_sharded_leaf_module_names(unwrap_model))
+    tracer = Tracer(
+        leaf_modules=_get_sharded_leaf_module_names(unwrap_model)
+        + _get_dense_embedding_leaf_module_names(unwrap_model)
+    )
     full_graph = tracer.trace(unwrap_model)  # , concrete_args=concrete_args)
     if is_rank_zero:
         with open(os.path.join(graph_dir, "gm_full.graph"), "w") as f:
@@ -1042,7 +1078,6 @@ def split_model(
         if not os.path.exists(graph_dir):
             os.makedirs(graph_dir)
 
-    model.set_is_inference(True)
     model.eval()
 
     tracer = Tracer()
@@ -1160,8 +1195,8 @@ def split_model(
     dense_gm = _prune_unused_param_and_buffer(dense_gm)
 
     seq_share_groups = _compute_seq_share_groups(
-        features=cast(List[BaseFeature], model._features),
-        feature_groups=model._feature_groups,
+        features=cast(List[BaseFeature], model.features),
+        feature_groups=model.feature_groups,
     )
     meta_info = {
         "seq_tensor_names": seq_tensor_names,

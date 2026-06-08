@@ -38,6 +38,13 @@ from tzrec.protos import data_pb2
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import config_util, env_util, misc_util
 
+_TIMEOUT_SCALE = float(os.environ.get("TZREC_TEST_TIMEOUT_SCALE", "1.0"))
+
+
+def _t(seconds: int) -> int:
+    """Scale a subprocess timeout by $TZREC_TEST_TIMEOUT_SCALE (default 1)."""
+    return int(seconds * _TIMEOUT_SCALE)
+
 
 def _create_random_id_data(
     size: Tuple[int],
@@ -916,7 +923,7 @@ def load_config_for_test(
                 f"--tree_output_dir {test_dir}/init_tree "
             )
             assert misc_util.run_cmd(
-                cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=600
+                cmd_str, os.path.join(test_dir, "log_init_tree.txt"), timeout=_t(600)
             )
 
             sampler_config.item_input_path = os.path.join(
@@ -1009,7 +1016,7 @@ def test_train_eval(
     if env_str:
         cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=_t(600)
     )
 
 
@@ -1029,7 +1036,7 @@ def test_eval(
     if env_str:
         cmd_str = f"{env_str} {cmd_str}"
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_eval.txt"), timeout=_t(600)
     )
 
 
@@ -1040,6 +1047,7 @@ def test_export(
     asset_files: str = "",
     env_str: str = "",
     additional_export_config: str = "",
+    item_input_path: str = "",
 ) -> bool:
     """Run export integration test."""
     log_dir = os.path.join(test_dir, "log_export")
@@ -1056,10 +1064,12 @@ def test_export(
     if asset_files:
         cmd_str += f"--asset_files {asset_files} "
     if additional_export_config:
-        cmd_str += f"--additional_export_config '{additional_export_config}'"
+        cmd_str += f"--additional_export_config '{additional_export_config}' "
+    if item_input_path:
+        cmd_str += f"--item_input_path {item_input_path} "
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=1800
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=_t(1800)
     )
 
 
@@ -1077,7 +1087,7 @@ def test_feature_selection(pipeline_config_path: str, test_dir: str) -> bool:
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_export.txt"), timeout=_t(600)
     )
 
 
@@ -1122,7 +1132,7 @@ def test_predict(
         cmd_str = f"{env_str} {cmd_str}"
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_predict.txt"), timeout=_t(600)
     )
 
 
@@ -1152,7 +1162,7 @@ def test_predict_checkpoint(
         cmd_str = f"{env_str} {cmd_str}"
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_predict_ckpt.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_predict_ckpt.txt"), timeout=_t(600)
     )
 
 
@@ -1173,7 +1183,7 @@ def test_create_faiss_index(
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_faiss.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_faiss.txt"), timeout=_t(600)
     )
 
 
@@ -1201,7 +1211,7 @@ def test_hitrate(
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_hitrate.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_hitrate.txt"), timeout=_t(600)
     )
 
 
@@ -1220,7 +1230,7 @@ def test_create_fg_json(
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_create_fg_json.txt"), timeout=_t(600)
     )
 
 
@@ -1322,7 +1332,7 @@ def test_tdm_retrieval(
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_tdm_retrieval.txt"), timeout=_t(600)
     )
 
 
@@ -1370,7 +1380,7 @@ def test_tdm_cluster_train_eval(
         f"--parallel 1 "
     )
     assert misc_util.run_cmd(
-        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=600
+        cluster_cmd_str, os.path.join(test_dir, "log_tdm_cluster.txt"), timeout=_t(600)
     )
 
     sampler_config.item_input_path = os.path.join(
@@ -1396,5 +1406,5 @@ def test_tdm_cluster_train_eval(
     )
 
     return misc_util.run_cmd(
-        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=600
+        cmd_str, os.path.join(test_dir, "log_train_eval.txt"), timeout=_t(600)
     )
