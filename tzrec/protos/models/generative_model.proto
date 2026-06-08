@@ -1,0 +1,72 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Generative (causal-LM) models.
+//
+// These differ from the rank/match/multi-task categories in that the model's
+// output is a per-position vocabulary distribution rather than a single score
+// or embedding.
+
+// GenerativeRecLM — the unified config for HF-backed generative recommendation
+// LMs. Dispatch to a concrete subclass via `class_name`; see design doc
+// §3 (FINAL_DESIGN_GENERATIVE_REC_LM.md).
+//
+// Sample contract (consumed by `predict()`):
+//   * user_sequence : list<int64>  — raw SID indices in [1, sum(codebook)]
+//   * label         : list<int64>  — raw SID indices in [1, sum(codebook)]
+// Both flow into TER as `sequence_raw_feature` parquet columns. The model
+// converts SID → token id at batch time via integer offset arithmetic and
+// splices them between the cached chat-template buffers built at __init__.
+message GenerativeRecLM {
+    // Dispatches to the concrete Python subclass. Valid values:
+    //   "Qwen2RecLM"   — Qwen2 family (Qwen2.5-0.5B, etc.)
+    // Future: "Llama3RecLM", "MistralRecLM", "MixtralRecLM" (MoE override).
+    required string class_name = 1;
+
+    // ----- Architecture source -----
+    // Either supply an HF hub / local model id (loaded via
+    // `AutoModelForCausalLM.from_pretrained(..., torch_dtype="auto")`), or
+    // give an architecture spec to randomly initialise. Exactly one must be
+    // set; checked at runtime.
+    optional string hf_model_id = 2 [default = ""];
+    // (architecture spec block is deferred to v1.x — `hf_model_id` is the
+    // only path validated in v1; matches algr's setup.)
+
+    // ----- SID vocabulary -----
+    // Required, non-empty. Each entry is the codebook size at one RQ layer
+    // (e.g. [512, 512] for a 2-layer RQ with 512 codes/layer). Total SID
+    // atoms = sum(codebook); these are added to the tokenizer / model
+    // vocabulary as `C0 .. C{sum-1}` directly after the base vocabulary
+    // (no [SEP]; matches algr's add_tokens layout). SID indices in the
+    // parquet are 1-indexed; the wrapper maps `sid → base_vocab + (sid-1)`
+    // where base_vocab = len(tokenizer) BEFORE the extension.
+    repeated uint32 codebook = 60;
+
+    // Pad the post-extension vocabulary up to a multiple of this value.
+    // 128 matches algr's `model.resize_token_embeddings(..., pad_to_multiple_of=128)`.
+    optional uint32 vocab_pad_to_multiple_of = 61 [default = 128];
+
+    // ----- Chat template -----
+    // Optional override for the system instruction string. When unset, the
+    // subclass's default (e.g. Qwen2RecLM's algr-matching default) is used.
+    optional string system_instruction = 70 [default = ""];
+
+    // Optional CN/EN text fragments wrapping the SID codes inside the user
+    // message. For algr's tiny dataset these are
+    //   user_prefix_text = "当前用户的历史行为如下："
+    //   user_suffix_text = "，请预测用户在电商推荐场景后续行为的语义编码"
+    // Tokenised once at __init__ and concatenated INSIDE the cached
+    // ``tpl_user_prefix`` and ``tpl_user_suffix`` buffers (after the
+    // ``<|im_start|>user\n`` marker, before the ``<|im_end|>\n`` marker).
+    // Leaving them empty produces the algr DEFAULT_INSTRUCTION path.
+    optional string user_prefix_text = 71 [default = ""];
+    optional string user_suffix_text = 72 [default = ""];
+
+    // ----- Sample feature names -----
+    // Which `sequence_raw_feature` blocks in the parquet carry the SID lists.
+    required string user_sequence_feature_name = 51;
+    required string label_feature_name = 52;
+
+    // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
+    optional int32 ignore_index = 53 [default = -100];
+}
