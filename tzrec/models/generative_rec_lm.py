@@ -11,9 +11,11 @@ Implements the FINAL design (see FINAL_DESIGN_GENERATIVE_REC_LM.md):
   * Per-family subclasses (design §2 / G4): ``GenerativeRecLM`` is the
     abstract base; each LLM family is a concrete subclass implementing the
     ``_build_prompt_tokens`` and ``predict`` hooks (e.g. ``Qwen2RecLM`` in
-    ``tzrec/models/qwen2_rec_lm.py``). The pipeline config selects the
-    family via ``generative_rec_lm.class_name``; dispatch goes through the
-    BaseModel registry (subclasses auto-register by class name).
+    ``tzrec/models/qwen2_rec_lm.py``). The pipeline config selects the family
+    by its own oneof entry (``qwen2_rec_lm``), whose message-type name resolves
+    directly to the same-named class via the BaseModel registry — no dispatch.
+    Shared config lives in ``GenerativeRecLMConfig`` (the family message's
+    ``common`` field); family-specific knobs sit on the family message.
   * Streaming sample format: each row carries two raw-int64 sequence features,
     ``user_sequence`` (list[int]) and ``label`` (list[int]), both holding raw
     SID indices in ``[1, sum(codebook)]``.
@@ -56,37 +58,21 @@ class GenerativeRecLM(BaseModel):
         _build_prompt_tokens(tokenizer, cfg)  — cache the prompt template
         predict(batch)                        — build inputs + HF forward
 
+    Family proto contract: every family message embeds
+    ``GenerativeRecLMConfig common = 1`` (shared config the base reads) and
+    supplies a backbone, by default via an ``hf_model_id`` field (overridable
+    through ``_backbone_id``).
+
     ``Qwen2RecLM`` (``tzrec/models/qwen2_rec_lm.py``) provides the decoder-only
     chat implementation (ChatML splice + ``.model``/``.lm_head`` forward),
     reusable by Llama/Mistral/Gemma/Phi-style families; GPT-NeoX/RWKV/Mamba/T5
-    each need their own. The pipeline config selects the family via
-    ``generative_rec_lm.class_name`` (resolved through the BaseModel registry).
+    each need their own. Each family registers directly (its oneof message-type
+    name == the class name); there is no ``class_name`` dispatch.
     """
 
     # predictions key the inference branch emits generated SIDs under, stable
     # across families (PredictWrapper ``output_cols`` should reference it).
     GENERATED_SIDS_KEY = "generated_sids"
-
-    def __new__(cls, model_config: ModelConfig, *args: Any, **kwargs: Any):
-        """Dispatch to the concrete family subclass.
-
-        ``tzrec.main._create_model`` resolves the proto oneof message name
-        (``GenerativeRecLM``) to THIS class; the actual family is selected
-        by ``generative_rec_lm.class_name`` and looked up in the BaseModel
-        registry (every subclass auto-registers via the metaclass).
-        """
-        if cls is GenerativeRecLM:
-            cfg = getattr(model_config, model_config.WhichOneof("model"))
-            class_name = cfg.class_name
-            # pyre-ignore [16]
-            sub_cls = BaseModel.create_class(class_name)
-            if not issubclass(sub_cls, GenerativeRecLM):
-                raise ValueError(
-                    f"generative_rec_lm.class_name = {class_name!r} resolves "
-                    f"to {sub_cls}, which is not a GenerativeRecLM subclass."
-                )
-            return super().__new__(sub_cls)
-        return super().__new__(cls)
 
     def __init__(
         self,
@@ -97,39 +83,35 @@ class GenerativeRecLM(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
-        cfg = self._model_config  # populated by BaseModel from WhichOneof
+        cfg = self._model_config  # the family message (e.g. Qwen2RecLM)
+        common = cfg.common  # GenerativeRecLMConfig — shared by all families
 
-        # proto -> python knobs
-        self._input_name: str = cfg.user_sequence_feature_name
-        self._label_name: str = cfg.label_feature_name
-        self._ignore_index: int = int(cfg.ignore_index)
-        codebook = list(cfg.codebook)
+        # shared proto -> python knobs
+        self._input_name: str = common.user_sequence_feature_name
+        self._label_name: str = common.label_feature_name
+        self._ignore_index: int = int(common.ignore_index)
+        codebook = list(common.codebook)
         if len(codebook) == 0:
             raise ValueError(
                 "GenerativeRecLM: codebook must be non-empty "
                 "(see design §3 — required field)"
             )
-        # One entry per RQ level: ``len(codebook)`` = SID codes per item (the
-        # exact width of every answer), ``sum(codebook)`` = total SID atoms to
-        # append to the vocab. e.g. AL-GR is 3 levels x 8192 -> [8192,8192,8192].
+        # len(codebook) = SID codes per item (answer width); sum = vocab atoms.
         self._num_levels = len(codebook)
         sid_atoms = sum(int(c) for c in codebook)
-        pad_mult = int(cfg.vocab_pad_to_multiple_of) or 128
+        pad_mult = int(common.vocab_pad_to_multiple_of) or 128
         # beam-search params for the inference branch (proto defaults = 50/50)
-        self._num_beams = int(cfg.num_beams)
-        self._num_return = int(cfg.num_return_sequences)
+        self._num_beams = int(common.num_beams)
+        self._num_return = int(common.num_return_sequences)
 
-        # backbone + tokenizer
-        hf_model_id = cfg.hf_model_id
+        # backbone + tokenizer (the backbone is family-owned; see _backbone_id)
+        hf_model_id = self._backbone_id()
         if not hf_model_id:
             raise ValueError(
-                "GenerativeRecLM v1: hf_model_id is required "
-                "(architecture-spec path deferred to v1.x)"
+                f"{type(self).__name__}: empty backbone id (see _backbone_id)."
             )
-        # torch_dtype="auto" preserves the safetensors-stored dtype (bf16
-        # for Qwen2.5-0.5B). The default would silently upcast to fp32.
-        # On CPU the same flag is honoured; on GPU it avoids a 2× memory
-        # blow-up.
+        # torch_dtype="auto" keeps the stored dtype (bf16); the default upcasts
+        # to fp32 (2x memory on GPU).
         self.lm = AutoModelForCausalLM.from_pretrained(
             hf_model_id, torch_dtype="auto"
         )
@@ -175,6 +157,14 @@ class GenerativeRecLM(BaseModel):
         # one-shot debug dump of the first spliced batch
         self._smoke_log_once = (os.environ.get("TZREC_GENRECLM_DEBUG", "0") == "1")
         self._first_predict = True
+
+    def _backbone_id(self) -> str:
+        """Family hook: the HF model id to load for ``self.lm``.
+
+        Defaults to the family message's ``hf_model_id``; override if a family
+        sources its backbone differently.
+        """
+        return self._model_config.hf_model_id
 
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Family hook: cache the tokenised prompt template as buffers.

@@ -78,8 +78,8 @@ message ModelConfig {
 
         RocketLaunching rocket_launching = 500;
 
-        // Generative (causal-LM) models.
-        GenerativeRecLM generative_rec_lm = 601;
+        // Generative (causal-LM) models — one family message per LLM family.
+        Qwen2RecLM qwen2_rec_lm = 601;
     }
 
     // Field 600 was the removed v1 offline-tokenized `Qwen2` wrapper —

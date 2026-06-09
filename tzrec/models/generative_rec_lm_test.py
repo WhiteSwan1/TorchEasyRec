@@ -55,6 +55,20 @@ class GenerativeRecLMTest(unittest.TestCase):
         self.assertIs(BaseModel.create_class("Qwen2RecLM"), Qwen2RecLM)
         self.assertTrue(issubclass(Qwen2RecLM, GenerativeRecLM))
 
+    def test_backbone_owned_by_family_proto(self) -> None:
+        # the backbone lives on the family message (its architecture), NOT in
+        # the shared common config; it defaults to the canonical Qwen2.5-0.5B.
+        from tzrec.protos.models.generative_model_pb2 import (
+            GenerativeRecLMConfig,
+        )
+        from tzrec.protos.models.generative_model_pb2 import (
+            Qwen2RecLM as Qwen2RecLMProto,
+        )
+
+        self.assertEqual(Qwen2RecLMProto().hf_model_id, "Qwen/Qwen2.5-0.5B")
+        common_fields = [f.name for f in GenerativeRecLMConfig.DESCRIPTOR.fields]
+        self.assertNotIn("hf_model_id", common_fields)
+
     def test_abstract_hooks_raise(self) -> None:
         base = object.__new__(GenerativeRecLM)
         with self.assertRaises(NotImplementedError):

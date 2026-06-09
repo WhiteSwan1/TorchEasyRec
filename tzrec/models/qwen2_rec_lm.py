@@ -6,12 +6,13 @@
 
 """Qwen2/Qwen2.5 family subclass of ``GenerativeRecLM`` (design §5).
 
-Selected from the pipeline config via::
+Selected from the pipeline config by its own oneof entry (the message-type name
+resolves directly to this class — no ``class_name`` dispatch)::
 
     model_config {
-        generative_rec_lm {
-            class_name: "Qwen2RecLM"
-            ...
+        qwen2_rec_lm {
+            common { hf_model_id: "..." codebook: 8192 ... }
+            system_instruction: "..."
         }
     }
 
