@@ -142,14 +142,7 @@ class Qwen2RecLM(GenerativeRecLM):
             ])
             for i in range(len(user_seq_rows))
         ]
-        input_ids = pad_sequence(
-            rows_ids, batch_first=True,
-            padding_value=self._pad_token_id, padding_side="left",
-        )
-        attention_mask = pad_sequence(
-            [torch.ones_like(r) for r in rows_ids], batch_first=True,
-            padding_value=0, padding_side="left",
-        )
+        input_ids, attention_mask = self._left_pad(rows_ids)
 
         # labels: the supervised tail is fixed-width, so left-padding aligns it
         # to the same columns for every row -> one vectorized write.
@@ -178,7 +171,19 @@ class Qwen2RecLM(GenerativeRecLM):
         return int((tmp == 1).float().argmax(dim=-1).min().item())
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
-        """Decoder-only forward: splice → ``.model`` → suffix-slice → CE loss."""
+        """Dispatch on the TER inference flag (``set_is_inference`` in main.py).
+
+        Branch 1 (train / eval, ``not is_inference``) — teacher-forced forward +
+        CE loss (the metric path).
+        Branch 2 (inference, ``is_inference``) — beam-search the SID answer from
+        the prompt.
+        """
+        if self.is_inference:
+            return self._generate(batch)
+        return self._predict_train(batch)
+
+    def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Branch 1: teacher-forced forward -> suffix-slice -> CE loss."""
         # SID indices -> token ids once, at the data boundary (see
         # _sid_token_rows); the splice then just assembles the prompt.
         u_rows = self._sid_token_rows(batch.sequence_dense_features[self._input_name])
@@ -230,3 +235,67 @@ class Qwen2RecLM(GenerativeRecLM):
             vocab_size=self.lm.config.vocab_size,
         )
         return {"loss": loss, "logits": logits}
+
+    def _generate(self, batch: Batch) -> Dict[str, torch.Tensor]:
+        """Branch 2: beam-search the SID answer (no ground truth supplied).
+
+        Builds the prompt (no answer), generates exactly ``num_levels`` new
+        tokens per beam, and maps them back to raw SID indices. Returns
+        ``generated_sids`` of shape ``(B, num_return, num_levels)``.
+        """
+        u_rows = self._sid_token_rows(batch.sequence_dense_features[self._input_name])
+        input_ids, attention_mask = self._splice_prompt_ids(u_rows)
+        out = self.lm.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=self._num_levels,
+            num_beams=self._num_beams,
+            num_return_sequences=self._num_return,
+            do_sample=False,
+            pad_token_id=self._pad_token_id,
+        )
+        # keep only the generated tail; map token ids back to raw SID indices
+        # (inverse of _tokenize_sids: sid = token - base_vocab + 1).
+        new_tokens = out[:, input_ids.shape[1]:]
+        sids = new_tokens - (self._base_vocab - 1)
+        # generate() returns rows grouped batch-major: [b0_beam0, b0_beam1, ...,
+        # b1_beam0, ...], so this view groups beams under the right user.
+        sids = sids.view(input_ids.shape[0], self._num_return, self._num_levels)
+        return {self.GENERATED_SIDS_KEY: sids}
+
+    def _splice_prompt_ids(
+        self, user_seq_rows: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Assemble the answer-less prompt and left-pad into ``(B, T_max)``.
+
+        Layout: ``[system | user_prefix | history | user_suffix | asst_prefix]``
+        — everything up to (but not including) the answer, so generation
+        continues from the assistant turn.
+        """
+        rows = [
+            torch.cat([
+                self.tpl_system, self.tpl_user_prefix, r,
+                self.tpl_user_suffix, self.tpl_asst_prefix,
+            ])
+            for r in user_seq_rows
+        ]
+        return self._left_pad(rows)
+
+    def _left_pad(
+        self, rows: List[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Left-pad token rows into ``(input_ids, attention_mask)``, ``(B, T_max)``.
+
+        Real content is right-aligned, pad at the front. ``attention_mask`` is
+        built from ``ones_like(row)`` (not ``!= pad``) so a real trailing eos is
+        never masked when ``pad_token_id == eos``.
+        """
+        input_ids = pad_sequence(
+            rows, batch_first=True,
+            padding_value=self._pad_token_id, padding_side="left",
+        )
+        attention_mask = pad_sequence(
+            [torch.ones_like(r) for r in rows], batch_first=True,
+            padding_value=0, padding_side="left",
+        )
+        return input_ids, attention_mask

@@ -63,6 +63,10 @@ class GenerativeRecLM(BaseModel):
     ``generative_rec_lm.class_name`` (resolved through the BaseModel registry).
     """
 
+    # predictions key the inference branch emits generated SIDs under, stable
+    # across families (PredictWrapper ``output_cols`` should reference it).
+    GENERATED_SIDS_KEY = "generated_sids"
+
     def __new__(cls, model_config: ModelConfig, *args: Any, **kwargs: Any):
         """Dispatch to the concrete family subclass.
 
@@ -111,6 +115,9 @@ class GenerativeRecLM(BaseModel):
         self._num_levels = len(codebook)
         sid_atoms = sum(int(c) for c in codebook)
         pad_mult = int(cfg.vocab_pad_to_multiple_of) or 128
+        # beam-search params for the inference branch (proto defaults = 50/50)
+        self._num_beams = int(cfg.num_beams)
+        self._num_return = int(cfg.num_return_sequences)
 
         # backbone + tokenizer
         hf_model_id = cfg.hf_model_id

@@ -69,4 +69,10 @@ message GenerativeRecLM {
 
     // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
     optional int32 ignore_index = 53 [default = -100];
+
+    // ----- Inference (beam search) -----
+    // Used only by the inference branch of predict() (tzrec.predict / export).
+    // Defaults match algr's predict config.
+    optional uint32 num_beams = 80 [default = 50];
+    optional uint32 num_return_sequences = 81 [default = 50];
 }

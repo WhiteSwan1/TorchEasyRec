@@ -85,6 +85,47 @@ class Qwen2RecLMTest(unittest.TestCase):
         labels = torch.tensor([[-100, -100, 5, 6], [-100, 7, 8, 9]])
         self.assertEqual(Qwen2RecLM._min_first_non_neg_index(labels), 1)
 
+    def test_splice_prompt_ids(self) -> None:
+        m = _stub()
+        ids, mask = m._splice_prompt_ids([torch.tensor([100, 101, 102])])
+        # [system | user_prefix | history | user_suffix | asst_prefix], no answer
+        self.assertEqual(ids[0].tolist(), [10, 11, 12, 100, 101, 102, 13, 14])
+        self.assertEqual(mask[0].tolist(), [1] * 8)
+
+    def test_predict_routes_on_inference_flag(self) -> None:
+        m = _stub()
+        m._predict_train = lambda b: {"branch": "train"}
+        m._generate = lambda b: {"branch": "generate"}
+        m._is_inference = False  # train / eval
+        self.assertEqual(Qwen2RecLM.predict(m, object())["branch"], "train")
+        m._is_inference = True  # inference (set_is_inference in main.py)
+        self.assertEqual(Qwen2RecLM.predict(m, object())["branch"], "generate")
+
+    def test_generate_maps_tokens_to_sids(self) -> None:
+        m = _stub(base_vocab=100)  # sid = token - base + 1 = token - 99
+        m._input_name = "user_sequence"
+        m._num_beams = m._num_return = 2
+
+        def fake_generate(input_ids, attention_mask, max_new_tokens,
+                          num_beams, num_return_sequences, do_sample, pad_token_id):
+            prompt = input_ids.repeat_interleave(num_return_sequences, dim=0)
+            new = torch.tensor([[200, 201, 202], [203, 204, 205]])  # 2 beams x 3 codes
+            return torch.cat([prompt, new], dim=1)
+
+        m.lm.generate = fake_generate
+
+        class _JT:
+            def values(self):
+                return torch.tensor([1, 2, 3], dtype=torch.float)
+
+            def lengths(self):
+                return torch.tensor([3])
+
+        batch = types.SimpleNamespace(sequence_dense_features={"user_sequence": _JT()})
+        sids = m._generate(batch)["generated_sids"]
+        self.assertEqual(tuple(sids.shape), (1, 2, 3))  # (B, num_return, num_levels)
+        self.assertEqual(sids[0].tolist(), [[101, 102, 103], [104, 105, 106]])
+
     def test_build_prompt_tokens_registers_buffers(self) -> None:
         m = object.__new__(Qwen2RecLM)
         nn.Module.__init__(m)
