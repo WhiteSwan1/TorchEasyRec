@@ -30,13 +30,15 @@ the ChatML ``_build_prompt_tokens``) into an intermediate
 they live here.
 """
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from tzrec.datasets.utils import Batch
+from tzrec.features.feature import BaseFeature
 from tzrec.models.generative_rec_lm import GenerativeRecLM
+from tzrec.protos.model_pb2 import ModelConfig
 
 
 def _encode_no_special(tokenizer, text: str) -> List[int]:
@@ -66,6 +68,71 @@ class Qwen2RecLM(GenerativeRecLM):
     """Qwen2 / Qwen2.5 generative-recommendation LM."""
 
     CHAT_TEMPLATE = QWEN2_TEMPLATE
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        features: List[BaseFeature],
+        labels: List[str],
+        sample_weights: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        common = self._model_config.common
+        # generation params — read in the subclass because only this family's
+        # _generate (the inference branch) consumes them.
+        self._num_beams = int(common.num_beams)
+        self._num_return = int(common.num_return_sequences)
+        # worst-case spliced length (template-aware) and the one-shot warm-up
+        # latch; the base supplies max_seq_length, batch_size, and the tpl_*
+        # buffers (built in super().__init__ via _build_prompt_tokens).
+        self._max_total_len = self._compute_max_total_length()
+        self._pool_warmed = False
+
+    def _compute_max_total_length(self) -> int:
+        """Full spliced length at the max history (0 if pre-allocation is off).
+
+        Mirrors ``_splice_input_ids``: fixed ChatML frame + ``self._max_seq_length``
+        history codes (the user-sequence feature's truncation length, supplied by
+        the base) + the ``num_levels``-code answer (the eos sits inside the
+        frame). This is the ``T`` the activation pool is pre-sized to.
+        """
+        if self._max_seq_length <= 0:
+            return 0
+        frame = (
+            self.tpl_system.numel()
+            + self.tpl_user_prefix.numel()
+            + self.tpl_user_suffix.numel()
+            + self.tpl_asst_prefix.numel()
+            + self.tpl_asst_suffix.numel()
+            + self.tpl_eos.numel()
+        )
+        return int(frame + self._max_seq_length + self._num_levels)
+
+    def _warmup_alloc(self) -> None:
+        """One-shot: build the CUDA activation pool at the worst case (B, T_max).
+
+        Runs a dummy forward+backward at the configured maximum length so the
+        caching allocator reserves its largest segments up front; every real
+        (shorter) batch is then served from that pool, so it never grows
+        mid-run — which is what stranded segments unevenly across ranks. Fires
+        from the first training step (earliest point the backbone is on-GPU);
+        the throwaway gradients are zeroed before the real step runs.
+        """
+        batch_size = self._batch_size or 1
+        device = self.device
+        tok = self._base_vocab  # C0 — a valid extended-vocab id
+        u_rows = [
+            torch.full((self._max_seq_length,), tok, dtype=torch.long, device=device)
+            for _ in range(batch_size)
+        ]
+        l_rows = [
+            torch.full((self._num_levels,), tok, dtype=torch.long, device=device)
+            for _ in range(batch_size)
+        ]
+        input_ids, labels, attention_mask = self._splice_input_ids(u_rows, l_rows)
+        self._forward_loss(input_ids, labels, attention_mask)["loss"].backward()
+        self.lm.zero_grad(set_to_none=True)
 
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Tokenise the family chat template once; cache as buffers.
@@ -185,9 +252,18 @@ class Qwen2RecLM(GenerativeRecLM):
 
     def _predict_train(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Branch 1: teacher-forced forward -> suffix-slice -> CE loss."""
+        # one-shot: pre-size the activation pool at the worst-case length on the
+        # first on-GPU training step (see _warmup_alloc); no-op once warmed or
+        # when the input feature has no truncation length (pre-allocation off).
+        if not self._pool_warmed and self._max_total_len > 0 and self.is_train:
+            self._warmup_alloc()
+            self._pool_warmed = True
         # SID indices -> token ids once, at the data boundary (see
         # _sid_token_rows); the splice then just assembles the prompt.
-        u_rows = self._sid_token_rows(batch.sequence_dense_features[self._input_name])
+        u_rows = self._sid_token_rows(
+            batch.sequence_dense_features[self._input_name],
+            max_codes=self._max_seq_length,  # cap to most-recent items (drop oldest)
+        )
         l_rows = self._sid_token_rows(
             batch.sequence_dense_features[self._label_name],
             expected_width=self._num_levels,  # answer = one item = num_levels codes
@@ -206,9 +282,20 @@ class Qwen2RecLM(GenerativeRecLM):
             )
             self._first_predict = False
 
-        outputs = self.lm.model(
-            input_ids=input_ids, attention_mask=attention_mask
-        )
+        return self._forward_loss(input_ids, labels, attention_mask)
+
+    def _forward_loss(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Teacher-forced forward over spliced ids -> suffix-slice -> CE loss.
+
+        Shared by ``_predict_train`` and the ``_warmup_alloc`` dummy step so the
+        pre-allocation reproduces the exact training allocation pattern.
+        """
+        outputs = self.lm.model(input_ids=input_ids, attention_mask=attention_mask)
         hidden = outputs.last_hidden_state  # (B, T, D)
 
         # Suffix slice in BOTH train and eval. algr only slices when
@@ -244,7 +331,10 @@ class Qwen2RecLM(GenerativeRecLM):
         tokens per beam, and maps them back to raw SID indices. Returns
         ``generated_sids`` of shape ``(B, num_return, num_levels)``.
         """
-        u_rows = self._sid_token_rows(batch.sequence_dense_features[self._input_name])
+        u_rows = self._sid_token_rows(
+            batch.sequence_dense_features[self._input_name],
+            max_codes=self._max_seq_length,  # cap to most-recent items (drop oldest)
+        )
         input_ids, attention_mask = self._splice_prompt_ids(u_rows)
         out = self.lm.generate(
             input_ids=input_ids,

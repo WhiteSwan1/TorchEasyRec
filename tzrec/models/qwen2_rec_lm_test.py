@@ -30,6 +30,7 @@ def _stub(num_levels=3, base_vocab=100, pad_id=9, device="cpu"):
     m._num_levels = num_levels
     m._base_vocab = base_vocab
     m._pad_token_id = pad_id
+    m._max_seq_length = 0  # no recency clip by default in unit stubs
     m.lm = types.SimpleNamespace(device=torch.device(device))
     for name, vals in {
         "tpl_system": [10, 11], "tpl_user_prefix": [12], "tpl_user_suffix": [13],
@@ -145,6 +146,95 @@ class Qwen2RecLMTest(unittest.TestCase):
             self.assertIsInstance(buf, torch.Tensor)
             self.assertEqual(buf.dtype, torch.int64)
         self.assertEqual(m.tpl_eos.tolist(), [99])  # eos cached for supervision
+
+    def test_input_sequence_length_from_feature(self) -> None:
+        m = object.__new__(Qwen2RecLM)
+        m._input_name = "user_sequence"
+        f_user = types.SimpleNamespace(
+            config=types.SimpleNamespace(feature_name="user_sequence"),
+            sequence_length=300,
+        )
+        f_label = types.SimpleNamespace(
+            config=types.SimpleNamespace(feature_name="label"), sequence_length=32
+        )
+        m._features = [f_label, f_user]
+        self.assertEqual(m._input_sequence_length(), 300)  # truncation length
+        m._features = [f_label]  # user-sequence feature absent
+        self.assertEqual(m._input_sequence_length(), 0)
+        f_user.sequence_length = None  # no length cap -> pre-allocation disabled
+        m._features = [f_user]
+        self.assertEqual(m._input_sequence_length(), 0)
+
+    def test_sid_token_rows_recency_clip(self) -> None:
+        m = _stub(num_levels=3, base_vocab=100)  # token = sid + base - 1 = sid + 99
+
+        def _jt(n):  # one row of n codes: values 1..n
+            return types.SimpleNamespace(
+                values=lambda: torch.arange(1, n + 1, dtype=torch.float),
+                lengths=lambda: torch.tensor([n]),
+            )
+
+        # 15 codes (5 items), cap 9 -> keep last 9 (items 3-5 = codes 7..15)
+        rows = m._sid_token_rows(_jt(15), max_codes=9)
+        self.assertEqual(rows[0].tolist(), [c + 99 for c in range(7, 16)])
+        # item-aligned: cap 10 still keeps 9 (3 whole items), never cuts mid-item
+        rows = m._sid_token_rows(_jt(15), max_codes=10)
+        self.assertEqual(rows[0].tolist(), [c + 99 for c in range(7, 16)])
+        # within cap -> untouched
+        rows = m._sid_token_rows(_jt(6), max_codes=9)
+        self.assertEqual(rows[0].tolist(), [c + 99 for c in range(1, 7)])
+        # disabled (0/None) -> no clip
+        rows = m._sid_token_rows(_jt(15), max_codes=0)
+        self.assertEqual(rows[0].tolist(), [c + 99 for c in range(1, 16)])
+
+    def test_compute_max_total_length(self) -> None:
+        m = _stub(num_levels=3)
+        # frame = |system|2 + |user_prefix|1 + |user_suffix|1 + |asst_prefix|1
+        #         + |asst_suffix|1 + |eos|1 = 7; + max_history + answer(num_levels)
+        m._max_seq_length = 300
+        self.assertEqual(m._compute_max_total_length(), 7 + 300 + 3)
+        m._max_seq_length = 0  # pre-allocation disabled
+        self.assertEqual(m._compute_max_total_length(), 0)
+
+    def test_warmup_fires_once_in_training(self) -> None:
+        m = _stub()
+        m._is_inference = False  # not inference + nn.Module.training=True -> is_train
+        m._smoke_log_once = False
+        m._input_name, m._label_name = "user_sequence", "label"
+        m._max_total_len = 50
+        m._pool_warmed = False
+        calls = []
+        m._warmup_alloc = lambda: calls.append(1)
+        m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
+            torch.tensor([100, 101, 102])
+        ]
+        m._forward_loss = lambda i, lbl, a: {"loss": torch.tensor(0.0)}
+        batch = types.SimpleNamespace(
+            sequence_dense_features={"user_sequence": None, "label": None}
+        )
+        m._predict_train(batch)
+        m._predict_train(batch)
+        self.assertEqual(len(calls), 1)  # one-shot, latched by _pool_warmed
+        self.assertTrue(m._pool_warmed)
+
+    def test_warmup_skipped_when_disabled(self) -> None:
+        m = _stub()
+        m._is_inference = False
+        m._smoke_log_once = False
+        m._input_name, m._label_name = "user_sequence", "label"
+        m._max_total_len = 0  # max_seq_length unset -> pre-allocation off
+        m._pool_warmed = False
+        calls = []
+        m._warmup_alloc = lambda: calls.append(1)
+        m._sid_token_rows = lambda jt, expected_width=None, max_codes=None: [
+            torch.tensor([100, 101, 102])
+        ]
+        m._forward_loss = lambda i, lbl, a: {"loss": torch.tensor(0.0)}
+        batch = types.SimpleNamespace(
+            sequence_dense_features={"user_sequence": None, "label": None}
+        )
+        m._predict_train(batch)
+        self.assertEqual(calls, [])  # never warms up when disabled
 
 
 if __name__ == "__main__":

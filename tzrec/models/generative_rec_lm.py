@@ -82,6 +82,10 @@ class GenerativeRecLM(BaseModel):
         sample_weights: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> None:
+        # per-rank batch size, threaded from data_config.batch_size by
+        # _create_model (absorbed by BaseModule's **kwargs); used to pre-size
+        # the activation pool. 0 = unknown (e.g. export/predict construction).
+        self._batch_size: int = int(kwargs.get("batch_size") or 0)
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
         cfg = self._model_config  # the family message (e.g. Qwen2RecLM)
         common = cfg.common  # GenerativeRecLMConfig — shared by all families
@@ -90,6 +94,10 @@ class GenerativeRecLM(BaseModel):
         self._input_name: str = common.user_sequence_feature_name
         self._label_name: str = common.label_feature_name
         self._ignore_index: int = int(common.ignore_index)
+        # max history length (SID codes) for activation pre-allocation, taken
+        # from the user-sequence feature's truncation length (the data reader
+        # caps every row at it, so it's the guaranteed upper bound). 0 = off.
+        self._max_seq_length: int = self._input_sequence_length()
         codebook = list(common.codebook)
         if len(codebook) == 0:
             raise ValueError(
@@ -100,9 +108,6 @@ class GenerativeRecLM(BaseModel):
         self._num_levels = len(codebook)
         sid_atoms = sum(int(c) for c in codebook)
         pad_mult = int(common.vocab_pad_to_multiple_of) or 128
-        # beam-search params for the inference branch (proto defaults = 50/50)
-        self._num_beams = int(common.num_beams)
-        self._num_return = int(common.num_return_sequences)
 
         # backbone + tokenizer (the backbone is family-owned; see _backbone_id)
         hf_model_id = self._backbone_id()
@@ -166,6 +171,19 @@ class GenerativeRecLM(BaseModel):
         """
         return self._model_config.hf_model_id
 
+    def _input_sequence_length(self) -> int:
+        """Truncation length (SID codes) of the user-sequence feature.
+
+        The data reader caps every row's history at the feature's
+        ``sequence_length``, so it is the guaranteed upper bound used to
+        pre-size the activation pool (see ``Qwen2RecLM._warmup_alloc``). Returns
+        0 if the feature has no length cap, which disables pre-allocation.
+        """
+        for feature in self._features:
+            if feature.config.feature_name == self._input_name:
+                return int(getattr(feature, "sequence_length", 0) or 0)
+        return 0
+
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
 
@@ -201,7 +219,10 @@ class GenerativeRecLM(BaseModel):
         return sids + (self._base_vocab - 1)
 
     def _sid_token_rows(
-        self, jt, expected_width: Optional[int] = None
+        self,
+        jt,
+        expected_width: Optional[int] = None,
+        max_codes: Optional[int] = None,
     ) -> List[torch.Tensor]:
         """Read a SID jagged feature -> per-row token-id tensors.
 
@@ -213,6 +234,15 @@ class GenerativeRecLM(BaseModel):
         ``expected_width``, when set, enforces the sample contract here at the
         data boundary: every row must have exactly that many codes (e.g. the
         answer = ``num_levels``); a deviation is an anomalous sample.
+
+        ``max_codes``, when set, caps each row to its most-recent whole items —
+        the last ``floor(max_codes / num_levels) * num_levels`` codes, dropping
+        the oldest *head* (sequences are oldest->newest, so recent behaviour is
+        preserved). FG_NONE does not truncate, so this is what actually enforces
+        the feature's ``sequence_length`` — guaranteeing the pre-allocated pool
+        covers every batch. Done on host views before the H2D copy, and skipped
+        entirely unless some row overflows, so it's free in the common case and
+        shrinks downstream work (and forward ``T``) when it fires.
         """
         values = jt.values()
         lengths = jt.lengths()
@@ -228,6 +258,12 @@ class GenerativeRecLM(BaseModel):
                     f"{expected_width} codes (len(codebook)); rows {bad} have "
                     f"{[sizes[i] for i in bad]} — anomalous sample(s)."
                 )
+        if max_codes:
+            keep = (max_codes // self._num_levels) * self._num_levels
+            if keep and any(n > keep for n in sizes):
+                rows = torch.split(values, sizes)  # host views, no copy
+                values = torch.cat([r[-keep:] for r in rows])  # keep recent tail
+                sizes = [min(n, keep) for n in sizes]
         # one vectorized SID->token map over the whole batch, on the backbone device
         values = self._tokenize_sids(values.to(self.device).long())
         return list(torch.split(values, sizes))
