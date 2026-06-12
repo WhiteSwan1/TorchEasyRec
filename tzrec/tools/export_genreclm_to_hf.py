@@ -34,7 +34,6 @@ import os
 import torch
 from google.protobuf import text_format
 from torch.distributed.checkpoint import FileSystemReader, load
-from transformers import AutoTokenizer
 
 from tzrec.models.generative_rec_lm import GenerativeRecLM  # noqa: F401
 from tzrec.models.model import BaseModel
@@ -85,17 +84,12 @@ def main() -> int:
             f"dtype={emb.dtype} mean_abs={emb.abs().mean().item():.6f}"
         )
 
-    os.makedirs(args.export_dir, exist_ok=True)
-    print(f"[export] save_pretrained -> {args.export_dir}")
-    model.lm.save_pretrained(args.export_dir)
-
-    # Save the EXTENDED tokenizer (TER layout: C0 at len(base tokenizer),
-    # no [SEP]) so downstream generation maps SID atoms identically.
-    tokenizer = AutoTokenizer.from_pretrained(grl_cfg.hf_model_id, use_fast=True)
-    base = len(tokenizer)
-    tokenizer.add_tokens([f"C{i}" for i in range(sum(grl_cfg.common.codebook))])
-    assert tokenizer.convert_tokens_to_ids("C0") == base
-    tokenizer.save_pretrained(args.export_dir)
+    # Reuse the model's HF-save (backbone + extended tokenizer) — the SAME code
+    # path as the in-training checkpoint hook, so offline and online exports are
+    # byte-identical.
+    print(f"[export] save_pretrained + tokenizer -> {args.export_dir}")
+    model.export_hf(args.export_dir)
+    base = model._base_vocab
     with open(os.path.join(args.export_dir, "TER_EXPORT_INFO.txt"), "w") as f:
         f.write(
             f"source_checkpoint={args.checkpoint_path}\n"
