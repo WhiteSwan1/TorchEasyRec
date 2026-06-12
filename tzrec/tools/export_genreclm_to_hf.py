@@ -4,7 +4,7 @@
 # You may obtain a copy of the License at
 #    http://www.apache.org/licenses/LICENSE-2.0
 
-"""Export a `GenerativeRecLM` TER DCP checkpoint to a HF-loadable directory.
+r"""Export a `GenerativeRecLM` TER DCP checkpoint to a HF-loadable directory.
 
 Design §6.4 (FINAL_DESIGN_GENERATIVE_REC_LM.md), simplified: instead of
 hand-writing safetensors shards, we rebuild the model from the pipeline
@@ -34,14 +34,17 @@ import os
 import torch
 from google.protobuf import text_format
 from torch.distributed.checkpoint import FileSystemReader, load
+from transformers import AutoTokenizer
 
 from tzrec.models.generative_rec_lm import GenerativeRecLM  # noqa: F401
 from tzrec.models.model import BaseModel
+from tzrec.models.qwen2_rec_lm import Qwen2RecLM  # noqa: F401  (register family)
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
-from transformers import AutoTokenizer
+from tzrec.utils import config_util
 
 
 def main() -> int:
+    """Export a GenerativeRecLM DCP checkpoint to a HF-loadable dir."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--pipeline_config_path", required=True)
     ap.add_argument("--checkpoint_path", required=True)
@@ -53,12 +56,15 @@ def main() -> int:
         text_format.Merge(f.read(), pipeline_config)
     model_config = pipeline_config.model_config
     grl_cfg = getattr(model_config, model_config.WhichOneof("model"))
+    # Resolve the family class from the oneof message-type name (e.g.
+    # "Qwen2RecLM"), the same way main._create_model does — no class_name field.
+    model_cls_name = config_util.which_msg(model_config, "model")
 
     # Rebuild the model exactly as training did (from_pretrained backbone +
     # SID vocab extension), CPU-resident.
-    print(f"[export] building {grl_cfg.class_name} from {grl_cfg.hf_model_id}")
+    print(f"[export] building {model_cls_name} from {grl_cfg.hf_model_id}")
     # pyre-ignore [16]
-    model_cls = BaseModel.create_class("GenerativeRecLM")
+    model_cls = BaseModel.create_class(model_cls_name)
     model = model_cls(model_config, features=[], labels=[])
     model.eval()
 
@@ -87,7 +93,7 @@ def main() -> int:
     # no [SEP]) so downstream generation maps SID atoms identically.
     tokenizer = AutoTokenizer.from_pretrained(grl_cfg.hf_model_id, use_fast=True)
     base = len(tokenizer)
-    tokenizer.add_tokens([f"C{i}" for i in range(sum(grl_cfg.codebook))])
+    tokenizer.add_tokens([f"C{i}" for i in range(sum(grl_cfg.common.codebook))])
     assert tokenizer.convert_tokens_to_ids("C0") == base
     tokenizer.save_pretrained(args.export_dir)
     with open(os.path.join(args.export_dir, "TER_EXPORT_INFO.txt"), "w") as f:
@@ -95,7 +101,7 @@ def main() -> int:
             f"source_checkpoint={args.checkpoint_path}\n"
             f"pipeline_config={args.pipeline_config_path}\n"
             f"sid_base_token_id={base}\n"
-            f"codebook={list(grl_cfg.codebook)}\n"
+            f"codebook={list(grl_cfg.common.codebook)}\n"
             "note=C atoms appended directly after base vocab (NO [SEP]); "
             "token_id = base + (sid - 1) for 1-indexed SIDs / base + k for C{k}.\n"
         )

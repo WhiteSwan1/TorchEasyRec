@@ -184,6 +184,24 @@ class GenerativeRecLM(BaseModel):
                 return int(getattr(feature, "sequence_length", 0) or 0)
         return 0
 
+    def export_hf(self, export_dir: str) -> None:
+        """Save the HF backbone + extended tokenizer as a HF-loadable dir.
+
+        Mirrors ``tzrec.tools.export_genreclm_to_hf`` but straight from the
+        live in-memory model, so intermediate training checkpoints can be saved
+        in HF (``from_pretrained``-loadable) format alongside the DCP
+        checkpoints (see the save hook in ``main._train_and_evaluate``). Call on
+        rank 0 only; the dense backbone is replicated, so rank 0 holds the full
+        weights. The extended tokenizer is rebuilt (base + C0..C{sum-1}) so SID
+        atoms decode with the same ids the model trained on.
+        """
+        os.makedirs(export_dir, exist_ok=True)
+        self.lm.save_pretrained(export_dir)
+        tokenizer = AutoTokenizer.from_pretrained(self._backbone_id(), use_fast=True)
+        sid_atoms = sum(int(c) for c in self._model_config.common.codebook)
+        tokenizer.add_tokens([f"C{i}" for i in range(sid_atoms)])
+        tokenizer.save_pretrained(export_dir)
+
     def _build_prompt_tokens(self, tokenizer, cfg) -> None:
         """Family hook: cache the tokenised prompt template as buffers.
 

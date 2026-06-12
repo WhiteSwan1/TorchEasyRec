@@ -466,6 +466,13 @@ def _train_and_evaluate(
                 if i_step % save_checkpoints_steps == 0:
                     last_ckpt_step = i_step
                     ckpt_manager.save(i_step, model, optimizer, dataloader_state)
+                    # also save an HF-loadable copy (GenerativeRecLM family only)
+                    # so intermediate checkpoints are directly inspectable
+                    # without the DCP->HF export round-trip.
+                    if is_rank_zero and hasattr(_model, "export_hf"):
+                        _model.export_hf(
+                            os.path.join(model_dir, f"hf_ckpt-{i_step}")
+                        )
                     if eval_dataloader is not None:
                         _evaluate(
                             model,
