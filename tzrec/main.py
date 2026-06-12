@@ -24,6 +24,8 @@ from torch import distributed as dist
 from torch import nn, optim
 from torch.amp import GradScaler
 from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint import load as dcp_load
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.optim.apply_optimizer_in_backward import (
@@ -960,6 +962,24 @@ def export(
             checkpoint_path, _ = ckpt_manager.best_checkpoint()
         else:
             checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+    # GenerativeRecLM family: export to a HF (from_pretrained-loadable) dir
+    # instead of TorchScript. Overlay the DCP checkpoint (training FQNs are
+    # ``model.lm.<hf_fqn>``) and reuse the model's ``export_hf`` save path — the
+    # same code path as the in-training checkpoint hook, so there is no separate
+    # export tool and no duplicated save.
+    grl_model = model.model
+    if hasattr(grl_model, "export_hf"):
+        ckpt_model_dir = os.path.join(checkpoint_path, "model")
+        lm_sd = grl_model.lm.state_dict()
+        prefixed = {f"model.lm.{k}": v for k, v in lm_sd.items()}
+        dcp_load(prefixed, storage_reader=FileSystemReader(ckpt_model_dir))
+        grl_model.lm.load_state_dict(
+            {k[len("model.lm.") :]: v for k, v in prefixed.items()}
+        )
+        if is_rank_zero:
+            grl_model.export_hf(export_dir)
+        return
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():

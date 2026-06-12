@@ -187,13 +187,14 @@ class GenerativeRecLM(BaseModel):
     def export_hf(self, export_dir: str) -> None:
         """Save the HF backbone + extended tokenizer as a HF-loadable dir.
 
-        Mirrors ``tzrec.tools.export_genreclm_to_hf`` but straight from the
-        live in-memory model, so intermediate training checkpoints can be saved
-        in HF (``from_pretrained``-loadable) format alongside the DCP
-        checkpoints (see the save hook in ``main._train_and_evaluate``). Call on
-        rank 0 only; the dense backbone is replicated, so rank 0 holds the full
-        weights. The extended tokenizer is rebuilt (base + C0..C{sum-1}) so SID
-        atoms decode with the same ids the model trained on.
+        Single source of truth for HF (``from_pretrained``-loadable) export,
+        reused by BOTH ``main.export`` (the standard TER export path, after it
+        overlays the DCP checkpoint) and the in-training checkpoint hook in
+        ``main._train_and_evaluate`` — so offline and online exports are
+        identical and there is no separate export tool. Call on rank 0 only;
+        the dense backbone is replicated, so rank 0 holds the full weights. The
+        extended tokenizer is rebuilt (base + C0..C{sum-1}) so SID atoms decode
+        with the same ids the model trained on.
         """
         os.makedirs(export_dir, exist_ok=True)
         self.lm.save_pretrained(export_dir)
