@@ -52,3 +52,4 @@ data/test/kuairand-mot-1k*
 tmp/
 docker/requirements*
 experiments/
+ai_report/

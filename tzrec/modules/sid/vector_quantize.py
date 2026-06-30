@@ -225,6 +225,10 @@ class VectorQuantizeLayer(QuantizeLayer):
         ids = self._find_nearest_embedding(x)
         return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
 
+    def compute_distances(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute distances with the layer's configured assignment metric."""
+        return self._compute_distances(x)
+
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""
         return self.embedding.weight

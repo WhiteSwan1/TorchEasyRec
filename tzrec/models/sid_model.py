@@ -82,6 +82,7 @@ class BaseSidModel(BaseModel):
                 f"every codebook entry must be >= 1, got {self._n_embed_list}"
             )
         self._n_layers = len(self._n_embed_list)
+        self._init_candidate_output_config()
 
         self.init_input()
         self._feature_group = self.embedding_group.group_names()[0]
@@ -91,6 +92,74 @@ class BaseSidModel(BaseModel):
                 f"feature group {self._feature_group!r} has total dim "
                 f"{self._input_dim}; it must be >= 1"
             )
+
+    def _init_candidate_output_config(self) -> None:
+        """Read optional inference candidate-output settings."""
+        self._candidate_output_enabled = False
+        self._candidate_output_topk = 0
+        self._candidate_output_strategy = "last_layer_knn"
+        self._candidate_output_target_layer = self._n_layers - 1
+        self._candidate_output_include_origin = True
+
+        cfg = self._model_config
+        if not hasattr(cfg, "candidate_output_config") or not cfg.HasField(
+            "candidate_output_config"
+        ):
+            return
+        candidate_cfg = cfg.candidate_output_config
+        if not candidate_cfg.enabled:
+            return
+
+        topk = int(candidate_cfg.topk)
+        if topk < 1:
+            raise ValueError(f"candidate_output_config.topk must be >= 1, got {topk}")
+        strategy = candidate_cfg.strategy
+        if strategy != "last_layer_knn":
+            raise ValueError(
+                "candidate_output_config.strategy supports only 'last_layer_knn' in v1."
+            )
+        target_layer = int(candidate_cfg.target_layer)
+        if target_layer < 0:
+            target_layer += self._n_layers
+        if target_layer < 0 or target_layer >= self._n_layers:
+            raise ValueError(
+                f"candidate_output_config.target_layer out of range for "
+                f"{self._n_layers} layers: {candidate_cfg.target_layer}"
+            )
+        if target_layer != self._n_layers - 1:
+            raise ValueError(
+                "candidate_output_config.target_layer supports only the last "
+                "layer in v1."
+            )
+        if topk > self._n_embed_list[target_layer]:
+            raise ValueError(
+                f"candidate_output_config.topk ({topk}) must be <= target "
+                f"layer codebook size ({self._n_embed_list[target_layer]})."
+            )
+
+        self._candidate_output_enabled = True
+        self._candidate_output_topk = topk
+        self._candidate_output_strategy = strategy
+        self._candidate_output_target_layer = target_layer
+        self._candidate_output_include_origin = candidate_cfg.include_origin
+
+    def _sid_candidate_predictions(
+        self, embedding: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Return optional candidate SID prediction tensors."""
+        if not self._candidate_output_enabled:
+            return {}
+        candidate_codes, candidate_scores = self._quantizer.get_code_candidates(
+            embedding,
+            topk=self._candidate_output_topk,
+            strategy=self._candidate_output_strategy,
+            target_layer=self._candidate_output_target_layer,
+            include_origin=self._candidate_output_include_origin,
+        )
+        return {
+            "candidate_codes": candidate_codes,
+            "candidate_scores": candidate_scores,
+        }
 
     def init_input(self) -> None:
         """Build the :class:`EmbeddingGroup` from features + feature groups."""

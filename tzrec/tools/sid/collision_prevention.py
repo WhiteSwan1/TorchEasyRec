@@ -188,6 +188,7 @@ def _load_candidate_rows(
     compact_candidate_field: Optional[str],
     priority_field: Optional[str],
     score_field: Optional[str],
+    code_delimiter: str,
     candidate_delimiter: str,
     reader_type: Optional[str],
     batch_size: int,
@@ -218,7 +219,7 @@ def _load_candidate_rows(
                 rows.append(
                     CandidateSidRow(
                         item_key=str(item_id),
-                        candidate_codebook=_cell_to_code(candidate, ","),
+                        candidate_codebook=_cell_to_code(candidate, code_delimiter),
                         priority=int(priorities[i]) if priorities is not None else 1,
                         score=float(scores[i]) if scores is not None else 0.0,
                     )
@@ -329,10 +330,19 @@ def assign_sid_collisions(
             assigned_items.add(row.item_key)
             code_counts[codebook] += 1
 
-    candidates_by_item: Dict[str, List[CandidateSidRow]] = defaultdict(list)
+    dedup_candidates: Dict[Tuple[str, str], CandidateSidRow] = {}
     for row in candidate_rows:
         if row.item_key in raw_by_item:
-            candidates_by_item[row.item_key].append(row)
+            key = (row.item_key, row.candidate_codebook)
+            current = dedup_candidates.get(key)
+            if current is None or _candidate_sort_key(
+                seed, row, score_order
+            ) < _candidate_sort_key(seed, current, score_order):
+                dedup_candidates[key] = row
+
+    candidates_by_item: Dict[str, List[CandidateSidRow]] = defaultdict(list)
+    for row in dedup_candidates.values():
+        candidates_by_item[row.item_key].append(row)
 
     overflow_items = set(raw_by_item) - assigned_items
     if overflow_items and not candidate_rows:
@@ -566,6 +576,7 @@ def run_local(args: argparse.Namespace) -> AssignmentStats:
             compact_candidate_field=args.compact_candidate_field,
             priority_field=args.priority_field,
             score_field=args.score_field,
+            code_delimiter=args.code_delimiter,
             candidate_delimiter=args.candidate_delimiter,
             reader_type=args.candidate_reader_type or args.reader_type,
             batch_size=args.batch_size,
@@ -766,6 +777,11 @@ def generate_odps_sql(args: argparse.Namespace) -> List[str]:
                     f"    FROM {cand_table}\n"
                     f"    WHERE 1=1{cand_predicate}\n"
                     "  ) c\n"
+                    "  INNER JOIN (\n"
+                    f"    SELECT CAST({args.item_id_field} AS STRING) AS item_id\n"
+                    f"    FROM {raw_table}\n"
+                    f"    WHERE 1=1{raw_predicate}\n"
+                    "  ) r ON c.item_id = r.item_id\n"
                     f"  LEFT OUTER JOIN {assigned} a ON c.item_id = a.item_id\n"
                     f"  LEFT OUTER JOIN {counts} cnt ON c.codebook = cnt.codebook\n"
                     "  WHERE a.item_id IS NULL\n"

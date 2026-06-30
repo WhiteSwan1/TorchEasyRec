@@ -47,6 +47,15 @@ class QuantizeLayer(nn.Module):
         """Gather codebook embeddings for ``ids`` (indexes the codebook)."""
         return self.get_codebook_embeddings()[ids]
 
+    def compute_distances(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute distances from ``x`` to every codebook vector.
+
+        Lower values are better. Backends can override this when their
+        assignment metric is not squared L2.
+        """
+        codebook = self.get_codebook_embeddings()
+        return torch.cdist(x.to(codebook.dtype), codebook, p=2).pow(2)
+
     @abstractmethod
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the full codebook, shape (n_embed, embed_dim).

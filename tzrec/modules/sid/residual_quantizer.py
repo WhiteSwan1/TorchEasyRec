@@ -114,15 +114,16 @@ class ResidualQuantizer(nn.Module):
         """
         raise NotImplementedError
 
-    def _residual_pass(
+    def _residual_pass_with_inputs(
         self,
         input: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """Shared residual walk: per-layer assign, subtract, accumulate.
 
         The quantized vector is subtracted detached (keeps the residual chain
         gradient-free) and accumulated (keeps gradient when the backend
-        supplies it, e.g. VQ).
+        supplies it, e.g. VQ). Also returns the exact per-layer residual inputs
+        used for assignment, which candidate generation uses for last-layer KNN.
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
@@ -132,20 +133,32 @@ class ResidualQuantizer(nn.Module):
             aggregated (Tensor): sum of quantized vectors, shape (B, D).
             cumulative (List[Tensor]): running sum after each layer
                 (``cumulative[-1] is aggregated``).
+            layer_inputs (List[Tensor]): residual input to each layer after
+                optional normalization.
         """
         residual = input
         all_codes: List[torch.Tensor] = []
         cumulative: List[torch.Tensor] = []
+        layer_inputs: List[torch.Tensor] = []
         aggregated = torch.zeros_like(input)
         for i in range(self.n_layers):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
+            layer_inputs.append(residual)
             codes, quantized = self._quantize_layer(i, residual)
             all_codes.append(codes)
             aggregated = aggregated + quantized
             cumulative.append(aggregated)
             residual = residual - quantized.detach()
         cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
+        return cluster_ids, aggregated, cumulative, layer_inputs
+
+    def _residual_pass(
+        self,
+        input: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Shared residual walk without returning candidate-only state."""
+        cluster_ids, aggregated, cumulative, _ = self._residual_pass_with_inputs(input)
         return cluster_ids, aggregated, cumulative
 
     @torch.no_grad()
@@ -162,6 +175,81 @@ class ResidualQuantizer(nn.Module):
         """
         cluster_ids, _, _ = self._residual_pass(input)
         return cluster_ids
+
+    @torch.no_grad()
+    def get_code_candidates(
+        self,
+        input: torch.Tensor,
+        topk: int,
+        strategy: str = "last_layer_knn",
+        target_layer: int = -1,
+        include_origin: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate candidate SID tuples by replacing one quantization layer.
+
+        v1 supports the collision-prevention workflow's last-layer KNN strategy:
+        keep the greedy prefix unchanged, rank all codebook entries for the last
+        residual, and replace only that layer's code.
+
+        Args:
+            input (Tensor): input embeddings, shape (B, D).
+            topk (int): number of candidate SID tuples to return.
+            strategy (str): candidate strategy. Only ``last_layer_knn`` is
+                supported.
+            target_layer (int): target layer. Must resolve to the final layer.
+            include_origin (bool): force the original SID into slot 0.
+
+        Returns:
+            candidate_codes (Tensor): shape (B, topk, n_layers).
+            candidate_scores (Tensor): shape (B, topk), lower is better.
+        """
+        if strategy != "last_layer_knn":
+            raise ValueError("v1 supports only strategy='last_layer_knn'.")
+        if topk < 1:
+            raise ValueError(f"topk must be >= 1, got {topk}")
+        if target_layer < 0:
+            target_layer += self.n_layers
+        if target_layer < 0 or target_layer >= self.n_layers:
+            raise ValueError(
+                f"target_layer out of range for {self.n_layers} layers: {target_layer}"
+            )
+        if target_layer != self.n_layers - 1:
+            raise ValueError("v1 candidate generation supports only the last layer.")
+
+        n_embed = self.n_embed_list[target_layer]
+        if topk > n_embed:
+            raise ValueError(
+                f"topk ({topk}) must be <= target layer codebook size ({n_embed})."
+            )
+
+        cluster_ids, _, _, layer_inputs = self._residual_pass_with_inputs(input)
+        residual = layer_inputs[target_layer]
+        distances = self.layers[target_layer].compute_distances(residual)
+
+        candidate_codes = cluster_ids.unsqueeze(1).expand(-1, topk, -1).clone()
+        candidate_scores = distances.new_empty((input.shape[0], topk))
+
+        offset = 0
+        search_distances = distances
+        if include_origin:
+            origin_codes = cluster_ids[:, target_layer].unsqueeze(1)
+            candidate_scores[:, 0] = distances.gather(1, origin_codes).squeeze(1)
+            offset = 1
+            if topk > 1:
+                search_distances = distances.clone()
+                search_distances.scatter_(1, origin_codes, float("inf"))
+
+        if offset < topk:
+            scores, ids = torch.topk(
+                search_distances,
+                k=topk - offset,
+                dim=1,
+                largest=False,
+            )
+            candidate_codes[:, offset:, target_layer] = ids
+            candidate_scores[:, offset:] = scores
+
+        return candidate_codes, candidate_scores
 
     @torch.no_grad()
     def get_codebook_embeddings(self, layer_idx: int) -> torch.Tensor:

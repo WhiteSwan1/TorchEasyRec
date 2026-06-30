@@ -191,7 +191,10 @@ class SidRqvae(BaseSidModel):
         grouped = self.build_input(batch)
         embedding = grouped[self._feature_group]
         if self._is_inference:
-            return {"codes": self._quantizer.get_codes(self._encode(embedding))}
+            z_e = self._encode(embedding)
+            predictions = {"codes": self._quantizer.get_codes(z_e)}
+            predictions.update(self._sid_candidate_predictions(z_e))
+            return predictions
         if self._use_contrastive:
             return self._predict_mixed(grouped)
         return self._predict_rqvae(embedding)

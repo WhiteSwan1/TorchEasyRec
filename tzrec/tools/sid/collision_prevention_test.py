@@ -74,6 +74,30 @@ class SidCollisionPreventionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no explicit candidate input"):
             assign_sid_collisions(raw_rows, [], capacity=1)
 
+    def test_duplicate_candidates_do_not_consume_capacity_twice(self) -> None:
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_2", "item_2", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "C", 1, 0.1),
+            CandidateSidRow("item_0", "C", 2, 0.2),
+            CandidateSidRow("item_1", "C", 1, 0.1),
+            CandidateSidRow("item_2", "C", 1, 0.1),
+        ]
+
+        assigned, stats = assign_sid_collisions(
+            raw_rows,
+            candidate_rows,
+            capacity=2,
+            seed=7,
+        )
+
+        self.assertEqual(len(assigned), 3)
+        self.assertEqual(stats.unassigned_count, 0)
+        self.assertLessEqual(max(Counter(row.codebook for row in assigned).values()), 2)
+
     def test_local_csv_outputs_codebooks_as_strings(self) -> None:
         raw_path = os.path.join(self.test_dir, "raw.csv")
         cand_path = os.path.join(self.test_dir, "cand.csv")
@@ -169,6 +193,60 @@ class SidCollisionPreventionTest(unittest.TestCase):
         self.assertIn("1,2", set(result["origin_codebook"].to_pylist()))
         self.assertLessEqual(max(Counter(result["codebook"].to_pylist()).values()), 2)
 
+    def test_local_csv_accepts_split_codes_and_compact_candidates(self) -> None:
+        raw_path = os.path.join(self.test_dir, "raw_split.csv")
+        cand_path = os.path.join(self.test_dir, "cand_compact.csv")
+        out_dir = os.path.join(self.test_dir, "out_split")
+        csv.write_csv(
+            pa.table(
+                {
+                    "item_id": ["1", "2", "3"],
+                    "code_0": ["A", "A", "A"],
+                    "code_1": ["B", "B", "B"],
+                }
+            ),
+            raw_path,
+        )
+        csv.write_csv(
+            pa.table(
+                {
+                    "item_id": ["1", "2", "3"],
+                    "sorted_index": ["A|C", "A|C", "A|C"],
+                }
+            ),
+            cand_path,
+        )
+
+        args = build_parser().parse_args(
+            [
+                "--input_path",
+                raw_path,
+                "--candidate_input_path",
+                cand_path,
+                "--output_path",
+                out_dir,
+                "--reader_type",
+                "CsvReader",
+                "--writer_type",
+                "CsvWriter",
+                "--code_field",
+                "",
+                "--code_fields",
+                "code_0,code_1",
+                "--compact_candidate_field",
+                "sorted_index",
+                "--max_items_per_codebook",
+                "2",
+            ]
+        )
+        stats = run_local(args)
+
+        self.assertEqual(stats.reassigned_count, 1)
+        result = csv.read_csv(os.path.join(out_dir, "part-0.csv"))
+        self.assertIn("A,B", set(result["origin_codebook"].to_pylist()))
+        self.assertIn("A", set(result["codebook"].to_pylist()))
+        self.assertLessEqual(max(Counter(result["codebook"].to_pylist()).values()), 2)
+
     def test_generate_odps_sql_uses_tool_capacity_and_no_random(self) -> None:
         args = build_parser().parse_args(
             [
@@ -190,6 +268,8 @@ class SidCollisionPreventionTest(unittest.TestCase):
         sql = "\n".join(generate_odps_sql(args))
         self.assertIn("<= 5", sql)
         self.assertIn("PARTITION (ds='20260630')", sql)
+        self.assertIn("INNER JOIN", sql)
+        self.assertIn("FROM proj.raw_sid", sql)
         self.assertNotIn("rand()", sql.lower())
         self.assertNotIn("last_layer_random", sql)
 

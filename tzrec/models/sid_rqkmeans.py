@@ -138,6 +138,8 @@ class SidRqkmeans(BaseSidModel):
         predictions: Dict[str, torch.Tensor] = {
             "codes": codes,
         }
+        if self.is_inference:
+            predictions.update(self._sid_candidate_predictions(embedding))
 
         if self.is_eval and self._quantizer.is_fitted:
             predictions["x_hat"] = quantized
