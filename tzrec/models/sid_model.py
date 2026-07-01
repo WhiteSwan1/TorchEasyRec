@@ -25,6 +25,7 @@ from tzrec.metrics.relative_l1 import RelativeL1
 from tzrec.metrics.unique_ratio import UniqueRatio
 from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
+from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
 
@@ -99,6 +100,17 @@ class BaseSidModel(BaseModel):
     def build_input(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Build grouped input features: ``{group_name: (B, group_total_dim)}``."""
         return self.embedding_group(batch)
+
+    def _sid_predictions(
+        self,
+        quant: ResidualQuantizerOutput,
+    ) -> Dict[str, torch.Tensor]:
+        """Build SID prediction tensors from a quantizer output."""
+        predictions = {"codes": quant.cluster_ids}
+        if quant.candidate_codes is not None and quant.candidate_scores is not None:
+            predictions["candidate_codes"] = quant.candidate_codes
+            predictions["candidate_scores"] = quant.candidate_scores
+        return predictions
 
     def init_loss(self) -> None:
         """Initialize SID loss modules from ``ModelConfig.losses``.

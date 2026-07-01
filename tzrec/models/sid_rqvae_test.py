@@ -17,9 +17,11 @@ from torchrec import KeyedTensor
 
 from tzrec.datasets.utils import BASE_DATA_GROUP, Batch
 from tzrec.features.feature import create_features
+from tzrec.models.model import ScriptWrapper
 from tzrec.models.sid_rqvae import SidRqvae
 from tzrec.protos import feature_pb2, loss_pb2, model_pb2
 from tzrec.protos.models import sid_model_pb2
+from tzrec.utils.fx_util import symbolic_trace
 from tzrec.utils.state_dict_util import init_parameters
 
 
@@ -106,6 +108,7 @@ class SidRqvaeTest(unittest.TestCase):
         embed_dim=8,
         n_layers=2,
         recon="l2",
+        candidate_output=False,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -120,6 +123,10 @@ class SidRqvaeTest(unittest.TestCase):
             sid_rqvae_cfg.contrastive_config.pair_feature_group = "pair"
             sid_rqvae_cfg.contrastive_config.pair_flag_feature_group = "pair_flag"
             losses.append(_contrastive_cfg())
+        if candidate_output:
+            sid_rqvae_cfg.candidate_output_config.enabled = True
+            sid_rqvae_cfg.candidate_output_config.topk = 3
+            sid_rqvae_cfg.candidate_output_config.include_origin = True
 
         # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_contrastive)
@@ -202,6 +209,33 @@ class SidRqvaeTest(unittest.TestCase):
         self.assertIn("codes", predictions)
         self.assertNotIn("x_hat", predictions)
         self.assertNotIn("latents", predictions)
+        self.assertNotIn("candidate_codes", predictions)
+
+    def test_rqvae_export_trace_keeps_candidate_output(self) -> None:
+        """Export wrapper traces candidate outputs after inference is set."""
+        B, input_dim = 4, 32
+        model = self._create_model(input_dim=input_dim, candidate_output=True)
+        model.eval()
+        model.set_is_inference(True)
+
+        wrapper = ScriptWrapper(model).eval()
+        data = {"item_emb.values": torch.randn(B, input_dim)}
+
+        predictions = wrapper(data)
+        traced = symbolic_trace(wrapper)
+        traced_predictions = traced(data)
+
+        self.assertEqual(
+            set(predictions.keys()),
+            {"codes", "candidate_codes", "candidate_scores"},
+        )
+        self.assertEqual(set(traced_predictions.keys()), set(predictions.keys()))
+        self.assertEqual(traced_predictions["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(traced_predictions["candidate_scores"].shape, (B, 3))
+        torch.testing.assert_close(
+            traced_predictions["candidate_codes"][:, 0, :],
+            traced_predictions["codes"],
+        )
 
     def test_rqvae_contrastive_mode(self) -> None:
         """Test SidRqvae with the mixed recon + contrastive path."""

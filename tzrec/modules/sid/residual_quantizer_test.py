@@ -18,6 +18,7 @@ from tzrec.modules.sid.residual_quantizer import (
     ResidualQuantizer,
     normalize_n_embed,
 )
+from tzrec.modules.sid.types import QuantizeOutput
 
 
 class NormalizeNEmbedTest(unittest.TestCase):
@@ -72,9 +73,17 @@ class _FakeQuantizer(ResidualQuantizer):
             ]
         )
 
-    def _quantize_layer(self, layer_idx, residual):
-        codes = (residual.detach() @ self.books[layer_idx].t()).argmax(dim=-1)
-        return codes, self.books[layer_idx][codes]
+    def _quantize_layer(self, layer_idx, residual, topk=1):
+        scores = residual.detach() @ self.books[layer_idx].t()
+        topk_scores, topk_ids = torch.topk(scores, k=topk, dim=-1)
+        codes = topk_ids[:, 0]
+        return QuantizeOutput(
+            embeddings=self.books[layer_idx][codes],
+            ids=codes,
+            scores=topk_scores[:, 0],
+            topk_ids=topk_ids,
+            topk_scores=topk_scores,
+        )
 
     def _lookup_code(self, layer_idx, code_idx):
         return self.books[layer_idx][code_idx]
@@ -93,18 +102,20 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         torch.manual_seed(0)
         fq = _FakeQuantizer(embed_dim=4, n_layers=3, n_embed=5)
         x = torch.randn(6, 4)
-        ids, agg, cum = fq._residual_pass(x)
+        ids, agg, cum, candidate_codes, candidate_scores = fq._residual_pass(x)
         self.assertEqual(ids.shape, (6, 3))
         self.assertEqual(fq.get_codes(x).shape, (6, 3))
         manual = sum(fq._lookup_code(i, ids[:, i]) for i in range(3))
         torch.testing.assert_close(agg, manual)  # aggregated == Σ quantized_i
         self.assertTrue(torch.equal(cum[-1], agg))
+        self.assertIsNone(candidate_codes)
+        self.assertIsNone(candidate_scores)
 
     def test_detach_invariant(self) -> None:
         torch.manual_seed(0)
         fq = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5)
         x = torch.randn(5, 4, requires_grad=True)
-        _, agg, _ = fq._residual_pass(x)
+        _, agg, _, _, _ = fq._residual_pass(x)
         # Codebook grad flows, but the residual chain is detached, so the
         # input receives no gradient.
         self.assertTrue(agg.requires_grad)
@@ -123,8 +134,8 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         fq_on = _FakeQuantizer(
             embed_dim=4, n_layers=2, n_embed=6, normalize_residuals=True
         )
-        ids_off, _, _ = fq_off._residual_pass(x)
-        ids_on, _, _ = fq_on._residual_pass(x)
+        ids_off, _, _, _, _ = fq_off._residual_pass(x)
+        ids_on, _, _, _, _ = fq_on._residual_pass(x)
         self.assertEqual(ids_on.shape, (8, 2))
         self.assertFalse(torch.equal(ids_off, ids_on))
 

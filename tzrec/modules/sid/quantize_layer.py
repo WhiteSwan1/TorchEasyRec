@@ -39,13 +39,38 @@ class QuantizeLayer(nn.Module):
         self.embed_dim = embed_dim
 
     @abstractmethod
-    def quantize(self, x: torch.Tensor) -> QuantizeOutput:
+    def quantize(self, x: torch.Tensor, topk: int = 1) -> QuantizeOutput:
         """Assign ``x`` (B, D) to the codebook, returning codes + embeddings."""
         raise NotImplementedError
 
     def lookup(self, ids: torch.Tensor) -> torch.Tensor:
         """Gather codebook embeddings for ``ids`` (indexes the codebook)."""
         return self.get_codebook_embeddings()[ids]
+
+    def nearest_neighbors(
+        self,
+        distances: torch.Tensor,
+        topk: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return top-k nearest ids and scores from a distance matrix."""
+        self._check_topk(topk)
+        return torch.topk(distances, k=topk, dim=-1, largest=False)
+
+    def _check_topk(self, topk: int) -> None:
+        """Validate a top-k request against this codebook."""
+        if topk < 1:
+            raise ValueError(f"topk must be >= 1, got {topk}")
+        if topk > self.n_embed:
+            raise ValueError(f"topk must be <= n_embed ({self.n_embed}), got {topk}")
+
+    def compute_distances(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute distances from ``x`` to every codebook vector.
+
+        Lower values are better. Backends can override this when their
+        assignment metric is not squared L2.
+        """
+        codebook = self.get_codebook_embeddings()
+        return torch.cdist(x.to(codebook.dtype), codebook, p=2).pow(2)
 
     @abstractmethod
     def get_codebook_embeddings(self) -> torch.Tensor:

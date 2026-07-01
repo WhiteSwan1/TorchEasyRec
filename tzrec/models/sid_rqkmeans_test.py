@@ -82,6 +82,7 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         codebook=None,
         normalize_residuals=False,
         train_sample_size=0,
+        candidate_output=False,
     ):
         """Build a SidRqkmeans on CPU with params initialized."""
         n_embed_list = codebook if codebook is not None else [16] * n_layers
@@ -94,6 +95,10 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
             faiss_kmeans_kwargs=faiss_kwargs,
             train_sample_size=train_sample_size,
         )
+        if candidate_output:
+            cfg.candidate_output_config.enabled = True
+            cfg.candidate_output_config.topk = 3
+            cfg.candidate_output_config.include_origin = True
         features, feature_groups = _features_and_groups(input_dim)
         model = SidRqkmeans(
             model_config=model_pb2.ModelConfig(
@@ -284,6 +289,29 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         model.set_is_inference(True)
         inf_preds = model.predict(_make_batch(B, input_dim))
         self.assertEqual(set(inf_preds.keys()), {"codes"})
+
+    def test_inference_candidate_output_opt_in(self) -> None:
+        """Candidate tensors are emitted only when explicitly configured."""
+        B, input_dim = 4, 8
+        model = self._create_model(
+            input_dim=input_dim,
+            codebook=[4, 4],
+            candidate_output=True,
+        )
+        for layer in model._quantizer.layers:
+            layer.load_centroids_(torch.randn(4, input_dim))
+
+        model.eval()
+        model.set_is_inference(True)
+        preds = model.predict(_make_batch(B, input_dim))
+
+        self.assertEqual(
+            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
+        )
+        self.assertEqual(preds["codes"].shape, (B, 2))
+        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
+        torch.testing.assert_close(preds["candidate_codes"][:, 0, :], preds["codes"])
 
     def test_eval_metric_path(self) -> None:
         """init_metric/update_metric report finite mse + rel_loss in eval."""

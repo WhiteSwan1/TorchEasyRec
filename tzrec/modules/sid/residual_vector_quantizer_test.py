@@ -11,6 +11,7 @@
 
 import os
 import unittest
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
@@ -23,6 +24,15 @@ from tzrec.modules.sid.residual_vector_quantizer import (
 )
 from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.utils import misc_util
+
+
+def _candidate_output_config(topk: int = 3) -> dict:
+    return {
+        "enabled": True,
+        "topk": topk,
+        "strategy": "last_layer_knn",
+        "include_origin": True,
+    }
 
 
 class GumbelResidualVQTest(unittest.TestCase):
@@ -203,6 +213,101 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         gc_ids = self.rvq.get_codes(x)
         self.assertFalse(gc_ids.requires_grad)
         torch.testing.assert_close(gc_ids, fwd_ids)
+
+    def test_get_code_candidates_last_layer_knn(self) -> None:
+        """Candidate SIDs keep the greedy prefix and replace only the last layer."""
+        rvq = ResidualVectorQuantizer(
+            embed_dim=1,
+            n_layers=2,
+            n_embed=[2, 4],
+            forward_mode="ste",
+            use_sinkhorn=False,
+            kmeans_init=False,
+            candidate_output_config=_candidate_output_config(),
+        )
+        rvq.eval()
+        rvq.layers[0].embedding.weight.data.copy_(torch.tensor([[0.0], [10.0]]))
+        rvq.layers[1].embedding.weight.data.copy_(
+            torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+        )
+
+        candidate_codes, candidate_scores = rvq.get_code_candidates(
+            torch.tensor([[2.2], [0.9]])
+        )
+
+        self.assertEqual(candidate_codes.shape, (2, 3, 2))
+        self.assertEqual(candidate_scores.shape, (2, 3))
+        torch.testing.assert_close(
+            candidate_codes[:, 0, :], rvq.get_codes(torch.tensor([[2.2], [0.9]]))
+        )
+        # The first-layer greedy prefix is unchanged for every candidate.
+        self.assertTrue(
+            torch.equal(
+                candidate_codes[:, :, 0], candidate_codes[:, :1, 0].expand(-1, 3)
+            )
+        )
+        # For 2.2, last-layer origin is 2; nearest alternatives are 3 then 1.
+        self.assertEqual(candidate_codes[0, :, 1].tolist(), [2, 3, 1])
+
+    def test_get_code_candidates_fx_traceable(self) -> None:
+        """Forward candidate output uses functional tensor construction for export."""
+
+        class CandidateWrapper(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.rvq = ResidualVectorQuantizer(
+                    embed_dim=1,
+                    n_layers=2,
+                    n_embed=[2, 4],
+                    forward_mode="ste",
+                    use_sinkhorn=False,
+                    kmeans_init=False,
+                    candidate_output_config=_candidate_output_config(),
+                )
+                self.rvq.eval()
+                self.rvq.set_is_inference(True)
+                self.rvq.layers[0].embedding.weight.data.copy_(
+                    torch.tensor([[0.0], [10.0]])
+                )
+                self.rvq.layers[1].embedding.weight.data.copy_(
+                    torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+                )
+
+            def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                out = self.rvq(
+                    x,
+                    include_candidates=True,
+                )
+                return out.candidate_codes, out.candidate_scores
+
+        gm = torch.fx.symbolic_trace(CandidateWrapper().eval())
+        candidate_codes, candidate_scores = gm(torch.tensor([[2.2], [0.9]]))
+
+        self.assertEqual(candidate_codes.shape, (2, 3, 2))
+        self.assertEqual(candidate_scores.shape, (2, 3))
+
+    def test_forward_candidate_output_requires_inference(self) -> None:
+        """Forward emits candidates only in inference mode."""
+        rvq = ResidualVectorQuantizer(
+            embed_dim=1,
+            n_layers=2,
+            n_embed=[2, 4],
+            forward_mode="ste",
+            use_sinkhorn=False,
+            kmeans_init=False,
+            candidate_output_config=_candidate_output_config(),
+        )
+        rvq.eval()
+        x = torch.tensor([[2.2], [0.9]])
+
+        out = rvq(x, include_candidates=True)
+        self.assertIsNone(out.candidate_codes)
+        self.assertIsNone(out.candidate_scores)
+
+        rvq.set_is_inference(True)
+        out = rvq(x, include_candidates=True)
+        self.assertEqual(out.candidate_codes.shape, (2, 3, 2))
+        self.assertEqual(out.candidate_scores.shape, (2, 3))
 
     def test_faiss_kmeans_init_seeds_codebook(self) -> None:
         try:

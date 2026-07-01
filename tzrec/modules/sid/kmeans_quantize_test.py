@@ -64,12 +64,45 @@ class KMeansQuantizeLayerTest(unittest.TestCase):
         torch.testing.assert_close(out.embeddings, centroids[out.ids])
         torch.testing.assert_close(layer.lookup(out.ids), out.embeddings)
 
+    def test_quantize_returns_topk_centroids(self) -> None:
+        layer = KMeansQuantizeLayer(n_embed=4, embed_dim=1)
+        centroids = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+        layer.load_centroids_(centroids)
+        layer.eval()
+
+        out = layer.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        torch.testing.assert_close(out.topk_ids, torch.tensor([[1, 2, 0], [3, 2, 1]]))
+        torch.testing.assert_close(
+            out.topk_scores,
+            torch.tensor([[0.04, 0.64, 1.44], [0.04, 0.64, 3.24]]),
+        )
+
     def test_quantize_uninitialized_returns_zeros(self) -> None:
         layer = KMeansQuantizeLayer(n_embed=4, embed_dim=3)
         out = layer.quantize(torch.randn(5, 3))
         self.assertEqual(out.ids.shape, (5,))
         self.assertEqual(int(out.ids.abs().sum()), 0)
         torch.testing.assert_close(out.embeddings, torch.zeros(5, 3))
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
+
+        layer.eval()
+        out = layer.quantize(torch.randn(5, 3), topk=2)
+        self.assertEqual(out.topk_ids.shape, (5, 2))
+        self.assertEqual(out.topk_scores.shape, (5, 2))
+
+    def test_training_quantize_skips_topk_metadata(self) -> None:
+        layer = KMeansQuantizeLayer(n_embed=4, embed_dim=1)
+        layer.load_centroids_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+        layer.train()
+
+        out = layer.quantize(torch.tensor([[1.2], [2.8]]), topk=3)
+
+        torch.testing.assert_close(out.ids, torch.tensor([1, 3]))
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_load_centroids_shape_mismatch_raises(self) -> None:
         layer = KMeansQuantizeLayer(n_embed=2, embed_dim=2)
