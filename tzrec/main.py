@@ -72,6 +72,7 @@ from tzrec.ops import Kernel
 from tzrec.optim import optimizer_builder
 from tzrec.optim.lr_scheduler import BaseLR
 from tzrec.optim.optimizer import TZRecOptimizer
+from tzrec.protos import export_pb2
 from tzrec.protos.data_pb2 import DataConfig, DatasetType
 from tzrec.protos.eval_pb2 import EvalConfig
 from tzrec.protos.feature_pb2 import FeatureConfig
@@ -141,6 +142,7 @@ def _create_model(
         labels (list): list of label names.
         sample_weights (list): list of sample weight names.
         sampler_type (str): negative sampler type
+
     Return:
         model: a EasyRec Model.
     """
@@ -709,6 +711,16 @@ def train_and_evaluate(
         sample_weights=list(data_config.sample_weight_fields),
         sampler_type=sampler_type,
     )
+    # Cold-start gate (training-only). `_create_model` builds the EMPTY extended
+    # architecture (GenerativeRecLM: from_config, no weight download). On a fresh
+    # run (no checkpoint to resume/fine-tune — same `ckpt_path is None` signal the
+    # DCP-restore branch at L420-433 keys off) we load the pretrained HF weights
+    # ONCE here, before TrainWrapper/DMP wrapping and before any DCP restore. On
+    # resume/fine-tune (`ckpt_path` set) we skip it: DCP `load_state_dict` fills
+    # the weights. eval/export never reach this path — they always DCP-restore an
+    # empty model. (See design §1.)
+    if ckpt_path is None:
+        model.init_from_pretrained()  # no-op unless the model has a pretrained source
     model = TrainWrapper(
         model, device=device, mixed_precision=train_config.mixed_precision
     )
@@ -991,6 +1003,33 @@ def export(
     if asset_files:
         assets = asset_files.split(",")
 
+    ckpt_manager = checkpoint_util.CheckpointManager(
+        pipeline_config.model_dir, export_config=pipeline_config.export_config
+    )
+    if not checkpoint_path:
+        if (
+            pipeline_config.HasField("export_config")
+            and pipeline_config.export_config.exporter_type == "best"
+        ):
+            checkpoint_path, _ = ckpt_manager.best_checkpoint()
+        else:
+            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
+
+    # Explicit export-format branch (driven by export_config.export_format).
+    # HF: a standalone DCP->HF conversion — NO model build, NO DCP restore, NO
+    # from_pretrained. `dcp_to_hf` reads everything from the self-contained
+    # checkpoint dir (DCP weights + co-located config/tokenizer) and writes a
+    # `from_pretrained`-loadable dir. Done before _create_model so we never
+    # instantiate the model for HF export (design §2).
+    if pipeline_config.export_config.export_format == export_pb2.ExportFormat.HF:
+        if checkpoint_path is None:
+            raise ValueError("HF export: no checkpoint found to convert.")
+        if is_rank_zero:
+            from tzrec.utils.export_util import dcp_to_hf
+
+            dcp_to_hf(checkpoint_path, export_dir)
+        return
+
     data_config = pipeline_config.data_config
 
     # Build feature
@@ -1009,18 +1048,6 @@ def export(
     # is snapshot from the scalar view.
     model.set_is_inference(True)
     model = InferWrapper(model)
-
-    if not checkpoint_path:
-        ckpt_manager = checkpoint_util.CheckpointManager(
-            pipeline_config.model_dir, export_config=pipeline_config.export_config
-        )
-        if (
-            pipeline_config.HasField("export_config")
-            and pipeline_config.export_config.exporter_type == "best"
-        ):
-            checkpoint_path, _ = ckpt_manager.best_checkpoint()
-        else:
-            checkpoint_path, _ = ckpt_manager.latest_checkpoint()
 
     if isinstance(model.model, MatchModel):
         for name, module in model.model.named_children():

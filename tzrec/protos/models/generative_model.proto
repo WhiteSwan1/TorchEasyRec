@@ -1,0 +1,91 @@
+syntax = "proto2";
+package tzrec.protos;
+
+// Generative (causal-LM) models.
+//
+// Each LLM family is registered DIRECTLY: the model_config oneof picks a family
+// message (e.g. `qwen2_rec_lm`), whose message type name (`Qwen2RecLM`) resolves
+// to the Python class of the same name. There is no `class_name` dispatch.
+//
+// Shared, architecture-agnostic config lives in `GenerativeRecLMConfig` and is
+// embedded as `common` in every family message; family-specific knobs (e.g. the
+// chat template) live on the family message itself. Adding a family = a new
+// message like `Qwen2RecLM` + a same-named Python subclass of GenerativeRecLM.
+
+// Architecture-agnostic config shared by ALL generative-rec families (the base
+// reads this for everything except the backbone, which the family owns — see
+// _backbone_id). Sample contract (consumed by `predict()`):
+//   * history : list<int64>  — raw SID indices in [1, sum(codebook)]; the single
+//               JAGGED_SEQUENCE feature_group (a `sequence_raw_feature` column).
+//   * answer  : list<int64>  — raw SID indices; a `data_config.label_field`
+//               (read from batch.jagged_labels), NOT a feature.
+// The model maps SID -> token id by integer offset at batch time. Column names
+// are NOT configured here (see below).
+message GenerativeRecLMConfig {
+    // Backbone (`hf_model_id`) is NOT here — it's the family's architecture
+    // commitment, so it lives on the family message.
+
+    // SID vocabulary, one entry per RQ level: len = SID codes per item (answer
+    // width), sum = atoms appended as C0..C{sum-1} after the base vocab.
+    repeated uint32 codebook = 2;
+    // Pad the post-extension vocab up to a multiple of this value.
+    optional uint32 vocab_pad_to_multiple_of = 3 [default = 128];
+
+    // Neither the history feature_group nor the SID-column names are configured
+    // here — they're derived from the config that already declares them: the
+    // history is the single declared feature_group (a JAGGED_SEQUENCE group;
+    // build_input keys the EmbeddingGroup output by its GROUP name, the HSTU
+    // idiom), and its one member is the history feature; the answer is the first
+    // data_config.label_field (read from batch.jagged_labels, like RankModel's
+    // labels[0]). The answer is NOT a feature_group.
+
+    // Cross-entropy ignore index — matches PyTorch's F.cross_entropy default.
+    optional int32 ignore_index = 6 [default = -100];
+
+    // Inference (beam search) — used only by predict()'s inference branch.
+    optional uint32 num_beams = 7 [default = 50];
+    optional uint32 num_return_sequences = 8 [default = 50];
+    // When set, decode with the ALGR-style escalating beam instead of HF's
+    // fixed-width beam search: the beam width doubles at every SID level
+    // (num_beams -> 2*num_beams -> ... ), returning num_beams * 2**num_levels
+    // candidates (num_return_sequences is ignored). Faithful parity with ALGR's
+    // dynamic_beams schedule; exploits the fixed-length, EOS-free SID answer.
+    optional bool dynamic_beam = 9 [default = false];
+
+    // Predictions key the inference branch emits generated SIDs under (stable
+    // across families; PredictWrapper output_cols should reference it).
+    optional string generated_sids_key = 12 [default = "generated_sids"];
+    // Backbone PARAM dtype = the fp32 MASTER weights. "float32" avoids bf16-ULP
+    // underflow of Adam's small (lr=1e-5) updates; bf16 COMPUTE comes from
+    // mixed_precision:"BF16" autocast, NOT the param dtype. One of:
+    // float32 | bfloat16 | float16.
+    optional string param_dtype = 13 [default = "float32"];
+
+    // Model's history budget (SID codes): the truncation cap enforced model-side
+    // (_sid_token_rows, item-aligned, recency-preserving) AND the activation-pool
+    // pre-size (_compute_max_total_length). A model knob like HSTU's
+    // DlrmHSTU.max_seq_len, distinct from the user_sequence feature's
+    // sequence_length. REQUIRED (like HSTU's DlrmHSTU.max_seq_len); set it to 0
+    // to explicitly disable the cap + activation-pool pre-allocation.
+    required uint32 max_sequence_length = 14;
+}
+
+// Qwen2 / Qwen2.5 family (Qwen2.5-0.5B, etc.). Registered directly via its
+// message-type name; the Python class is `Qwen2RecLM`.
+message Qwen2RecLM {
+    // Architecture-agnostic config shared by all generative-rec families.
+    optional GenerativeRecLMConfig common = 1;
+
+    // Qwen2 backbone (HF hub id or local path; must be a Qwen2 model). Owned by
+    // this family message, not `common`. Default = canonical 0.5B.
+    optional string hf_model_id = 2 [default = "Qwen/Qwen2.5-0.5B"];
+
+    // ----- Chat template (family-specific) -----
+    // Optional override for the system instruction. Empty -> the family default
+    // (Qwen2RecLM's algr-matching default).
+    optional string system_instruction = 10 [default = ""];
+    // Optional CN/EN text wrapping the SID codes in the user message, e.g.
+    // "当前用户的历史行为如下：" / "，请预测用户在电商推荐场景后续行为的语义编码".
+    optional string user_prefix_text = 11 [default = ""];
+    optional string user_suffix_text = 12 [default = ""];
+}

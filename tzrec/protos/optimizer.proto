@@ -20,6 +20,7 @@ message SparseOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
 }
 
@@ -38,6 +39,7 @@ message DenseOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
     repeated PartOptimizer part_optimizers = 201;
 }
@@ -58,6 +60,7 @@ message PartOptimizer {
         ManualStepLR manual_step_learning_rate = 103;
         CosineAnnealingLR cosine_annealing_learning_rate = 104;
         CosineAnnealingWarmRestartsLR cosine_annealing_warm_restarts_learning_rate = 105;
+        LinearDecayLR linear_decay_learning_rate = 106;
     }
 }
 
@@ -231,6 +234,20 @@ message ManualStepLR {
     optional bool warmup = 3 [default = false];
     // schedule by epoch or by step.
     optional bool by_epoch = 4 [default = false];
+}
+
+message LinearDecayLR {
+    // total number of steps or epochs to decay from base_lr to
+    // min_learning_rate (mirrors HF Trainer's `lr_scheduler_type: linear`)
+    optional uint32 total_size = 1;
+    // minimum learning rate reached at total_size
+    optional float min_learning_rate = 2 [default = 0.0];
+    // warmup start learning rate
+    optional float warmup_learning_rate = 3 [default = 0.0];
+    // warmup steps or epochs
+    optional uint32 warmup_size = 4 [default = 0];
+    // schedule by epoch or by step.
+    optional bool by_epoch = 5 [default = false];
 }
 
 message CosineAnnealingLR {
