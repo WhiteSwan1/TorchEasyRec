@@ -89,7 +89,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
     def forward(
         self,
         input: torch.Tensor,
-        include_candidates: bool = False,
     ) -> ResidualQuantizerOutput:
         """Assign codes per layer and sum the centroids.
 
@@ -99,7 +98,6 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
-            include_candidates (bool): include configured candidate SID tensors.
 
         Returns:
             ResidualQuantizerOutput: named output with optional candidate tensors.
@@ -107,7 +105,7 @@ class ResidualKMeansQuantizer(ResidualQuantizer):
         cluster_ids, quantized_sum, cumulative, candidate_codes, candidate_scores = (
             self._residual_pass(
                 input,
-                include_candidates=self._should_output_candidates(include_candidates),
+                include_candidates=self._should_output_candidates(),
             )
         )
         return self._residual_output(

@@ -290,7 +290,6 @@ class KMeansQuantizeLayer(QuantizeLayer):
         if self.training:
             ids = distances.argmin(dim=-1)
             return QuantizeOutput(embeddings=self.centroids[ids], ids=ids)
-        self._check_topk(topk)
         topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
         ids = topk_ids[:, 0]
         return QuantizeOutput(

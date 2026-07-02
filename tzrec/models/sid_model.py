@@ -28,6 +28,7 @@ from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.sid.types import ResidualQuantizerOutput
 from tzrec.protos.loss_pb2 import LossConfig
 from tzrec.protos.model_pb2 import ModelConfig
+from tzrec.utils.config_util import config_to_kwargs
 
 
 class BaseSidModel(BaseModel):
@@ -73,6 +74,9 @@ class BaseSidModel(BaseModel):
 
         cfg = self._model_config
         self._normalize_residuals = cfg.normalize_residuals
+        # Shared across both SID protos (SidRqvae field 17, SidRqkmeans field 7);
+        # convert once here so subclasses just hand it to their quantizer.
+        self._candidate_output_kwargs = config_to_kwargs(cfg.candidate_output_config)
 
         if not cfg.codebook:
             raise ValueError("codebook must be set, e.g. [256, 256, 256]")

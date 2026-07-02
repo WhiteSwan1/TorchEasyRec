@@ -93,8 +93,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertEqual(out.cluster_ids.shape, (7, 3))
         for i, k in enumerate(n_embed):
             self.assertTrue(
-                (out.cluster_ids[:, i] >= 0).all()
-                and (out.cluster_ids[:, i] < k).all()
+                (out.cluster_ids[:, i] >= 0).all() and (out.cluster_ids[:, i] < k).all()
             )
 
     def test_train_offline_then_decode(self) -> None:
@@ -113,6 +112,46 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
         self.assertTrue((out.cluster_ids >= 0).all() and (out.cluster_ids < 8).all())
         recon = rkq.decode_codes(out.cluster_ids)  # inherited from the base
         self.assertEqual(recon.shape, (5, 4))
+
+    def test_candidate_output_last_layer_knn(self) -> None:
+        """Candidate SIDs keep the greedy prefix and vary only the last layer."""
+        try:
+            import faiss  # noqa: F401
+        except ImportError:
+            self.skipTest("faiss not installed")
+        rkq = ResidualKMeansQuantizer(
+            embed_dim=1,
+            n_layers=2,
+            n_embed=[2, 4],
+            candidate_output_config={
+                "enabled": True,
+                "topk": 3,
+                "strategy": "last_layer_knn",
+                "include_origin": True,
+            },
+        )
+        rkq.eval()
+        rkq.set_is_inference(True)
+        # Deterministic centroids (set directly; no fit needed).
+        rkq.layers[0].load_centroids_(torch.tensor([[0.0], [10.0]]))
+        rkq.layers[1].load_centroids_(torch.tensor([[0.0], [1.0], [2.0], [3.0]]))
+
+        x = torch.tensor([[2.2], [0.9]])
+        out = rkq(x)
+
+        self.assertEqual(out.candidate_codes.shape, (2, 3, 2))  # (B, topk, n_layers)
+        self.assertEqual(out.candidate_scores.shape, (2, 3))
+        # include_origin: the first candidate is the greedy SID (get_codes order).
+        torch.testing.assert_close(out.candidate_codes[:, 0, :], rkq.get_codes(x))
+        # The first-layer greedy prefix is unchanged for every candidate.
+        self.assertTrue(
+            torch.equal(
+                out.candidate_codes[:, :, 0],
+                out.candidate_codes[:, :1, 0].expand(-1, 3),
+            )
+        )
+        # For 2.2, last-layer origin is 2; nearest alternatives are 3 then 1.
+        self.assertEqual(out.candidate_codes[0, :, 1].tolist(), [2, 3, 1])
 
     def test_forward_get_codes_consistent(self) -> None:
         """Forward ids and get_codes both route through the shared walk."""

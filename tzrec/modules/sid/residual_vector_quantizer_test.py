@@ -214,7 +214,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         self.assertFalse(gc_ids.requires_grad)
         torch.testing.assert_close(gc_ids, fwd_ids)
 
-    def test_get_code_candidates_last_layer_knn(self) -> None:
+    def test_candidate_output_last_layer_knn(self) -> None:
         """Candidate SIDs keep the greedy prefix and replace only the last layer."""
         rvq = ResidualVectorQuantizer(
             embed_dim=1,
@@ -226,20 +226,20 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
             candidate_output_config=_candidate_output_config(),
         )
         rvq.eval()
+        rvq.set_is_inference(True)
         rvq.layers[0].embedding.weight.data.copy_(torch.tensor([[0.0], [10.0]]))
         rvq.layers[1].embedding.weight.data.copy_(
             torch.tensor([[0.0], [1.0], [2.0], [3.0]])
         )
 
-        candidate_codes, candidate_scores = rvq.get_code_candidates(
-            torch.tensor([[2.2], [0.9]])
-        )
+        x = torch.tensor([[2.2], [0.9]])
+        out = rvq(x)
+        candidate_codes, candidate_scores = out.candidate_codes, out.candidate_scores
 
         self.assertEqual(candidate_codes.shape, (2, 3, 2))
         self.assertEqual(candidate_scores.shape, (2, 3))
-        torch.testing.assert_close(
-            candidate_codes[:, 0, :], rvq.get_codes(torch.tensor([[2.2], [0.9]]))
-        )
+        # include_origin: the first candidate is the greedy SID (get_codes order).
+        torch.testing.assert_close(candidate_codes[:, 0, :], rvq.get_codes(x))
         # The first-layer greedy prefix is unchanged for every candidate.
         self.assertTrue(
             torch.equal(
@@ -249,7 +249,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         # For 2.2, last-layer origin is 2; nearest alternatives are 3 then 1.
         self.assertEqual(candidate_codes[0, :, 1].tolist(), [2, 3, 1])
 
-    def test_get_code_candidates_fx_traceable(self) -> None:
+    def test_candidate_output_fx_traceable(self) -> None:
         """Forward candidate output uses functional tensor construction for export."""
 
         class CandidateWrapper(torch.nn.Module):
@@ -274,10 +274,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
                 )
 
             def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-                out = self.rvq(
-                    x,
-                    include_candidates=True,
-                )
+                out = self.rvq(x)
                 return out.candidate_codes, out.candidate_scores
 
         gm = torch.fx.symbolic_trace(CandidateWrapper().eval())
@@ -286,7 +283,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         self.assertEqual(candidate_codes.shape, (2, 3, 2))
         self.assertEqual(candidate_scores.shape, (2, 3))
 
-    def test_forward_candidate_output_requires_inference(self) -> None:
+    def test_candidate_output_gated_by_is_inference(self) -> None:
         """Forward emits candidates only in inference mode."""
         rvq = ResidualVectorQuantizer(
             embed_dim=1,
@@ -300,12 +297,12 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
         rvq.eval()
         x = torch.tensor([[2.2], [0.9]])
 
-        out = rvq(x, include_candidates=True)
+        out = rvq(x)
         self.assertIsNone(out.candidate_codes)
         self.assertIsNone(out.candidate_scores)
 
         rvq.set_is_inference(True)
-        out = rvq(x, include_candidates=True)
+        out = rvq(x)
         self.assertEqual(out.candidate_codes.shape, (2, 3, 2))
         self.assertEqual(out.candidate_scores.shape, (2, 3))
 
@@ -369,9 +366,9 @@ def _init_embed_worker(rank: int, world_size: int, port: int) -> None:
         wmin, wmax = w.clone(), w.clone()
         dist.all_reduce(wmin, op=dist.ReduceOp.MIN)
         dist.all_reduce(wmax, op=dist.ReduceOp.MAX)
-        assert torch.allclose(wmin, wmax), (
-            f"rank{rank}: codebook differs across ranks (init not broadcast)"
-        )
+        assert torch.allclose(
+            wmin, wmax
+        ), f"rank{rank}: codebook differs across ranks (init not broadcast)"
     dist.destroy_process_group()
 
 

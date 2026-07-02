@@ -133,13 +133,13 @@ class ResidualQuantizer(BaseModule):
 
         self._candidate_output_enabled = True
 
-    def _should_output_candidates(self, include_candidates: bool) -> bool:
-        """Whether this forward call should emit candidate SID tensors."""
-        return (
-            self.is_inference
-            and self._candidate_output_enabled
-            and include_candidates is True
-        )
+    def _should_output_candidates(self) -> bool:
+        """Whether forward should emit candidate SID tensors.
+
+        Candidate output is a configured, inference-only behavior: it is gated
+        purely by inference mode plus the enabling config, with no per-call flag.
+        """
+        return self.is_inference and self._candidate_output_enabled
 
     def _quantize_layer(
         self,
@@ -275,37 +275,6 @@ class ResidualQuantizer(BaseModule):
         cluster_ids, _, _, _, _ = self._residual_pass(input)
         return cluster_ids
 
-    @torch.no_grad()
-    def get_code_candidates(
-        self,
-        input: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate candidate SID tuples by replacing the last quantization layer.
-
-        v1 supports the collision-prevention workflow's last-layer KNN strategy:
-        keep the greedy prefix unchanged, rank all codebook entries for the last
-        residual, and replace only that layer's code.
-
-        Args:
-            input (Tensor): input embeddings, shape (B, D).
-
-        Returns:
-            candidate_codes (Tensor): shape (B, topk, n_layers).
-            candidate_scores (Tensor): shape (B, topk), lower is better.
-        """
-        if not self._candidate_output_enabled:
-            raise RuntimeError(
-                "candidate_output_config must be enabled before calling "
-                "get_code_candidates."
-            )
-
-        _, _, _, candidate_codes, candidate_scores = self._residual_pass(
-            input,
-            include_candidates=True,
-        )
-        assert candidate_codes is not None and candidate_scores is not None
-        return candidate_codes, candidate_scores
-
     def _build_code_candidates(
         self,
         cluster_ids: torch.Tensor,
@@ -343,9 +312,7 @@ class ResidualQuantizer(BaseModule):
             candidate_layer_codes = layer_output.topk_ids[:, :topk]
             candidate_scores = layer_output.topk_scores[:, :topk]
 
-        prefix_codes = cluster_ids[:, :target_layer].unsqueeze(1).expand(
-            -1, topk, -1
-        )
+        prefix_codes = cluster_ids[:, :target_layer].unsqueeze(1).expand(-1, topk, -1)
         candidate_codes = torch.cat(
             [prefix_codes, candidate_layer_codes.unsqueeze(-1)],
             dim=-1,

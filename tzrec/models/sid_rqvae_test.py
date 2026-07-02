@@ -109,6 +109,7 @@ class SidRqvaeTest(unittest.TestCase):
         n_layers=2,
         recon="l2",
         candidate_output=False,
+        candidate_include_origin=True,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -126,7 +127,9 @@ class SidRqvaeTest(unittest.TestCase):
         if candidate_output:
             sid_rqvae_cfg.candidate_output_config.enabled = True
             sid_rqvae_cfg.candidate_output_config.topk = 3
-            sid_rqvae_cfg.candidate_output_config.include_origin = True
+            sid_rqvae_cfg.candidate_output_config.include_origin = (
+                candidate_include_origin
+            )
 
         # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_contrastive)
@@ -236,6 +239,62 @@ class SidRqvaeTest(unittest.TestCase):
             traced_predictions["candidate_codes"][:, 0, :],
             traced_predictions["codes"],
         )
+
+    def test_rqvae_candidate_output_no_origin(self) -> None:
+        """include_origin=False: slot-0 candidate is the nearest neighbor.
+
+        The greedy code is not force-inserted at slot 0 — with
+        include_origin=False slot 0 is simply the top-scored (nearest) last-layer
+        neighbor, so the returned scores are sorted best-first and slot 0 holds
+        the minimum score (NOT necessarily asserted equal to the greedy codes).
+        """
+        B, input_dim = 4, 32
+        model = self._create_model(
+            input_dim=input_dim,
+            candidate_output=True,
+            candidate_include_origin=False,
+        )
+        model.eval()
+        model.set_is_inference(True)
+
+        preds = model.predict(_make_batch(B, input_dim))
+        self.assertEqual(
+            set(preds.keys()), {"codes", "candidate_codes", "candidate_scores"}
+        )
+        self.assertEqual(preds["candidate_codes"].shape, (B, 3, 2))
+        self.assertEqual(preds["candidate_scores"].shape, (B, 3))
+        scores = preds["candidate_scores"]
+        # Slot 0 is the best-scored (nearest) neighbor: minimum score, sorted.
+        self.assertTrue(bool(torch.all(scores[:, 0] == scores.min(dim=1).values)))
+        self.assertTrue(bool(torch.all(scores[:, :-1] <= scores[:, 1:])))
+
+    def test_candidate_output_topk_zero_raises(self) -> None:
+        """A candidate_output_config with topk=0 fails fast at construction.
+
+        Validation lives in the quantizer's _init_candidate_output_config, which
+        runs during model __init__.
+        """
+        features, feature_groups = _features_and_groups(32)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.candidate_output_config.enabled = True
+        cfg.candidate_output_config.topk = 0
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg
+        )
+        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
+
+    def test_candidate_output_topk_exceeds_codebook_raises(self) -> None:
+        """topk above the last-layer codebook size fails fast at construction."""
+        features, feature_groups = _features_and_groups(32)
+        cfg = sid_model_pb2.SidRqvae(embed_dim=8, codebook=[16, 16], kmeans_init=False)
+        cfg.candidate_output_config.enabled = True
+        cfg.candidate_output_config.topk = 17
+        model_config = model_pb2.ModelConfig(
+            feature_groups=feature_groups, sid_rqvae=cfg
+        )
+        with self.assertRaisesRegex(ValueError, "codebook size"):
+            SidRqvae(model_config=model_config, features=features, labels=[])
 
     def test_rqvae_contrastive_mode(self) -> None:
         """Test SidRqvae with the mixed recon + contrastive path."""

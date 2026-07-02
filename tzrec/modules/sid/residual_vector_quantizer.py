@@ -279,7 +279,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
     def forward(
         self,
         input: torch.Tensor,
-        include_candidates: bool = False,
     ) -> ResidualQuantizerOutput:
         """Forward the multi-layer residual quantization.
 
@@ -290,7 +289,6 @@ class ResidualVectorQuantizer(ResidualQuantizer):
 
         Args:
             input (Tensor): input embeddings, shape (B, D).
-            include_candidates (bool): include configured candidate SID tensors.
 
         Returns:
             ResidualQuantizerOutput: (cluster_ids, quantized_embeddings,
@@ -312,7 +310,7 @@ class ResidualVectorQuantizer(ResidualQuantizer):
             candidate_scores,
         ) = self._residual_pass(
             walk_input,
-            include_candidates=self._should_output_candidates(include_candidates),
+            include_candidates=self._should_output_candidates(),
         )
 
         quants_trunc = aggregated_quants

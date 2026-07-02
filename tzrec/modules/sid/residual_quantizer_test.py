@@ -64,8 +64,21 @@ class _FakeQuantizer(ResidualQuantizer):
     without pulling in the K-Means or VQ backends.
     """
 
-    def __init__(self, embed_dim, n_layers, n_embed=5, normalize_residuals=False):
-        super().__init__(embed_dim, n_layers, n_embed, normalize_residuals)
+    def __init__(
+        self,
+        embed_dim,
+        n_layers,
+        n_embed=5,
+        normalize_residuals=False,
+        candidate_output_config=None,
+    ):
+        super().__init__(
+            embed_dim,
+            n_layers,
+            n_embed,
+            normalize_residuals,
+            candidate_output_config=candidate_output_config,
+        )
         self.books = nn.ParameterList(
             [
                 nn.Parameter(torch.randn(self.n_embed_list[i], embed_dim))
@@ -151,6 +164,151 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         fq16 = _FakeQuantizer(embed_dim=4, n_layers=2, n_embed=5).to(torch.bfloat16)
         recon16 = fq16.decode_codes(torch.randint(0, 5, (3, 2)))
         self.assertEqual(recon16.dtype, torch.bfloat16)
+
+
+def _candidate_config(topk=2, include_origin=True, strategy="last_layer_knn") -> dict:
+    return {
+        "enabled": True,
+        "topk": topk,
+        "include_origin": include_origin,
+        "strategy": strategy,
+    }
+
+
+class ResidualQuantizerCandidateConfigTest(unittest.TestCase):
+    """Validation done by _init_candidate_output_config at construction."""
+
+    def test_disabled_config_leaves_candidates_off(self) -> None:
+        # enabled=False must short-circuit before topk/strategy are even read.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config={"enabled": False},
+        )
+        self.assertFalse(fq._candidate_output_enabled)
+
+    def test_topk_below_one_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "topk must be >= 1"):
+            _FakeQuantizer(
+                embed_dim=3,
+                n_layers=2,
+                n_embed=4,
+                candidate_output_config=_candidate_config(topk=0),
+            )
+
+    def test_unknown_strategy_raises(self) -> None:
+        with self.assertRaisesRegex(ValueError, "last_layer_knn"):
+            _FakeQuantizer(
+                embed_dim=3,
+                n_layers=2,
+                n_embed=4,
+                candidate_output_config=_candidate_config(strategy="random"),
+            )
+
+    def test_topk_exceeds_last_layer_codebook_raises(self) -> None:
+        # n_embed=4 -> last-layer codebook size is 4; topk=5 is out of range.
+        with self.assertRaisesRegex(ValueError, "must be <= target"):
+            _FakeQuantizer(
+                embed_dim=3,
+                n_layers=2,
+                n_embed=4,
+                candidate_output_config=_candidate_config(topk=5),
+            )
+
+
+class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
+    """Candidate machinery exercised backend-agnostically via _FakeQuantizer."""
+
+    def test_candidate_output_requires_eval_mode(self) -> None:
+        # The training guard lives in _residual_pass (before the is_inference
+        # gate), so drive it directly in .train() mode.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config=_candidate_config(topk=2),
+        )
+        fq.train()
+        with self.assertRaisesRegex(
+            RuntimeError, "candidate SID output requires eval/inference mode."
+        ):
+            fq._residual_pass(torch.randn(3, 3), include_candidates=True)
+
+    def test_candidate_layer_topk_include_origin_expands(self) -> None:
+        # include_origin & topk>1 -> min(last_codebook, topk+1); an extra
+        # neighbor is fetched so the forced origin never crowds out a real one.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=8,
+            candidate_output_config=_candidate_config(topk=3, include_origin=True),
+        )
+        self.assertEqual(fq._candidate_layer_topk(), 4)
+
+    def test_candidate_layer_topk_include_origin_capped(self) -> None:
+        # topk+1 exceeds the codebook -> capped at the codebook size.
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config=_candidate_config(topk=4, include_origin=True),
+        )
+        self.assertEqual(fq._candidate_layer_topk(), 4)
+
+    def test_candidate_layer_topk_plain(self) -> None:
+        # The else branch: no origin, or topk==1 -> exactly topk neighbors.
+        fq_no_origin = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=8,
+            candidate_output_config=_candidate_config(topk=2, include_origin=False),
+        )
+        self.assertEqual(fq_no_origin._candidate_layer_topk(), 2)
+        fq_topk1 = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=8,
+            candidate_output_config=_candidate_config(topk=1, include_origin=True),
+        )
+        self.assertEqual(fq_topk1._candidate_layer_topk(), 1)
+
+    def test_build_candidates_include_origin_false(self) -> None:
+        # include_origin=False branch: last-layer codes are the raw top-k
+        # neighbors (candidate[:, 0] is the top-scored one, == greedy here).
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config=_candidate_config(topk=2, include_origin=False),
+        )
+        fq.eval()
+        x = torch.randn(5, 3)
+        _, _, _, cand_codes, cand_scores = fq._residual_pass(x, include_candidates=True)
+        self.assertEqual(cand_codes.shape, (5, 2, 2))  # (B, topk, n_layers)
+        self.assertEqual(cand_scores.shape, (5, 2))
+        torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
+        # The greedy prefix (all but the last layer) is shared by every candidate.
+        self.assertTrue(
+            torch.equal(cand_codes[:, :, 0], cand_codes[:, :1, 0].expand(-1, 2))
+        )
+
+    def test_build_candidates_topk_one(self) -> None:
+        # include_origin=True, topk==1 branch: candidate collapses to the origin.
+        torch.manual_seed(0)
+        fq = _FakeQuantizer(
+            embed_dim=3,
+            n_layers=2,
+            n_embed=4,
+            candidate_output_config=_candidate_config(topk=1, include_origin=True),
+        )
+        fq.eval()
+        x = torch.randn(5, 3)
+        _, _, _, cand_codes, cand_scores = fq._residual_pass(x, include_candidates=True)
+        self.assertEqual(cand_codes.shape, (5, 1, 2))
+        self.assertEqual(cand_scores.shape, (5, 1))
+        torch.testing.assert_close(cand_codes[:, 0, :], fq.get_codes(x))
 
 
 if __name__ == "__main__":

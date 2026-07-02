@@ -209,10 +209,6 @@ class VectorQuantizeLayer(QuantizeLayer):
             QuantizeOutput: selected embedding/id plus top-k nearest ids/scores.
         """
         distances = self._compute_distances(x)
-        topk_ids = None
-        topk_scores = None
-        if not self.training:
-            topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
 
         if self.training and self.forward_mode == QuantizeForwardMode.GUMBEL_SOFTMAX:
             logits = -distances
@@ -221,30 +217,27 @@ class VectorQuantizeLayer(QuantizeLayer):
             )
             emb = weights @ self.embedding.weight
             ids = weights.argmax(dim=-1)
-            return QuantizeOutput(
-                embeddings=emb,
-                ids=ids,
-            )
+            return QuantizeOutput(embeddings=emb, ids=ids)
 
-        # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
-        # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
-        # while a wrap here would detach the codebook from ``latents`` and freeze
-        # it at init.
-        ids = self._find_nearest_embedding(distances)
-        scores = None
-        if not self.training:
-            scores = distances.gather(1, ids.unsqueeze(1)).squeeze(1)
+        if self.training:
+            # Return the RAW codebook vector (no per-layer STE wrap): the aggregate
+            # STE in ResidualVectorQuantizer.forward routes the encoder gradient,
+            # while a wrap here would detach the codebook from ``latents`` and freeze
+            # it at init.
+            ids = self._find_nearest_embedding(distances)
+            return QuantizeOutput(embeddings=self.embedding(ids), ids=ids)
+
+        # eval/inference: torch.topk(largest=False) already yields the nearest at
+        # slot 0, so reuse it instead of a separate argmin + gather.
+        topk_scores, topk_ids = self.nearest_neighbors(distances, topk)
+        ids = topk_ids[:, 0]
         return QuantizeOutput(
             embeddings=self.embedding(ids),
             ids=ids,
-            scores=scores,
+            scores=topk_scores[:, 0],
             topk_ids=topk_ids,
             topk_scores=topk_scores,
         )
-
-    def compute_distances(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute distances with the layer's configured assignment metric."""
-        return self._compute_distances(x)
 
     def get_codebook_embeddings(self) -> torch.Tensor:
         """Return the codebook table, shape (n_embed, embed_dim)."""
