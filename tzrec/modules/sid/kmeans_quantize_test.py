@@ -88,10 +88,11 @@ class KMeansQuantizeLayerTest(unittest.TestCase):
         self.assertIsNone(out.topk_ids)
         self.assertIsNone(out.topk_scores)
 
+        # Eval before the fit is also a no-op: no topk/candidate metadata either.
         layer.eval()
         out = layer.quantize(torch.randn(5, 3), topk=2)
-        self.assertEqual(out.topk_ids.shape, (5, 2))
-        self.assertEqual(out.topk_scores.shape, (5, 2))
+        self.assertIsNone(out.topk_ids)
+        self.assertIsNone(out.topk_scores)
 
     def test_training_quantize_skips_topk_metadata(self) -> None:
         layer = KMeansQuantizeLayer(n_embed=4, embed_dim=1)

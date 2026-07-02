@@ -83,7 +83,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         normalize_residuals=False,
         train_sample_size=0,
         candidate_output=False,
-        candidate_include_origin=True,
     ):
         """Build a SidRqkmeans on CPU with params initialized."""
         n_embed_list = codebook if codebook is not None else [16] * n_layers
@@ -99,7 +98,6 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         if candidate_output:
             cfg.candidate_output_config.enabled = True
             cfg.candidate_output_config.topk = 3
-            cfg.candidate_output_config.include_origin = candidate_include_origin
         features, feature_groups = _features_and_groups(input_dim)
         model = SidRqkmeans(
             model_config=model_pb2.ModelConfig(
@@ -314,21 +312,17 @@ class SidRqkmeansOfflineTest(unittest.TestCase):
         self.assertEqual(preds["candidate_scores"].shape, (B, 3))
         torch.testing.assert_close(preds["candidate_codes"][:, 0, :], preds["codes"])
 
-    def test_inference_candidate_output_no_origin(self) -> None:
-        """include_origin=False: slot-0 candidate is the nearest neighbor.
+    def test_inference_candidate_scores_sorted(self) -> None:
+        """Candidate scores come back sorted best-first, minimum at slot 0.
 
-        Mirrors test_inference_candidate_output_opt_in but with
-        include_origin=False: the greedy code is not force-inserted at slot 0.
-        Slot 0 is simply the top-scored (nearest) last-layer centroid, so scores
-        come back sorted best-first with the minimum at slot 0 (NOT necessarily
-        asserted equal to the greedy codes tuple).
+        Mirrors test_inference_candidate_output_opt_in but asserts the score
+        ordering (slot 0 is the top-scored/nearest last-layer centroid).
         """
         B, input_dim = 4, 8
         model = self._create_model(
             input_dim=input_dim,
             codebook=[4, 4],
             candidate_output=True,
-            candidate_include_origin=False,
         )
         for layer in model._quantizer.layers:
             layer.load_centroids_(torch.randn(4, input_dim))

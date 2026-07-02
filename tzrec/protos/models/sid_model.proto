@@ -39,17 +39,15 @@ message ContrastiveConfig {
 }
 
 message SidCandidateOutputConfig {
-    reserved 4;
+    reserved 4, 5;
 
     // Whether predict/inference emits candidate SIDs. Disabled by default.
     optional bool enabled = 1 [default = false];
-    // Number of candidate SIDs per item. If include_origin is true, the
-    // original SID occupies the first slot.
+    // Number of candidate SIDs per item; the nearest last-layer codes,
+    // best-first (slot 0 is the greedy SID).
     optional uint32 topk = 2 [default = 10];
     // v1 supports only last-layer nearest-neighbor replacement.
     optional string strategy = 3 [default = "last_layer_knn"];
-    // Whether to force the original SID as priority-0 candidate.
-    optional bool include_origin = 5 [default = true];
 }
 
 message SidRqvae {

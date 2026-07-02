@@ -85,6 +85,8 @@ class ResidualQuantizer(BaseModule):
         assert n_layers >= 1, f"n_layers must be >= 1, got {n_layers}"
         self.embed_dim = embed_dim
         self.n_layers = n_layers
+        # Last layer index; the only layer varied to build candidate SIDs.
+        self._candidate_layer_idx = n_layers - 1
         self.normalize_residuals = normalize_residuals
         self.n_embed_list = normalize_n_embed(n_embed, n_layers)
         self._init_candidate_output_config(candidate_output_config)
@@ -110,9 +112,6 @@ class ResidualQuantizer(BaseModule):
             return
 
         self._candidate_output_topk = int(candidate_output_config["topk"])
-        self._candidate_output_include_origin = candidate_output_config[
-            "include_origin"
-        ]
 
         if self._candidate_output_topk < 1:
             raise ValueError(
@@ -123,12 +122,11 @@ class ResidualQuantizer(BaseModule):
             raise ValueError(
                 "candidate_output_config.strategy supports only 'last_layer_knn' in v1."
             )
-        last_layer = self.n_layers - 1
-        if self._candidate_output_topk > self.n_embed_list[last_layer]:
+        if self._candidate_output_topk > self.n_embed_list[self._candidate_layer_idx]:
             raise ValueError(
                 f"candidate_output_config.topk ({self._candidate_output_topk}) "
                 f"must be <= target "
-                f"layer codebook size ({self.n_embed_list[last_layer]})."
+                f"layer codebook size ({self.n_embed_list[self._candidate_layer_idx]})."
             )
 
         self._candidate_output_enabled = True
@@ -203,24 +201,23 @@ class ResidualQuantizer(BaseModule):
         cumulative: List[torch.Tensor] = []
         candidate_layer_output: Optional[QuantizeOutput] = None
         aggregated = torch.zeros_like(input)
-        target_layer = self.n_layers - 1
         for i in range(self.n_layers):
             if self.normalize_residuals:
                 residual = F.normalize(residual, dim=-1)
             layer_topk = 1
-            if include_candidates and i == target_layer:
-                layer_topk = self._candidate_layer_topk()
+            if include_candidates and i == self._candidate_layer_idx:
+                # Last layer fetches topk neighbors to vary; others stay greedy.
+                layer_topk = self._candidate_output_topk
             out = self._quantize_layer(i, residual, topk=layer_topk)
             codes, quantized = out.ids, out.embeddings
             all_codes.append(codes)
             aggregated = aggregated + quantized
             cumulative.append(aggregated)
             residual = residual - quantized.detach()
-            if include_candidates and i == target_layer:
+            if include_candidates and i == self._candidate_layer_idx:
                 candidate_layer_output = out
         cluster_ids = torch.stack(all_codes, dim=-1)  # (B, n_layers)
         if include_candidates:
-            assert candidate_layer_output is not None
             candidate_codes, candidate_scores = self._build_code_candidates(
                 cluster_ids,
                 candidate_layer_output,
@@ -233,15 +230,6 @@ class ResidualQuantizer(BaseModule):
                 candidate_scores,
             )
         return cluster_ids, aggregated, cumulative, None, None
-
-    def _candidate_layer_topk(self) -> int:
-        """Number of final-layer neighbors needed to build candidate output."""
-        if self._candidate_output_include_origin and self._candidate_output_topk > 1:
-            return min(
-                self.n_embed_list[self.n_layers - 1],
-                self._candidate_output_topk + 1,
-            )
-        return self._candidate_output_topk
 
     def _residual_output(
         self,
@@ -280,39 +268,24 @@ class ResidualQuantizer(BaseModule):
         cluster_ids: torch.Tensor,
         layer_output: QuantizeOutput,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build candidate SID tuples from one residual walk."""
+        """Build candidate SID tuples from one residual walk.
+
+        Keeps the greedy prefix and varies only the last layer across its
+        top-k nearest codes, best-first (slot 0 is the greedy code).
+        """
         topk = self._candidate_output_topk
-        include_origin = self._candidate_output_include_origin
-        target_layer = self.n_layers - 1
-        assert layer_output.scores is not None
+        assert layer_output is not None
         assert layer_output.topk_ids is not None
         assert layer_output.topk_scores is not None
 
-        origin_codes = cluster_ids[:, target_layer].unsqueeze(1)
-        if include_origin:
-            origin_scores = layer_output.scores.unsqueeze(1)
-            if topk > 1:
-                search_scores = layer_output.topk_scores.masked_fill(
-                    layer_output.topk_ids == origin_codes,
-                    float("inf"),
-                )
-                scores, positions = torch.topk(
-                    search_scores,
-                    k=topk - 1,
-                    dim=1,
-                    largest=False,
-                )
-                ids = layer_output.topk_ids.gather(1, positions)
-                candidate_layer_codes = torch.cat([origin_codes, ids], dim=1)
-                candidate_scores = torch.cat([origin_scores, scores], dim=1)
-            else:
-                candidate_layer_codes = origin_codes
-                candidate_scores = origin_scores
-        else:
-            candidate_layer_codes = layer_output.topk_ids[:, :topk]
-            candidate_scores = layer_output.topk_scores[:, :topk]
+        candidate_layer_codes = layer_output.topk_ids[:, :topk]
+        candidate_scores = layer_output.topk_scores[:, :topk]
 
-        prefix_codes = cluster_ids[:, :target_layer].unsqueeze(1).expand(-1, topk, -1)
+        prefix_codes = (
+            cluster_ids[:, : self._candidate_layer_idx]
+            .unsqueeze(1)
+            .expand(-1, topk, -1)
+        )
         candidate_codes = torch.cat(
             [prefix_codes, candidate_layer_codes.unsqueeze(-1)],
             dim=-1,

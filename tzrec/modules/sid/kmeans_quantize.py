@@ -271,19 +271,10 @@ class KMeansQuantizeLayer(QuantizeLayer):
             QuantizeOutput: selected centroid/id plus top-k nearest ids/scores.
         """
         if not self.is_initialized:
+            # Pre-fit no-op so the model stays callable; codes are dummy zeros and
+            # topk/candidate metadata is omitted (never consumed before the fit).
             ids = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
-            if self.training:
-                return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
-            self._check_topk(topk)
-            topk_ids = torch.zeros(x.shape[0], topk, dtype=torch.long, device=x.device)
-            topk_scores = torch.zeros(x.shape[0], topk, dtype=x.dtype, device=x.device)
-            return QuantizeOutput(
-                embeddings=torch.zeros_like(x),
-                ids=ids,
-                scores=torch.zeros_like(ids, dtype=x.dtype),
-                topk_ids=topk_ids,
-                topk_scores=topk_scores,
-            )
+            return QuantizeOutput(embeddings=torch.zeros_like(x), ids=ids)
         # Match x to the centroid dtype (as load_centroids_ does): cdist rejects
         # mismatched dtypes, so a non-fp32 input would otherwise raise.
         distances = torch.cdist(x.to(self.centroids.dtype), self.centroids).pow(2)

@@ -31,7 +31,6 @@ def _candidate_output_config(topk: int = 3) -> dict:
         "enabled": True,
         "topk": topk,
         "strategy": "last_layer_knn",
-        "include_origin": True,
     }
 
 
@@ -238,7 +237,7 @@ class ResidualVectorQuantizerTest(unittest.TestCase):
 
         self.assertEqual(candidate_codes.shape, (2, 3, 2))
         self.assertEqual(candidate_scores.shape, (2, 3))
-        # include_origin: the first candidate is the greedy SID (get_codes order).
+        # The first candidate is the greedy SID (nearest == get_codes order).
         torch.testing.assert_close(candidate_codes[:, 0, :], rvq.get_codes(x))
         # The first-layer greedy prefix is unchanged for every candidate.
         self.assertTrue(

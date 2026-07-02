@@ -166,11 +166,10 @@ class ResidualQuantizerWalkTest(unittest.TestCase):
         self.assertEqual(recon16.dtype, torch.bfloat16)
 
 
-def _candidate_config(topk=2, include_origin=True, strategy="last_layer_knn") -> dict:
+def _candidate_config(topk=2, strategy="last_layer_knn") -> dict:
     return {
         "enabled": True,
         "topk": topk,
-        "include_origin": include_origin,
         "strategy": strategy,
     }
 
@@ -235,53 +234,15 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
         ):
             fq._residual_pass(torch.randn(3, 3), include_candidates=True)
 
-    def test_candidate_layer_topk_include_origin_expands(self) -> None:
-        # include_origin & topk>1 -> min(last_codebook, topk+1); an extra
-        # neighbor is fetched so the forced origin never crowds out a real one.
-        fq = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=8,
-            candidate_output_config=_candidate_config(topk=3, include_origin=True),
-        )
-        self.assertEqual(fq._candidate_layer_topk(), 4)
-
-    def test_candidate_layer_topk_include_origin_capped(self) -> None:
-        # topk+1 exceeds the codebook -> capped at the codebook size.
-        fq = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=4,
-            candidate_output_config=_candidate_config(topk=4, include_origin=True),
-        )
-        self.assertEqual(fq._candidate_layer_topk(), 4)
-
-    def test_candidate_layer_topk_plain(self) -> None:
-        # The else branch: no origin, or topk==1 -> exactly topk neighbors.
-        fq_no_origin = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=8,
-            candidate_output_config=_candidate_config(topk=2, include_origin=False),
-        )
-        self.assertEqual(fq_no_origin._candidate_layer_topk(), 2)
-        fq_topk1 = _FakeQuantizer(
-            embed_dim=3,
-            n_layers=2,
-            n_embed=8,
-            candidate_output_config=_candidate_config(topk=1, include_origin=True),
-        )
-        self.assertEqual(fq_topk1._candidate_layer_topk(), 1)
-
-    def test_build_candidates_include_origin_false(self) -> None:
-        # include_origin=False branch: last-layer codes are the raw top-k
-        # neighbors (candidate[:, 0] is the top-scored one, == greedy here).
+    def test_build_candidates(self) -> None:
+        # Last-layer codes are the raw top-k neighbors (candidate[:, 0] is the
+        # top-scored one, == greedy here).
         torch.manual_seed(0)
         fq = _FakeQuantizer(
             embed_dim=3,
             n_layers=2,
             n_embed=4,
-            candidate_output_config=_candidate_config(topk=2, include_origin=False),
+            candidate_output_config=_candidate_config(topk=2),
         )
         fq.eval()
         x = torch.randn(5, 3)
@@ -295,13 +256,13 @@ class ResidualQuantizerCandidateWalkTest(unittest.TestCase):
         )
 
     def test_build_candidates_topk_one(self) -> None:
-        # include_origin=True, topk==1 branch: candidate collapses to the origin.
+        # topk==1: the single candidate is the greedy SID.
         torch.manual_seed(0)
         fq = _FakeQuantizer(
             embed_dim=3,
             n_layers=2,
             n_embed=4,
-            candidate_output_config=_candidate_config(topk=1, include_origin=True),
+            candidate_output_config=_candidate_config(topk=1),
         )
         fq.eval()
         x = torch.randn(5, 3)

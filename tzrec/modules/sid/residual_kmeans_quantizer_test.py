@@ -127,7 +127,6 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
                 "enabled": True,
                 "topk": 3,
                 "strategy": "last_layer_knn",
-                "include_origin": True,
             },
         )
         rkq.eval()
@@ -141,7 +140,7 @@ class ResidualKMeansQuantizerTest(unittest.TestCase):
 
         self.assertEqual(out.candidate_codes.shape, (2, 3, 2))  # (B, topk, n_layers)
         self.assertEqual(out.candidate_scores.shape, (2, 3))
-        # include_origin: the first candidate is the greedy SID (get_codes order).
+        # The first candidate is the greedy SID (nearest == get_codes order).
         torch.testing.assert_close(out.candidate_codes[:, 0, :], rkq.get_codes(x))
         # The first-layer greedy prefix is unchanged for every candidate.
         self.assertTrue(

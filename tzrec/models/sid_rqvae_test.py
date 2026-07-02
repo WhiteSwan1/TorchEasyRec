@@ -109,7 +109,6 @@ class SidRqvaeTest(unittest.TestCase):
         n_layers=2,
         recon="l2",
         candidate_output=False,
-        candidate_include_origin=True,
     ):
         """Helper to create a SidRqvae model with config-driven losses."""
         n_embed_list = [16] * n_layers
@@ -127,9 +126,6 @@ class SidRqvaeTest(unittest.TestCase):
         if candidate_output:
             sid_rqvae_cfg.candidate_output_config.enabled = True
             sid_rqvae_cfg.candidate_output_config.topk = 3
-            sid_rqvae_cfg.candidate_output_config.include_origin = (
-                candidate_include_origin
-            )
 
         # Real features + feature_groups: input_dim is derived from the group.
         features, feature_groups = _features_and_groups(input_dim, use_contrastive)
@@ -240,19 +236,12 @@ class SidRqvaeTest(unittest.TestCase):
             traced_predictions["codes"],
         )
 
-    def test_rqvae_candidate_output_no_origin(self) -> None:
-        """include_origin=False: slot-0 candidate is the nearest neighbor.
-
-        The greedy code is not force-inserted at slot 0 — with
-        include_origin=False slot 0 is simply the top-scored (nearest) last-layer
-        neighbor, so the returned scores are sorted best-first and slot 0 holds
-        the minimum score (NOT necessarily asserted equal to the greedy codes).
-        """
+    def test_rqvae_candidate_scores_sorted(self) -> None:
+        """Candidate scores come back sorted best-first, minimum at slot 0."""
         B, input_dim = 4, 32
         model = self._create_model(
             input_dim=input_dim,
             candidate_output=True,
-            candidate_include_origin=False,
         )
         model.eval()
         model.set_is_inference(True)
