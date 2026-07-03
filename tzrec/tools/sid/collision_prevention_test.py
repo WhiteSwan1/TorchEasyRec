@@ -15,7 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
-from collections import Counter
+from collections import Counter, defaultdict
 from unittest import mock
 
 import pyarrow as pa
@@ -23,6 +23,7 @@ from pyarrow import csv, parquet
 
 from tzrec.tools.sid.collision_prevention import (
     CandidateSidRow,
+    OdpsSqlGenerator,
     RawSidRow,
     assign_sid_collisions,
     build_parser,
@@ -364,6 +365,181 @@ class SidCollisionPreventionTest(unittest.TestCase):
         executed_sql = "\n".join(executed_sqls)
         self.assertIn("-- final: remaining_unassigned", executed_sql)
         self.assertNotIn("INSERT OVERWRITE TABLE proj.final_sid", executed_sql)
+
+    def test_odps_insert_selected_ranks_survivors_densely(self) -> None:
+        # Regression guard for the duplicate-(codebook, index) bug: the dense
+        # `codebook_rn` that feeds `index` must be computed AFTER the
+        # `WHERE item_rn = 1` survivor filter, otherwise dropped rows leave index
+        # gaps that reappear next iteration as duplicate slots. In the fixed
+        # nesting the `codebook_rn` window is defined in the outer query (over the
+        # already-filtered survivors) and therefore textually precedes the inner
+        # `item_rn` window; the buggy version co-located them with `item_rn` first.
+        args = build_parser().parse_args(
+            [
+                "--backend",
+                "odps",
+                "--input_path",
+                "odps://proj/tables/raw_sid/ds=20260630",
+                "--candidate_input_path",
+                "odps://proj/tables/cand_sid/ds=20260630",
+                "--output_path",
+                "odps://proj/tables/final_sid/ds=20260630",
+                "--max_items_per_codebook",
+                "5",
+                "--max_iters",
+                "3",
+            ]
+        )
+        sql = OdpsSqlGenerator(args)._insert_selected_sql()
+
+        self.assertIn("current_cnt + codebook_rn AS `index`", sql)
+        self.assertIn("WHERE item_rn = 1", sql)
+        self.assertLess(sql.index("AS codebook_rn"), sql.index("AS item_rn"))
+
+    def test_local_reassignment_indices_are_unique_and_dense(self) -> None:
+        # After reassignment every (codebook, index) pair must be unique and each
+        # bucket's indices must form a contiguous 1..N run -- the invariant the
+        # ODPS backend must also uphold. (Which two items overflow A is decided by
+        # a seeded hash, so every item carries the same B fallback.)
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_2", "item_2", "A"),
+            RawSidRow("item_3", "item_3", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "B", 1, 0.1),
+            CandidateSidRow("item_1", "B", 1, 0.2),
+            CandidateSidRow("item_2", "B", 1, 0.3),
+            CandidateSidRow("item_3", "B", 1, 0.4),
+        ]
+
+        assigned, stats = assign_sid_collisions(
+            raw_rows,
+            candidate_rows,
+            capacity=2,
+            seed=7,
+        )
+
+        self.assertEqual(len(assigned), 4)
+        self.assertEqual(stats.unassigned_count, 0)
+        pairs = [(row.codebook, row.index) for row in assigned]
+        self.assertEqual(len(pairs), len(set(pairs)))
+        by_codebook = defaultdict(list)
+        for codebook, index in pairs:
+            by_codebook[codebook].append(index)
+        for indices in by_codebook.values():
+            self.assertEqual(sorted(indices), list(range(1, len(indices) + 1)))
+
+    def test_local_drop_policy_omits_unplaceable_items(self) -> None:
+        # A (capacity 1) keeps one item; the other two overflow and both want B,
+        # which fits only one -> one item stays unplaceable and reaches
+        # _handle_unassigned's drop branch.
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_2", "item_2", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "B", 1, 0.1),
+            CandidateSidRow("item_1", "B", 1, 0.2),
+            CandidateSidRow("item_2", "B", 1, 0.3),
+        ]
+
+        assigned, stats = assign_sid_collisions(
+            raw_rows,
+            candidate_rows,
+            capacity=1,
+            seed=7,
+            unassigned_policy="drop",
+        )
+
+        self.assertEqual(stats.unassigned_count, 1)
+        # The unplaceable item is dropped: A keeps 1, B keeps 1, nothing else.
+        self.assertEqual(len(assigned), 2)
+        self.assertLessEqual(max(Counter(row.codebook for row in assigned).values()), 1)
+
+    def test_local_keep_original_readds_over_capacity(self) -> None:
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_2", "item_2", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "B", 1, 0.1),
+            CandidateSidRow("item_1", "B", 1, 0.2),
+            CandidateSidRow("item_2", "B", 1, 0.3),
+        ]
+
+        assigned, stats = assign_sid_collisions(
+            raw_rows,
+            candidate_rows,
+            capacity=1,
+            seed=7,
+            unassigned_policy="keep_original",
+        )
+
+        self.assertEqual(stats.unassigned_count, 0)
+        self.assertEqual(len(assigned), 3)
+        # The unplaceable item is re-added at its origin: keep_original is the
+        # only policy allowed to exceed capacity (A now holds 2 > capacity 1).
+        self.assertEqual(Counter(row.codebook for row in assigned)["A"], 2)
+        self.assertEqual(stats.max_final_bucket_size, 2)
+
+    def test_local_error_policy_raises_on_unplaceable(self) -> None:
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+            RawSidRow("item_2", "item_2", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "B", 1, 0.1),
+            CandidateSidRow("item_1", "B", 1, 0.2),
+            CandidateSidRow("item_2", "B", 1, 0.3),
+        ]
+
+        # Distinct from the "no explicit candidate input" ValueError: candidates
+        # are provided but cannot place every overflow item.
+        with self.assertRaisesRegex(RuntimeError, "could not be assigned"):
+            assign_sid_collisions(
+                raw_rows,
+                candidate_rows,
+                capacity=1,
+                seed=7,
+                unassigned_policy="error",
+            )
+
+    def test_local_score_order_higher_prefers_high_score(self) -> None:
+        # One item overflows A (capacity 1); it can go to B (score 0.1) or
+        # C (score 0.9). score_order flips which score wins. Both items carry both
+        # candidates so the choice is independent of which item the seeded hash
+        # picks to overflow.
+        raw_rows = [
+            RawSidRow("item_0", "item_0", "A"),
+            RawSidRow("item_1", "item_1", "A"),
+        ]
+        candidate_rows = [
+            CandidateSidRow("item_0", "B", 1, 0.1),
+            CandidateSidRow("item_0", "C", 1, 0.9),
+            CandidateSidRow("item_1", "B", 1, 0.1),
+            CandidateSidRow("item_1", "C", 1, 0.9),
+        ]
+
+        lower, _ = assign_sid_collisions(
+            raw_rows, candidate_rows, capacity=1, seed=7, score_order="lower"
+        )
+        higher, _ = assign_sid_collisions(
+            raw_rows, candidate_rows, capacity=1, seed=7, score_order="higher"
+        )
+
+        reassigned_lower = next(
+            row for row in lower if row.origin_codebook != row.codebook
+        )
+        reassigned_higher = next(
+            row for row in higher if row.origin_codebook != row.codebook
+        )
+        self.assertEqual(reassigned_lower.codebook, "B")
+        self.assertEqual(reassigned_higher.codebook, "C")
 
 
 if __name__ == "__main__":

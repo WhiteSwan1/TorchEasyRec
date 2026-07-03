@@ -871,31 +871,45 @@ class OdpsSqlGenerator:
         )
 
     def _insert_selected_sql(self) -> str:
+        # ``codebook_rn`` must rank ONLY the surviving (``item_rn = 1``) rows so
+        # the emitted ``index`` stays dense and contiguous with the rows already
+        # in ``assigned`` (counted by ``current_cnt``). Ranking before the
+        # ``item_rn = 1`` filter leaves a gap whenever a codebook's top-ranked
+        # candidate wins a different codebook (its row here is dropped): that gap
+        # both wastes capacity and is re-issued next iteration as a duplicate
+        # ``(codebook, index)`` pair, since ``current_cnt`` (a COUNT of inserted
+        # rows) then undercounts the real slot high-water mark. Hence the nested
+        # shape: pick each item's best codebook first, THEN densely number the
+        # survivors per codebook.
         return (
             f"INSERT INTO TABLE {self.assigned}\n"
             "SELECT item_id, origin_codebook, codebook,\n"
             "       current_cnt + codebook_rn AS `index`\n"
             "FROM (\n"
-            "  SELECT s.item_id, s.origin_codebook, s.codebook, "
+            "  SELECT item_id, origin_codebook, codebook, current_cnt,\n"
+            "         ROW_NUMBER() OVER (\n"
+            "           PARTITION BY codebook\n"
+            f"           ORDER BY priority ASC, {self._score_order}, "
+            "ABS(HASH(CONCAT("
+            f"'{self.args.seed}', ':', item_id, ':', codebook)))\n"
+            "         ) AS codebook_rn\n"
+            "  FROM (\n"
+            "    SELECT s.item_id, s.origin_codebook, s.codebook, "
             "s.priority, s.score,\n"
-            "         ROW_NUMBER() OVER (\n"
-            "           PARTITION BY s.item_id\n"
-            f"           ORDER BY s.priority ASC, s.{self._score_order}, "
+            "           ROW_NUMBER() OVER (\n"
+            "             PARTITION BY s.item_id\n"
+            f"             ORDER BY s.priority ASC, s.{self._score_order}, "
             "ABS(HASH(CONCAT("
             f"'{self.args.seed}', ':', s.item_id, ':', s.codebook)))\n"
-            "         ) AS item_rn,\n"
-            "         ROW_NUMBER() OVER (\n"
-            "           PARTITION BY s.codebook\n"
-            f"           ORDER BY s.priority ASC, s.{self._score_order}, "
-            "ABS(HASH(CONCAT("
-            f"'{self.args.seed}', ':', s.item_id, ':', s.codebook)))\n"
-            "         ) AS codebook_rn,\n"
-            "         COALESCE(cnt.cnt, 0) AS current_cnt\n"
-            f"  FROM {self.selected} s\n"
-            f"  LEFT OUTER JOIN {self.counts} cnt ON s.codebook = cnt.codebook\n"
-            ") x\n"
-            "WHERE item_rn = 1\n"
-            f"  AND current_cnt + codebook_rn <= {self.args.max_items_per_codebook}"
+            "           ) AS item_rn,\n"
+            "           COALESCE(cnt.cnt, 0) AS current_cnt\n"
+            f"    FROM {self.selected} s\n"
+            f"    LEFT OUTER JOIN {self.counts} cnt "
+            "ON s.codebook = cnt.codebook\n"
+            "  ) x\n"
+            "  WHERE item_rn = 1\n"
+            ") y\n"
+            f"WHERE current_cnt + codebook_rn <= {self.args.max_items_per_codebook}"
         )
 
     def _remaining_unassigned_sql(self, label: str) -> str:
