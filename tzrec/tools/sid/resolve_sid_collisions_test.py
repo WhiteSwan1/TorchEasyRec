@@ -242,6 +242,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [call.kwargs["selected_cols"] for call in create_reader.call_args_list],
             expected_projections,
         )
+        self.assertTrue(
+            all(call.kwargs["use_threads"] for call in create_reader.call_args_list)
+        )
         self.assertEqual(stats.relocated_count, expected_relocated)
         self.assertEqual(len(self._read_parquet(out)["item_id"]), 3)
 

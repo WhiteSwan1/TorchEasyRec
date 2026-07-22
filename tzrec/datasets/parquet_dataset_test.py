@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import pyarrow as pa
@@ -376,6 +377,19 @@ class ParquetReaderTest(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
+
+    def test_use_threads_is_forwarded(self):
+        input_path = os.path.join(self.test_dir, "part-0.parquet")
+        parquet.write_table(pa.table({"id": [1]}), input_path)
+        reader = ParquetReader(input_path, batch_size=1, use_threads=True)
+
+        with mock.patch(
+            "tzrec.datasets.parquet_dataset._reader_iter", return_value=iter(())
+        ) as reader_iter:
+            list(reader.to_batches())
+
+        reader_iter.assert_called_once()
+        self.assertTrue(reader_iter.call_args.kwargs["use_threads"])
 
     @parameterized.expand([[True], [False]])
     def test_parquet_reader(self, rebalance):

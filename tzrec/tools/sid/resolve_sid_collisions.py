@@ -324,6 +324,7 @@ class CollisionResolutionRunner:
             selected_cols=selected_cols,
             reader_type=self._config.reader_type,
             quota_name=self._config.odps_data_quota_name,
+            use_threads=True,
         )
 
     def _progress_interval_reached(

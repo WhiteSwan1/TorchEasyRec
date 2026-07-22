@@ -43,6 +43,7 @@ def _reader_iter(
     end: int,
     worker_id: int,
     source_id: Optional[str] = None,
+    use_threads: bool = False,
 ) -> Iterator[pa.RecordBatch]:
     cnt = 0
     global_row_idx = start  # Track absolute global row index
@@ -69,7 +70,10 @@ def _reader_iter(
 
             parquet_file = parquet.ParquetFile(input_file)
             for batch in parquet_file.iter_batches(
-                batch_size, row_groups=row_groups, columns=columns, use_threads=False
+                batch_size,
+                row_groups=row_groups,
+                columns=columns,
+                use_threads=use_threads,
             ):
                 original_batch_len = len(batch)  # Store before any modification
                 if cnt + original_batch_len <= start:
@@ -159,6 +163,7 @@ class ParquetReader(BaseReader):
         drop_redundant_bs_eq_one (bool): drop last redundant batch with batch_size
             equal one to prevent train_eval hung.
         rebalance (bool): rebalance parquet rows to equal number for each worker.
+        use_threads (bool): use Arrow threads when reading Parquet columns.
         sample_cost_field (str): sample cost field name.
         batch_cost_size (int): batch cost limit size.
     """
@@ -173,6 +178,7 @@ class ParquetReader(BaseReader):
         shuffle_buffer_size: int = 32,
         drop_redundant_bs_eq_one: bool = False,
         rebalance: bool = True,
+        use_threads: bool = False,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
         **kwargs: Any,
@@ -190,6 +196,7 @@ class ParquetReader(BaseReader):
         self._pg = dist_util.get_dist_object_pg()
         self._drop_redundant_bs_eq_one = drop_redundant_bs_eq_one
         self._rebalance = rebalance
+        self._use_threads = use_threads
 
         self._ordered_cols = None
         self._input_files = []
@@ -275,6 +282,7 @@ class ParquetReader(BaseReader):
                     source_id=f"{self._input_path}:{start}"
                     if self._rebalance
                     else None,
+                    use_threads=self._use_threads,
                 )
 
         yield from self._arrow_reader_iter(_combined_reader())
