@@ -836,6 +836,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         result = self._read_parquet(out)
         self.assertEqual(result["item_id"], [keeper, duplicate, duplicate])
         self.assertEqual(result["item_id"].count(duplicate), 2)
+        self.assertEqual(result["codebook"], [[0, 0], [0, 2], [0, 3]])
         self._assert_map_matches_resolved_groups(out)
         original_path, _ = self._group_paths(out)
         original_groups = self._read_parquet(original_path)
@@ -854,11 +855,14 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         np.testing.assert_array_equal(source_rows, [0, 2])
         np.testing.assert_array_equal(target_rows, [0, 1])
 
-        values = np.asarray([[10, 11], [20, 21], [-1, -1], [-1, -1]])
+        values = np.full((4, 2), -1)
+        values[target_rows] = [[10, 11], [20, 21]]
+        _, later_target_rows = lookup.match(np.asarray(["b"], dtype=object))
+        values[later_target_rows] = [[30, 31]]
         lookup.broadcast_duplicate_targets(values)
         np.testing.assert_array_equal(
             values,
-            [[10, 11], [20, 21], [10, 11], [10, 11]],
+            [[30, 31], [20, 21], [30, 31], [30, 31]],
         )
 
     def test_random_tolerates_duplicate_item_ids(self) -> None:

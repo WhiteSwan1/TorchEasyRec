@@ -90,6 +90,7 @@ from tzrec.utils.sid.collision import (
 
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
+_LOOKUP_CHUNK_ROWS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
 
 
@@ -110,32 +111,50 @@ class _ItemIdLookup:
     """Map streamed item IDs to positions in a fixed requested-ID array."""
 
     def __init__(self, item_ids: np.ndarray) -> None:
-        self._sorted_to_requested = np.argsort(item_ids, kind="stable")
-        self._sorted_ids = item_ids[self._sorted_to_requested]
-        duplicate_sorted_rows = (
-            np.flatnonzero(self._sorted_ids[1:] == self._sorted_ids[:-1]) + 1
+        import pandas as pd
+
+        requested_to_unique, unique_ids = pd.factorize(item_ids, sort=False)
+        unique_count = unique_ids.shape[0]
+        unique_to_requested = np.full(unique_count, item_ids.shape[0], dtype=np.int64)
+        for start in range(0, item_ids.shape[0], _LOOKUP_CHUNK_ROWS):
+            end = min(start + _LOOKUP_CHUNK_ROWS, item_ids.shape[0])
+            np.minimum.at(
+                unique_to_requested,
+                requested_to_unique[start:end],
+                np.arange(start, end, dtype=np.int64),
+            )
+
+        duplicate_requested_rows = []
+        representative_requested_rows = []
+        for start in range(0, item_ids.shape[0], _LOOKUP_CHUNK_ROWS):
+            end = min(start + _LOOKUP_CHUNK_ROWS, item_ids.shape[0])
+            requested_rows = np.arange(start, end, dtype=np.int64)
+            representative_rows = unique_to_requested[requested_to_unique[start:end]]
+            duplicate_mask = requested_rows != representative_rows
+            if np.any(duplicate_mask):
+                duplicate_requested_rows.append(requested_rows[duplicate_mask])
+                representative_requested_rows.append(
+                    representative_rows[duplicate_mask]
+                )
+
+        self._id_index = pd.Index(unique_ids)
+        self._unique_to_requested = unique_to_requested
+        self._duplicate_requested_rows = (
+            np.concatenate(duplicate_requested_rows)
+            if duplicate_requested_rows
+            else np.empty(0, dtype=np.int64)
         )
-        self._duplicate_requested_rows = self._sorted_to_requested[
-            duplicate_sorted_rows
-        ]
-        representative_sorted_rows = np.searchsorted(
-            self._sorted_ids,
-            self._sorted_ids[duplicate_sorted_rows],
-            side="left",
+        self._representative_requested_rows = (
+            np.concatenate(representative_requested_rows)
+            if representative_requested_rows
+            else np.empty(0, dtype=np.int64)
         )
-        self._representative_requested_rows = self._sorted_to_requested[
-            representative_sorted_rows
-        ]
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Return matching source rows and requested-ID positions."""
-        positions = np.searchsorted(self._sorted_ids, item_ids)
-        source_rows = np.flatnonzero(positions < self._sorted_ids.shape[0])
-        if source_rows.size:
-            source_rows = source_rows[
-                self._sorted_ids[positions[source_rows]] == item_ids[source_rows]
-            ]
-        return source_rows, self._sorted_to_requested[positions[source_rows]]
+        positions = self._id_index.get_indexer(item_ids)
+        source_rows = np.flatnonzero(positions >= 0)
+        return source_rows, self._unique_to_requested[positions[source_rows]]
 
     def broadcast_duplicate_targets(self, values: np.ndarray) -> None:
         """Copy representative values to duplicate requested-ID positions."""
