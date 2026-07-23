@@ -17,7 +17,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
@@ -137,6 +137,40 @@ class CollisionResolutionResult:
 
 
 @dataclass(frozen=True)
+class CollisionWorkShard:
+    """Compact collision work owned by one process.
+
+    Args:
+        overflow_rows: Original row indices aligned with the candidate matrix.
+        overflow_bucket_key_prefixes: Flattened band prefixes aligned with
+            ``overflow_rows``.
+        overflow_origin_last_codes: Original last-layer codes aligned with
+            ``overflow_rows``.
+        bucket_keys: Sorted occupied bucket keys for complete owned bands.
+        bucket_counts: Original counts aligned with ``bucket_keys``.
+        config: Collision capacity and SID shape configuration.
+    """
+
+    overflow_rows: np.ndarray
+    overflow_bucket_key_prefixes: np.ndarray
+    overflow_origin_last_codes: np.ndarray
+    bucket_keys: np.ndarray
+    bucket_counts: np.ndarray
+    config: CollisionResolutionConfig
+
+
+@dataclass(frozen=True)
+class CollisionShardResult:
+    """Compact assignments and bucket metadata produced by one process."""
+
+    resolved_last_codes: np.ndarray
+    slot_indices: np.ndarray
+    unresolved_rows: np.ndarray
+    final_bucket_keys: np.ndarray
+    final_bucket_counts: np.ndarray
+
+
+@dataclass(frozen=True)
 class CodebookItemGrouping:
     """CSR-like row grouping for sorted flattened SID keys.
 
@@ -197,14 +231,18 @@ class CollisionResolver(ABC):
         """
         raise NotImplementedError
 
+    @staticmethod
     def _validate_candidate_last_codes(
-        self, plan: CollisionPlan, candidate_last_codes: np.ndarray
+        candidate_last_codes: np.ndarray,
+        overflow_count: int,
+        last_size: int,
     ) -> np.ndarray:
         """Validate and normalize candidates aligned with overflow rows.
 
         Args:
-            plan: Collision plan defining overflow rows and codebook bounds.
             candidate_last_codes: Ordered candidate matrix to validate.
+            overflow_count: Number of overflow rows the matrix must cover.
+            last_size: Cardinality of the last SID layer.
 
         Returns:
             The candidate matrix as a NumPy array.
@@ -219,7 +257,6 @@ class CollisionResolver(ABC):
             raise ValueError(
                 f"candidate_last_codes must be 2-D, got shape {candidates.shape}."
             )
-        overflow_count = plan.overflow_rows.shape[0]
         if candidates.shape[0] != overflow_count:
             raise ValueError(
                 "candidate_last_codes must be row-aligned with overflow_rows, got "
@@ -228,8 +265,6 @@ class CollisionResolver(ABC):
             )
         if not np.issubdtype(candidates.dtype, np.integer):
             raise TypeError("candidate_last_codes must use an integer dtype.")
-
-        last_size = plan.config.layer_sizes[-1]
         if candidates.size and (
             int(candidates.min()) < 0 or int(candidates.max()) >= last_size
         ):
@@ -280,61 +315,112 @@ class CollisionResolver(ABC):
             stats=stats,
         )
 
-    def _summarize_final_buckets(
+    def _resolve_first_fit_shard(
         self,
-        plan: CollisionPlan,
-        initial_counts: np.ndarray,
-        in_overflow_band: np.ndarray,
-        slot_counts: dict[int, int],
-        collect_grouping: bool,
-    ) -> tuple[np.ndarray, np.ndarray, int, int]:
-        """Summarize final bucket metadata and collision statistics.
+        shard: CollisionWorkShard,
+        candidates: np.ndarray,
+    ) -> CollisionShardResult:
+        """Greedily resolve one compact collection of complete bands.
 
-        Args:
-            plan: Collision plan defining original bucket keys and capacity.
-            initial_counts: Original bucket counts capped at capacity.
-            in_overflow_band: Mask selecting buckets affected by relocation.
-            slot_counts: Final counts for buckets in affected bands.
-            collect_grouping: Whether to build sorted final bucket arrays.
-
-        Returns:
-            Final bucket keys, final bucket counts, number of over-capacity
-            buckets, and maximum final bucket size.
+        ``candidates`` must already satisfy
+        :meth:`_validate_candidate_last_codes` for this shard.
         """
-        capacity = plan.config.capacity
-        final_bucket_keys = np.empty(0, dtype=np.int64)
-        final_bucket_counts = np.empty(0, dtype=np.int64)
-        untouched_mask = ~in_overflow_band
-        untouched_counts = initial_counts[untouched_mask]
-        band_counts = np.fromiter(
+        overflow_count = shard.overflow_rows.shape[0]
+        if overflow_count == 0:
+            return CollisionShardResult(
+                resolved_last_codes=np.empty(0, dtype=np.int64),
+                slot_indices=np.empty(0, dtype=np.int64),
+                unresolved_rows=np.empty(0, dtype=np.int64),
+                final_bucket_keys=shard.bucket_keys.copy(),
+                final_bucket_counts=np.minimum(
+                    shard.bucket_counts, shard.config.capacity
+                ),
+            )
+
+        capacity = shard.config.capacity
+        slot_counts = dict(
+            zip(
+                shard.bucket_keys.tolist(),
+                np.minimum(shard.bucket_counts, capacity).tolist(),
+            )
+        )
+        resolved_last_codes = shard.overflow_origin_last_codes.copy()
+        slot_indices = np.empty(overflow_count, dtype=np.int64)
+        unresolved_rows = []
+        get_slot_count = slot_counts.get
+        progress = ProgressLogger("Resolving collision overflow", start_n=0)
+        processed_count = 0
+
+        for start in range(0, overflow_count, _ROW_CHUNK_SIZE):
+            end = min(start + _ROW_CHUNK_SIZE, overflow_count)
+            for local_row, (
+                row,
+                key_prefix,
+                origin_last_code,
+                candidate_row,
+            ) in enumerate(
+                zip(
+                    shard.overflow_rows[start:end].tolist(),
+                    shard.overflow_bucket_key_prefixes[start:end].tolist(),
+                    shard.overflow_origin_last_codes[start:end].tolist(),
+                    candidates[start:end],
+                ),
+                start=start,
+            ):
+                for candidate in candidate_row.tolist():
+                    if candidate == origin_last_code:
+                        continue
+                    destination_key = key_prefix + candidate
+                    destination_count = get_slot_count(destination_key, 0)
+                    if destination_count < capacity:
+                        slot_counts[destination_key] = destination_count + 1
+                        resolved_last_codes[local_row] = candidate
+                        slot_indices[local_row] = destination_count + 1
+                        break
+                else:
+                    unresolved_rows.append(row)
+                    origin_key = key_prefix + origin_last_code
+                    origin_count = get_slot_count(origin_key, 0) + 1
+                    slot_counts[origin_key] = origin_count
+                    slot_indices[local_row] = origin_count
+
+                processed_count += 1
+                if processed_count % self._progress_interval == 0:
+                    progress.log(
+                        processed_count,
+                        suffix=f"{processed_count} samples processed",
+                    )
+
+        final_bucket_keys = np.fromiter(
+            slot_counts, dtype=np.int64, count=len(slot_counts)
+        )
+        final_bucket_counts = np.fromiter(
             slot_counts.values(), dtype=np.int64, count=len(slot_counts)
         )
-        collision_count = int((band_counts > capacity).sum())
-        max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
-        max_band = int(band_counts.max()) if band_counts.size else 0
-        max_bucket_size = max(max_untouched, max_band)
-        if collect_grouping:
-            untouched_keys = plan.bucket_keys[untouched_mask]
-            band_keys = np.fromiter(slot_counts, dtype=np.int64, count=len(slot_counts))
-            all_keys = np.concatenate((untouched_keys, band_keys))
-            all_counts = np.concatenate((untouched_counts, band_counts))
-            occupancy_order = np.argsort(all_keys, kind="stable")
-            final_bucket_keys = all_keys[occupancy_order]
-            final_bucket_counts = all_counts[occupancy_order]
-        return final_bucket_keys, final_bucket_counts, collision_count, max_bucket_size
+        order = np.argsort(final_bucket_keys, kind="stable")
+        return CollisionShardResult(
+            resolved_last_codes=resolved_last_codes,
+            slot_indices=slot_indices,
+            unresolved_rows=np.asarray(unresolved_rows, dtype=np.int64),
+            final_bucket_keys=final_bucket_keys[order],
+            final_bucket_counts=final_bucket_counts[order],
+        )
 
-    def _resolve_first_fit(
+    def _resolve_plan(
         self,
         plan: CollisionPlan,
         candidate_last_codes: np.ndarray,
         collect_grouping: bool,
+        resolve_shard: Callable[[CollisionWorkShard, np.ndarray], CollisionShardResult],
     ) -> CollisionResolutionResult:
-        """Greedily relocate overflow rows to their first free candidate slot.
+        """Resolve a whole plan by delegating its overflow bands to one shard.
 
         Candidate rows must be aligned with ``plan.overflow_rows`` and values
-        must be valid last-layer codebook indices. An overflow row that finds
-        no free candidate slot keeps its original SID (over capacity), so every
-        input row is preserved in the output.
+        must be valid last-layer codebook indices. The shard contains every
+        overflow row plus the occupied buckets of every overflow band; buckets
+        in untouched bands keep their capped initial counts. An overflow row
+        the shard resolver cannot place keeps its original SID (over
+        capacity), so every input row is preserved in the output.
 
         Args:
             plan: Grouping and overflow plan from
@@ -343,6 +429,8 @@ class CollisionResolver(ABC):
                 ``(M, K)``, where ``M`` equals the number of overflow rows.
             collect_grouping: Whether to retain final bucket metadata required
                 by :func:`build_resolved_item_grouping`.
+            resolve_shard: Callback resolving one validated complete-band
+                shard with its aligned candidate matrix.
 
         Returns:
             Resolved last-layer codes, slot indices, unresolved row indices,
@@ -353,91 +441,82 @@ class CollisionResolver(ABC):
             ValueError: If candidates are not a row-aligned two-dimensional
                 matrix or contain out-of-range last-layer indices.
         """
-        candidates = self._validate_candidate_last_codes(plan, candidate_last_codes)
         overflow_count = plan.overflow_rows.shape[0]
+        candidates = self._validate_candidate_last_codes(
+            candidate_last_codes,
+            overflow_count,
+            plan.config.layer_sizes[-1],
+        )
         if overflow_count == 0:
             return self._build_no_overflow_result(plan, collect_grouping)
 
-        last_size = plan.config.layer_sizes[-1]
         capacity = plan.config.capacity
         initial_counts = np.minimum(plan.bucket_counts, capacity)
-        # Relocation only reads or writes buckets in a band with an overflow
-        # row. Every other bucket keeps its capped initial count untouched.
-        overflow_band_ids = plan.overflow_bucket_key_prefixes // last_size
+        last_size = plan.config.layer_sizes[-1]
+        overflow_band_ids = np.unique(plan.overflow_bucket_key_prefixes // last_size)
         in_overflow_band = np.isin(plan.bucket_keys // last_size, overflow_band_ids)
-        slot_counts = dict(
-            zip(
-                plan.bucket_keys[in_overflow_band].tolist(),
-                initial_counts[in_overflow_band].tolist(),
-            )
+        shard = CollisionWorkShard(
+            overflow_rows=plan.overflow_rows,
+            overflow_bucket_key_prefixes=plan.overflow_bucket_key_prefixes,
+            overflow_origin_last_codes=plan.overflow_origin_last_codes,
+            bucket_keys=plan.bucket_keys[in_overflow_band],
+            bucket_counts=plan.bucket_counts[in_overflow_band],
+            config=plan.config,
         )
+        shard_result = resolve_shard(shard, candidates)
         resolved_last_codes = plan.original_last_codes.copy()
+        resolved_last_codes[plan.overflow_rows] = shard_result.resolved_last_codes
         slot_indices = plan.initial_slot_indices.copy()
-        relocated_count = 0
-        unresolved_rows = []
-        get_slot_count = slot_counts.get
-        progress = ProgressLogger("Resolving collision overflow", start_n=0)
-        processed_count = 0
-
-        for start in range(0, overflow_count, _ROW_CHUNK_SIZE):
-            end = min(start + _ROW_CHUNK_SIZE, overflow_count)
-            for row, key_prefix, origin_last_code, candidate_row in zip(
-                plan.overflow_rows[start:end].tolist(),
-                plan.overflow_bucket_key_prefixes[start:end].tolist(),
-                plan.overflow_origin_last_codes[start:end].tolist(),
-                candidates[start:end],
-            ):
-                for candidate in candidate_row.tolist():
-                    if candidate == origin_last_code:
-                        continue
-                    destination_key = key_prefix + candidate
-                    destination_count = get_slot_count(destination_key, 0)
-                    if destination_count < capacity:
-                        slot_counts[destination_key] = destination_count + 1
-                        resolved_last_codes[row] = candidate
-                        slot_indices[row] = destination_count + 1
-                        relocated_count += 1
-                        break
-                else:
-                    # No free candidate slot: keep the original SID over capacity.
-                    unresolved_rows.append(row)
-                    origin_key = key_prefix + origin_last_code
-                    origin_count = get_slot_count(origin_key, 0) + 1
-                    slot_counts[origin_key] = origin_count
-                    slot_indices[row] = origin_count
-
-                processed_count += 1
-                if processed_count % self._progress_interval == 0:
-                    progress.log(
-                        processed_count,
-                        suffix=f"{processed_count} samples processed",
-                    )
-
-        (
-            final_bucket_keys,
-            final_bucket_counts,
-            final_collision_buckets,
-            max_final_bucket_size,
-        ) = self._summarize_final_buckets(
-            plan,
-            initial_counts,
-            in_overflow_band,
-            slot_counts,
-            collect_grouping,
+        slot_indices[plan.overflow_rows] = shard_result.slot_indices
+        if collect_grouping:
+            untouched_counts = initial_counts[~in_overflow_band]
+            final_bucket_keys = np.concatenate(
+                (
+                    plan.bucket_keys[~in_overflow_band],
+                    shard_result.final_bucket_keys,
+                )
+            )
+            final_bucket_counts = np.concatenate(
+                (untouched_counts, shard_result.final_bucket_counts)
+            )
+            order = np.argsort(final_bucket_keys, kind="stable")
+            final_bucket_keys = final_bucket_keys[order]
+            final_bucket_counts = final_bucket_counts[order]
+            untouched_max = int(untouched_counts.max()) if untouched_counts.size else 0
+        else:
+            final_bucket_keys = np.empty(0, dtype=np.int64)
+            final_bucket_counts = np.empty(0, dtype=np.int64)
+            untouched_max = int(
+                np.max(
+                    initial_counts,
+                    where=~in_overflow_band,
+                    initial=0,
+                )
+            )
+        final_collision_buckets = int(
+            (shard_result.final_bucket_counts > capacity).sum()
         )
-        unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
+        max_final_bucket_size = max(
+            untouched_max,
+            (
+                int(shard_result.final_bucket_counts.max())
+                if shard_result.final_bucket_counts.size
+                else 0
+            ),
+        )
+        relocated_count = overflow_count - shard_result.unresolved_rows.size
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
             raw_collision_buckets=int((plan.bucket_counts > capacity).sum()),
             final_collision_buckets=final_collision_buckets,
-            relocated_count=relocated_count,
-            unresolved_count=len(unresolved_rows),
+            relocated_count=int(relocated_count),
+            unresolved_count=int(shard_result.unresolved_rows.size),
             max_final_bucket_size=max_final_bucket_size,
         )
         return CollisionResolutionResult(
             resolved_last_codes=resolved_last_codes,
             slot_indices=slot_indices,
-            unresolved_rows=unresolved_array,
+            unresolved_rows=shard_result.unresolved_rows,
             final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
             grouping_collected=collect_grouping,
@@ -447,6 +526,19 @@ class CollisionResolver(ABC):
 
 class KnnCollisionResolver(CollisionResolver):
     """Resolve collisions from externally supplied KNN candidate codes."""
+
+    def resolve_shard(
+        self,
+        shard: CollisionWorkShard,
+        candidate_codes: np.ndarray,
+    ) -> CollisionShardResult:
+        """Resolve compact complete-band work with ordered KNN candidates."""
+        candidates = self._validate_candidate_last_codes(
+            candidate_codes,
+            shard.overflow_rows.shape[0],
+            shard.config.layer_sizes[-1],
+        )
+        return self._resolve_first_fit_shard(shard, candidates)
 
     def resolve(
         self,
@@ -477,8 +569,8 @@ class KnnCollisionResolver(CollisionResolver):
                     "overflow rows."
                 )
             candidate_codes = np.empty((0, 0), dtype=np.int64)
-        return self._resolve_first_fit(
-            plan, candidate_codes, collect_grouping=collect_grouping
+        return self._resolve_plan(
+            plan, candidate_codes, collect_grouping, self._resolve_first_fit_shard
         )
 
 
@@ -500,37 +592,6 @@ class RandomCollisionResolver(CollisionResolver):
         if num_candidates < 1:
             raise ValueError(f"num_candidates must be >= 1, got {num_candidates}.")
         self._num_candidates = num_candidates
-
-    def _generate_candidate_last_codes(
-        self, item_ids: np.ndarray, last_size: int
-    ) -> np.ndarray:
-        """Generate deterministic full-space random candidate draws.
-
-        Sampling is with replacement and includes each item's original code
-        because that code is not an input to this method. The placement step
-        skips an origin draw without replacing it, preserving current behavior.
-
-        Args:
-            item_ids: One-dimensional IDs for the overflow rows.
-            last_size: Cardinality of the last SID layer.
-
-        Returns:
-            An ``(len(item_ids), K)`` int64 matrix, where ``K`` is the smaller
-            of ``num_candidates`` and ``last_size - 1``.
-
-        Raises:
-            ValueError: If ``last_size`` is smaller than two.
-        """
-        if last_size < 2:
-            raise ValueError("random candidates require last_size >= 2.")
-        candidate_count = min(self._num_candidates, last_size - 1)
-        hashes = stable_order_hash(item_ids)
-        draw_indices = np.arange(candidate_count, dtype=np.uint64)
-        with np.errstate(over="ignore"):
-            mixed = _splitmix64(
-                hashes[:, None] + draw_indices[None, :] * np.uint64(_SPLITMIX_INCREMENT)
-            )
-        return (mixed % np.uint64(last_size)).astype(np.int64)
 
     def resolve(
         self,
@@ -556,14 +617,15 @@ class RandomCollisionResolver(CollisionResolver):
         if candidate_codes is not None:
             raise ValueError("RandomCollisionResolver does not accept candidate_codes.")
         if plan.overflow_rows.size:
-            candidate_codes = self._generate_candidate_last_codes(
+            candidate_codes = generate_random_candidate_last_codes(
                 plan.overflow_item_ids,
                 plan.config.layer_sizes[-1],
+                self._num_candidates,
             )
         else:
             candidate_codes = np.empty((0, 0), dtype=np.int64)
-        return self._resolve_first_fit(
-            plan, candidate_codes, collect_grouping=collect_grouping
+        return self._resolve_plan(
+            plan, candidate_codes, collect_grouping, self._resolve_first_fit_shard
         )
 
 
@@ -603,6 +665,40 @@ def stable_order_hash(item_ids: np.ndarray) -> np.ndarray:
 
         base = pd.util.hash_array(np.asarray(item_ids, dtype=object))
     return _splitmix64(base)
+
+
+def generate_random_candidate_last_codes(
+    item_ids: np.ndarray,
+    last_size: int,
+    num_candidates: int,
+) -> np.ndarray:
+    """Generate deterministic random last-layer candidate draws.
+
+    Args:
+        item_ids: One-dimensional item IDs for the overflow rows.
+        last_size: Cardinality of the last SID layer.
+        num_candidates: Positive number of requested draws, capped at
+            ``last_size - 1``.
+
+    Returns:
+        An integer candidate matrix aligned with ``item_ids``.
+
+    Raises:
+        ValueError: If the layer has fewer than two codes or the requested
+            number of candidates is not positive.
+    """
+    if last_size < 2:
+        raise ValueError("random candidates require last_size >= 2.")
+    if num_candidates < 1:
+        raise ValueError(f"num_candidates must be >= 1, got {num_candidates}.")
+    candidate_count = min(num_candidates, last_size - 1)
+    hashes = stable_order_hash(item_ids)
+    draw_indices = np.arange(candidate_count, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        mixed = _splitmix64(
+            hashes[:, None] + draw_indices[None, :] * np.uint64(_SPLITMIX_INCREMENT)
+        )
+    return (mixed % np.uint64(last_size)).astype(np.int64)
 
 
 def _band_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:

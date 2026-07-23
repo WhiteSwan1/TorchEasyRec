@@ -18,10 +18,12 @@ from parameterized import parameterized
 from tzrec.utils.sid import collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
+    CollisionWorkShard,
     KnnCollisionResolver,
     RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
+    generate_random_candidate_last_codes,
     prepare_collision_plan,
 )
 from tzrec.utils.test_util import parameterized_name_func
@@ -250,16 +252,60 @@ class CollisionTest(unittest.TestCase):
 
     def test_random_candidate_golden_draws(self) -> None:
         item_ids = np.asarray([0, 1], dtype=np.int64)
-        actual = RandomCollisionResolver(
-            num_candidates=3
-        )._generate_candidate_last_codes(item_ids, last_size=4)
-        capped = RandomCollisionResolver(
-            num_candidates=10
-        )._generate_candidate_last_codes(item_ids, last_size=4)
+        actual = generate_random_candidate_last_codes(item_ids, 4, 3)
+        capped = generate_random_candidate_last_codes(item_ids, 4, 10)
 
         expected = [[1, 2, 0], [2, 0, 2]]
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(capped, expected)
+
+    def test_first_fit_shards_match_complete_resolution(self) -> None:
+        plan = _plan(
+            (3, 5),
+            1,
+            range(8),
+            [[0, 0], [0, 0], [0, 1], [1, 0], [1, 0], [1, 1], [2, 3], [2, 3]],
+        )
+        candidates = np.asarray([[2, 3], [2, 4], [1, 2]], dtype=np.int64)
+        resolver = KnnCollisionResolver()
+        expected = resolver.resolve(plan, candidates)
+        actual_last_codes = plan.original_last_codes.copy()
+        actual_slots = plan.initial_slot_indices.copy()
+        shard_keys = []
+        shard_counts = []
+        unresolved = []
+
+        prefixes = plan.overflow_bucket_key_prefixes
+        split = int(np.flatnonzero(prefixes[1:] != prefixes[:-1])[0] + 1)
+        for start, end in ((0, split), (split, prefixes.size)):
+            owned_bands = np.unique(prefixes[start:end] // 5)
+            bucket_mask = np.isin(plan.bucket_keys // 5, owned_bands)
+            shard = CollisionWorkShard(
+                overflow_rows=plan.overflow_rows[start:end],
+                overflow_bucket_key_prefixes=prefixes[start:end],
+                overflow_origin_last_codes=plan.overflow_origin_last_codes[start:end],
+                bucket_keys=plan.bucket_keys[bucket_mask],
+                bucket_counts=plan.bucket_counts[bucket_mask],
+                config=plan.config,
+            )
+            result = resolver.resolve_shard(shard, candidates[start:end])
+            actual_last_codes[shard.overflow_rows] = result.resolved_last_codes
+            actual_slots[shard.overflow_rows] = result.slot_indices
+            shard_keys.append(result.final_bucket_keys)
+            shard_counts.append(result.final_bucket_counts)
+            unresolved.append(result.unresolved_rows)
+
+        np.testing.assert_array_equal(actual_last_codes, expected.resolved_last_codes)
+        np.testing.assert_array_equal(actual_slots, expected.slot_indices)
+        np.testing.assert_array_equal(
+            np.concatenate(unresolved), expected.unresolved_rows
+        )
+        np.testing.assert_array_equal(
+            np.concatenate(shard_keys), expected.final_bucket_keys
+        )
+        np.testing.assert_array_equal(
+            np.concatenate(shard_counts), expected.final_bucket_counts
+        )
 
     def test_random_resolution_golden(self) -> None:
         plan = _plan((4,), 1, [0, 1, 2], [[0], [0], [3]])

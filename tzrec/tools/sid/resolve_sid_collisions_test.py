@@ -14,6 +14,8 @@ import os
 import shutil
 import unittest
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from unittest import mock
 
 import numpy as np
@@ -26,7 +28,14 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     CollisionResolutionRunner,
     ResolveSidCollisionsConfig,
 )
-from tzrec.utils.sid.collision import stable_order_hash
+from tzrec.utils.sid.collision import (
+    CollisionResolutionConfig,
+    CollisionShardResult,
+    prepare_collision_plan,
+    stable_order_hash,
+)
+from tzrec.utils.sid.collision_sharding import partition_collision_bands
+from tzrec.utils.sid.distributed_collision import DistributedCollisionContext
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 
@@ -36,6 +45,7 @@ def _parquet(
     codes,
     candidate_codes=None,
     item_id_type=None,
+    candidate_scores=None,
 ):
     if item_id_type is None:
         item_id_type = pa.int64()
@@ -47,6 +57,10 @@ def _parquet(
         # flatten each row's [[c0, ..], ..] (topk x n_layers) to a flat list<int>
         flat = [[code for cand in row for code in cand] for row in candidate_codes]
         cols["candidate_codes"] = pa.array(flat, type=pa.list_(pa.int64()))
+    if candidate_scores is not None:
+        cols["candidate_scores"] = pa.array(
+            candidate_scores, type=pa.list_(pa.float32())
+        )
     parquet.write_table(pa.table(cols), path)
 
 
@@ -84,12 +98,14 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             writer_type=None,
             batch_size=100000,
             progress_interval=1_000_000,
+            distributed_timeout_seconds=60,
             item_id_field="item_id",
             code_field="codes",
             candidate_codes_field="candidate_codes",
             layer_sizes=(8, 8),
             max_items_per_codebook=2,
             strategy="candidate",
+            placement_policy="first_fit",
             random_num_candidates=64,
             rate_only=False,
             odps_data_quota_name="pay-as-you-go",
@@ -123,6 +139,34 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             item_map["item_id"], item_map["codebook"], item_map["index"]
         ):
             self.assertEqual(resolved_items[tuple(codebook)][index - 1], item_id)
+
+    @staticmethod
+    def _collision_merge_case():
+        plan = prepare_collision_plan(
+            np.arange(7),
+            np.asarray([[0, 0]] * 3 + [[1, 0]] * 3 + [[2, 3]]),
+            CollisionResolutionConfig(layer_sizes=(3, 4), capacity=1),
+        )
+        shards = partition_collision_bands(
+            plan.overflow_bucket_key_prefixes,
+            plan.bucket_keys,
+            last_size=4,
+            world_size=2,
+        )
+        results = []
+        for shard in shards:
+            rows = plan.overflow_rows[shard.overflow_start : shard.overflow_end]
+            prefix = plan.overflow_bucket_key_prefixes[shard.overflow_start]
+            results.append(
+                CollisionShardResult(
+                    resolved_last_codes=np.asarray([1, 0]),
+                    slot_indices=np.asarray([1, 2]),
+                    unresolved_rows=rows[1:].copy(),
+                    final_bucket_keys=np.asarray([prefix, prefix + 1]),
+                    final_bucket_counts=np.asarray([2, 1]),
+                )
+            )
+        return plan, shards, results
 
     # ---- candidate strategy ----
 
@@ -226,10 +270,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         out = os.path.join(self.test_dir, "out")
         _parquet(inp, [0, 1, 2], codes, candidate_codes)
 
+        from tzrec.datasets import dataset as dataset_module
+
         with mock.patch.object(
-            resolve_sid_collisions,
+            dataset_module,
             "create_reader",
-            wraps=resolve_sid_collisions.create_reader,
+            wraps=dataset_module.create_reader,
         ) as create_reader:
             stats = self._run(
                 inp,
@@ -245,6 +291,33 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.relocated_count, expected_relocated)
         self.assertEqual(len(self._read_parquet(out)["item_id"]), 3)
 
+    def test_candidate_scores_are_not_read_for_rank_only_placement(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        candidates = [[[0, 1], [0, 2]]] * 3
+        _parquet(
+            inp,
+            [0, 1, 2],
+            [[0, 0]] * 3,
+            candidates,
+            candidate_scores=[[0.1, 0.2]] * 3,
+        )
+
+        from tzrec.datasets import dataset as dataset_module
+
+        with mock.patch.object(
+            dataset_module,
+            "create_reader",
+            wraps=dataset_module.create_reader,
+        ) as create_reader:
+            stats = self._run(inp, out, max_items_per_codebook=2)
+
+        self.assertEqual(
+            [call.kwargs["selected_cols"] for call in create_reader.call_args_list],
+            [["item_id", "codes"], ["item_id", "candidate_codes"]],
+        )
+        self.assertEqual(stats.relocated_count, 1)
+
     def test_raises_when_overflow_but_no_candidates(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
@@ -252,15 +325,58 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "candidate_codes field .* is missing"):
             self._run(inp, out, max_items_per_codebook=2)
 
-    def test_multi_process_launch_rejected(self) -> None:
+    def test_rank_zero_reader_uses_single_process_environment(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
-        with (
-            mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}),
-            self.assertRaisesRegex(RuntimeError, "single-process"),
-        ):
-            self._run(inp, out)
+        _parquet(inp, [0], [[0, 0]], [[[0, 1]]])
+        runner = self._runner(inp, out)
+        distributed_environment = {
+            "WORLD_SIZE": "2",
+            "RANK": "0",
+            "LOCAL_WORLD_SIZE": "2",
+            "LOCAL_RANK": "0",
+        }
+
+        with mock.patch.dict(os.environ, distributed_environment):
+            reader = runner._make_reader(["item_id", "codes"])
+            self.assertEqual(os.environ["WORLD_SIZE"], "2")
+            self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "2")
+
+        self.assertEqual(reader.schema.names, ["item_id", "codes"])
+
+    def test_iterative_policy_can_improve_candidate_placement(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        first_fit_out = os.path.join(self.test_dir, "first_fit")
+        iterative_out = os.path.join(self.test_dir, "iterative")
+        item_ids = [10, 11, 20, 21, 30]
+        codes = [[0, 0], [0, 0], [0, 1], [0, 1], [0, 2]]
+        candidates = [
+            [[0, 2], [0, 3], [0, 4]],
+            [[0, 2], [0, 3], [0, 4]],
+            [[0, 3], [0, 2], [0, 2]],
+            [[0, 3], [0, 2], [0, 2]],
+            [[0, 3], [0, 4], [0, 5]],
+        ]
+        _parquet(inp, item_ids, codes, candidates)
+
+        first_fit = self._run(
+            inp,
+            first_fit_out,
+            layer_sizes=(8, 8),
+            max_items_per_codebook=1,
+        )
+        iterative = self._run(
+            inp,
+            iterative_out,
+            layer_sizes=(8, 8),
+            max_items_per_codebook=1,
+            placement_policy="iterative",
+        )
+
+        self.assertEqual(first_fit.relocated_count, 1)
+        self.assertEqual(first_fit.unresolved_count, 1)
+        self.assertEqual(iterative.relocated_count, 2)
+        self.assertEqual(iterative.unresolved_count, 0)
 
     def test_candidates_align_across_batches(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -884,6 +1000,184 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(result["item_id"], ["b", "a", "a"])
         self._assert_map_matches_resolved_groups(out)
 
+    def test_merge_collision_shards_accumulates_stats(self) -> None:
+        plan, shards, results = self._collision_merge_case()
+
+        merged = CollisionResolutionRunner._merge_collision_shards(
+            plan,
+            shards,
+            results,
+            collect_grouping=False,
+        )
+
+        self.assertEqual(merged.stats.unresolved_count, 2)
+        self.assertEqual(merged.stats.relocated_count, 2)
+        self.assertEqual(merged.stats.final_collision_buckets, 2)
+        self.assertEqual(merged.stats.max_final_bucket_size, 2)
+        np.testing.assert_array_equal(
+            np.sort(merged.unresolved_rows),
+            np.sort(np.concatenate([result.unresolved_rows for result in results])),
+        )
+        self.assertEqual(merged.final_bucket_keys.size, 0)
+        self.assertEqual(merged.final_bucket_counts.size, 0)
+
+    def test_merge_collision_shards_collects_sorted_grouping(self) -> None:
+        plan, shards, results = self._collision_merge_case()
+
+        merged = CollisionResolutionRunner._merge_collision_shards(
+            plan,
+            shards,
+            results,
+            collect_grouping=True,
+        )
+
+        self.assertTrue(merged.grouping_collected)
+        np.testing.assert_array_equal(merged.final_bucket_keys, [0, 1, 4, 5, 11])
+        np.testing.assert_array_equal(merged.final_bucket_counts, [2, 1, 2, 1, 1])
+
+    def test_distributed_run_matches_single_process(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        single_out = os.path.join(self.test_dir, "single")
+        distributed_out = os.path.join(self.test_dir, "distributed")
+        # Two overflow bands so both ranks receive real complete-band work.
+        _parquet(
+            inp,
+            list(range(7)),
+            [[0, 0]] * 3 + [[1, 0]] * 3 + [[2, 3]],
+        )
+        run_options = dict(
+            max_items_per_codebook=1,
+            strategy="random",
+            layer_sizes=(3, 4),
+        )
+        expected_stats = self._run(inp, single_out, **run_options)
+
+        work_queue = Queue()
+        result_queue = Queue()
+        stats_queue = Queue()
+
+        def fake_send_work(work, dst):
+            work_queue.put(work)
+
+        def fake_receive_work(src):
+            return work_queue.get(timeout=30)
+
+        def fake_gather(result, context):
+            if context.is_coordinator:
+                return [result, result_queue.get(timeout=30)]
+            result_queue.put(result)
+            return None
+
+        def fake_broadcast(stats, context):
+            if context.is_coordinator:
+                stats_queue.put(stats)
+                return stats
+            return stats_queue.get(timeout=30)
+
+        coordinator = self._runner(inp, distributed_out, **run_options)
+        worker = self._runner(inp, distributed_out, **run_options)
+        with (
+            mock.patch.object(
+                resolve_sid_collisions, "send_collision_work", fake_send_work
+            ),
+            mock.patch.object(
+                resolve_sid_collisions, "receive_collision_work", fake_receive_work
+            ),
+            mock.patch.object(
+                resolve_sid_collisions,
+                "gather_collision_shard_results",
+                fake_gather,
+            ),
+            mock.patch.object(
+                resolve_sid_collisions, "broadcast_collision_stats", fake_broadcast
+            ),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            worker_future = pool.submit(
+                worker._run_distributed_worker,
+                DistributedCollisionContext(2, 1, 2),
+            )
+            stats = coordinator._run_distributed_coordinator(
+                DistributedCollisionContext(2, 0, 2)
+            )
+            worker_stats = worker_future.result(timeout=60)
+
+        self.assertEqual(stats, expected_stats)
+        self.assertEqual(worker_stats, expected_stats)
+        self.assertEqual(
+            self._read_parquet(distributed_out), self._read_parquet(single_out)
+        )
+        self.assertEqual(
+            self._read_parquet(self._group_paths(distributed_out)[1]),
+            self._read_parquet(self._group_paths(single_out)[1]),
+        )
+        self._assert_map_matches_resolved_groups(distributed_out)
+
+    def test_merge_collision_shards_rejects_missing_result(self) -> None:
+        plan, shards, results = self._collision_merge_case()
+
+        with self.assertRaisesRegex(ValueError, "received 1 results for 2 shards"):
+            CollisionResolutionRunner._merge_collision_shards(
+                plan,
+                shards,
+                results[:1],
+                collect_grouping=False,
+            )
+
+    def test_merge_collision_shards_rejects_extra_result(self) -> None:
+        plan, shards, results = self._collision_merge_case()
+
+        with self.assertRaisesRegex(ValueError, "received 3 results for 2 shards"):
+            CollisionResolutionRunner._merge_collision_shards(
+                plan,
+                shards,
+                [*results, results[-1]],
+                collect_grouping=False,
+            )
+
+    def test_merge_collision_shards_rejects_out_of_range_code(self) -> None:
+        plan, shards, results = self._collision_merge_case()
+        malformed = CollisionShardResult(
+            resolved_last_codes=np.asarray([4, 0]),
+            slot_indices=results[0].slot_indices,
+            unresolved_rows=results[0].unresolved_rows,
+            final_bucket_keys=results[0].final_bucket_keys,
+            final_bucket_counts=results[0].final_bucket_counts,
+        )
+
+        with self.assertRaisesRegex(ValueError, r"outside \[0, 4\)"):
+            CollisionResolutionRunner._merge_collision_shards(
+                plan,
+                shards,
+                [malformed, results[1]],
+                collect_grouping=False,
+            )
+
+    def test_run_applies_configured_timeout_to_process_group(self) -> None:
+        runner = self._runner(
+            "input",
+            "output",
+            distributed_timeout_seconds=37,
+        )
+        context_manager = mock.MagicMock()
+        context_manager.__enter__.return_value.distributed = False
+        with (
+            mock.patch.object(
+                resolve_sid_collisions,
+                "initialize_distributed_collision",
+                return_value=context_manager,
+            ) as initialize,
+            mock.patch.object(
+                runner,
+                "_run_single_process",
+                return_value=mock.sentinel.stats,
+            ),
+        ):
+            stats = runner.run()
+
+        initialize.assert_called_once_with(37)
+        self.assertIs(stats, mock.sentinel.stats)
+
     def test_empty_codebook_token_raises(self) -> None:
         args = resolve_sid_collisions.build_parser().parse_args(
             [
@@ -898,6 +1192,12 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "codebook"):
             ResolveSidCollisionsConfig.from_namespace(args)
+
+    def test_parser_has_no_removed_distributed_flags(self) -> None:
+        parser = resolve_sid_collisions.build_parser()
+        flags = {action.dest for action in parser._actions}
+        self.assertNotIn("distributed_work_dir", flags)
+        self.assertNotIn("compute_threads", flags)
 
 
 if __name__ == "__main__":

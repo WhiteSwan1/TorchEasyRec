@@ -28,13 +28,17 @@ writer cannot serialize list columns; ``candidate_codes`` is a flat
 
 The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
-item's origin, so an origin draw or a duplicate draw is not replaced.
+item's origin, so an origin draw or a duplicate draw is not replaced. Candidate
+generation is independent of the selected first-fit or iterative placement
+policy.
 
-It is a single-process tool -- launch it with ``python -m`` (no torchrun /
-process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
-``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
-``--strategy candidate`` -- a flat ``candidate_codes`` ``list<int>`` column
-(``topk * n_layers`` codes per item)).
+The input is a Semantic-ID table from ``tzrec.predict`` (an ``item_id`` column,
+a ``codes`` ``list<int>`` column, and -- for the default ``--strategy
+candidate`` -- a flat ``candidate_codes`` ``list<int>`` column (``topk *
+n_layers`` codes per item)). RQ-VAE also emits ``candidate_scores`` when
+candidate output is enabled. This tool does not read those scores: candidates
+are already sorted from best to worst, and both placement policies use that
+column position as the priority.
 
 Example::
 
@@ -47,33 +51,27 @@ Example::
 
 To also write the optional original-SID audit grouping, add
 ``--original_sid_groups_output_path sid_collision/original_groups``.
+
+For CPU parallel arbitration on one machine, launch the same command with
+``torchrun --standalone --nproc-per-node=8``. Rank zero owns all input and
+output I/O; ranks exchange only numeric collision shards through PyTorch
+object collectives on a Gloo group.
 """
 
-from __future__ import annotations
-
 import argparse
+import importlib
 import json
 import os
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from functools import cached_property
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-# Register the local reader/writer classes used through create_reader/writer.
-import tzrec.datasets.parquet_dataset  # noqa: F401
-from tzrec.datasets.csv_dataset import CsvWriter
-from tzrec.datasets.dataset import (
-    BaseReader,
-    BaseWriter,
-    create_reader,
-    create_writer,
-)
 from tzrec.utils.logging_util import ProgressLogger, logger
-from tzrec.utils.path_util import check_path_conflict
 from tzrec.utils.sid.collision import (
     CodebookItemGrouping,
     CollisionPlan,
@@ -81,61 +79,97 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionResult,
     CollisionResolutionStats,
     CollisionResolver,
+    CollisionShardResult,
     KnnCollisionResolver,
-    RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
+    generate_random_candidate_last_codes,
     prepare_collision_plan,
+    stable_order_hash,
 )
+from tzrec.utils.sid.collision_sharding import (
+    CollisionBandShard,
+    partition_collision_bands,
+)
+from tzrec.utils.sid.distributed_collision import (
+    DistributedCollisionContext,
+    DistributedCollisionWork,
+    broadcast_collision_stats,
+    build_collision_work,
+    gather_collision_shard_results,
+    initialize_distributed_collision,
+    receive_collision_work,
+    send_collision_work,
+)
+from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+
+if TYPE_CHECKING:
+    from tzrec.datasets.dataset import BaseReader, BaseWriter
 
 _MAP_WRITE_ROWS = 1_000_000
 _GROUP_WRITE_ITEMS = 1_000_000
 _ARROW_LIST_OFFSET_MAX = int(np.iinfo(np.int32).max)
+_IO_MODULE_BY_CLASS = {
+    "CsvReader": "tzrec.datasets.csv_dataset",
+    "CsvWriter": "tzrec.datasets.csv_dataset",
+    "OdpsReader": "tzrec.datasets.odps_dataset",
+    "OdpsWriter": "tzrec.datasets.odps_dataset",
+    "ParquetReader": "tzrec.datasets.parquet_dataset",
+    "ParquetWriter": "tzrec.datasets.parquet_dataset",
+}
 
 
-def _require_single_process() -> None:
-    """Reject multi-process launches; the tool writes one complete map itself."""
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    if world_size != 1 or rank != 0:
-        raise RuntimeError(
-            "resolve_sid_collisions is single-process; launch it with `python -m` "
-            f"(not torchrun): got WORLD_SIZE={world_size}, RANK={rank}. Under "
-            "multiple ranks every rank reprocesses the full input and emits "
-            "duplicate shards (local) or racing overwrite sessions (ODPS)."
-        )
+@contextmanager
+def _rank_zero_io_environment():
+    """Expose rank-zero Reader and Writer construction as single-process I/O."""
+    names = ("WORLD_SIZE", "RANK", "LOCAL_WORLD_SIZE", "LOCAL_RANK")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(
+        {
+            "WORLD_SIZE": "1",
+            "RANK": "0",
+            "LOCAL_WORLD_SIZE": "1",
+            "LOCAL_RANK": "0",
+        }
+    )
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 class _ItemIdLookup:
     """Map streamed item IDs to positions in a fixed requested-ID array."""
 
     def __init__(self, item_ids: np.ndarray) -> None:
-        self._sorted_to_requested = np.argsort(item_ids, kind="stable")
-        self._sorted_ids = item_ids[self._sorted_to_requested]
-        duplicate_sorted_rows = (
-            np.flatnonzero(self._sorted_ids[1:] == self._sorted_ids[:-1]) + 1
+        import pandas as pd
+
+        group_indices, unique_ids = pd.factorize(item_ids, sort=False)
+        representative_rows = np.full(unique_ids.shape[0], item_ids.shape[0])
+        np.minimum.at(
+            representative_rows,
+            group_indices,
+            np.arange(item_ids.shape[0], dtype=np.int64),
         )
-        self._duplicate_requested_rows = self._sorted_to_requested[
-            duplicate_sorted_rows
+        requested_rows = np.arange(item_ids.shape[0], dtype=np.int64)
+        self._duplicate_requested_rows = requested_rows[
+            requested_rows != representative_rows[group_indices]
         ]
-        representative_sorted_rows = np.searchsorted(
-            self._sorted_ids,
-            self._sorted_ids[duplicate_sorted_rows],
-            side="left",
-        )
-        self._representative_requested_rows = self._sorted_to_requested[
-            representative_sorted_rows
+        self._representative_requested_rows = representative_rows[
+            group_indices[self._duplicate_requested_rows]
         ]
+        self._unique_id_index = pd.Index(unique_ids)
+        self._representative_rows = representative_rows
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Return matching source rows and requested-ID positions."""
-        positions = np.searchsorted(self._sorted_ids, item_ids)
-        source_rows = np.flatnonzero(positions < self._sorted_ids.shape[0])
-        if source_rows.size:
-            source_rows = source_rows[
-                self._sorted_ids[positions[source_rows]] == item_ids[source_rows]
-            ]
-        return source_rows, self._sorted_to_requested[positions[source_rows]]
+        group_indices = self._unique_id_index.get_indexer(item_ids)
+        source_rows = np.flatnonzero(group_indices >= 0)
+        return source_rows, self._representative_rows[group_indices[source_rows]]
 
     def broadcast_duplicate_targets(self, values: np.ndarray) -> None:
         """Copy representative values to duplicate requested-ID positions."""
@@ -156,12 +190,14 @@ class ResolveSidCollisionsConfig:
     writer_type: Optional[str]
     batch_size: int
     progress_interval: int
+    distributed_timeout_seconds: int
     item_id_field: str
     code_field: str
     candidate_codes_field: str
     layer_sizes: Tuple[int, ...]
     max_items_per_codebook: int
     strategy: str
+    placement_policy: str
     random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
@@ -173,12 +209,21 @@ class ResolveSidCollisionsConfig:
             raise ValueError(
                 f"progress_interval must be >= 1, got {self.progress_interval}."
             )
+        if self.distributed_timeout_seconds < 1:
+            raise ValueError(
+                "distributed_timeout_seconds must be >= 1, got "
+                f"{self.distributed_timeout_seconds}."
+            )
         if self.random_num_candidates < 1:
             raise ValueError(
                 f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
             )
         if self.strategy not in {"candidate", "random"}:
             raise ValueError(f"unsupported strategy: {self.strategy!r}.")
+        if self.placement_policy not in {"first_fit", "iterative"}:
+            raise ValueError(
+                f"unsupported placement_policy: {self.placement_policy!r}."
+            )
         if not self.rate_only and not self.output_path:
             raise ValueError("output_path is required unless rate_only is set.")
         if not self.rate_only and not self.resolved_sid_groups_output_path:
@@ -186,19 +231,22 @@ class ResolveSidCollisionsConfig:
                 "resolved_sid_groups_output_path is required unless rate_only is set."
             )
 
-        paths = [self.input_path]
-        paths.extend(
-            path
-            for path in (
-                self.output_path,
-                self.original_sid_groups_output_path,
-                self.resolved_sid_groups_output_path,
+        if int(os.environ.get("RANK", 0)) == 0:
+            from tzrec.utils.path_util import check_path_conflict
+
+            paths = [self.input_path]
+            paths.extend(
+                path
+                for path in (
+                    self.output_path,
+                    self.original_sid_groups_output_path,
+                    self.resolved_sid_groups_output_path,
+                )
+                if path
             )
-            if path
-        )
-        has_conflict, conflict_message = check_path_conflict(paths)
-        if has_conflict:
-            raise ValueError(conflict_message)
+            has_conflict, conflict_message = check_path_conflict(paths)
+            if has_conflict:
+                raise ValueError(conflict_message)
 
         # Eagerly build the resolution config so its validation (layer_sizes,
         # capacity) fails fast here rather than lazily inside run().
@@ -223,12 +271,14 @@ class ResolveSidCollisionsConfig:
             writer_type=args.writer_type,
             batch_size=args.batch_size,
             progress_interval=args.progress_interval,
+            distributed_timeout_seconds=args.distributed_timeout_seconds,
             item_id_field=args.item_id_field,
             code_field=args.code_field,
             candidate_codes_field=args.candidate_codes_field,
             layer_sizes=layer_sizes,
             max_items_per_codebook=args.max_items_per_codebook,
             strategy=args.strategy,
+            placement_policy=args.placement_policy,
             random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
@@ -251,10 +301,8 @@ class CollisionResolutionRunner:
         config: ResolveSidCollisionsConfig,
     ) -> None:
         self._config = config
-        self._resolver: CollisionResolver
-        if self._config.strategy == "random":
-            self._resolver = RandomCollisionResolver(
-                self._config.random_num_candidates,
+        if self._config.placement_policy == "iterative":
+            self._resolver: CollisionResolver = IterativeCollisionResolver(
                 progress_interval=self._config.progress_interval,
             )
         else:
@@ -266,7 +314,17 @@ class CollisionResolutionRunner:
 
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and write the resulting SID map."""
-        _require_single_process()
+        with initialize_distributed_collision(
+            self._config.distributed_timeout_seconds,
+        ) as context:
+            if not context.distributed:
+                return self._run_single_process()
+            if context.is_coordinator:
+                return self._run_distributed_coordinator(context)
+            return self._run_distributed_worker(context)
+
+    def _run_single_process(self) -> CollisionResolutionStats:
+        """Execute the existing in-process Reader, resolver, and Writer path."""
         item_ids, codes = self._load_codes()
         plan = prepare_collision_plan(
             item_ids,
@@ -275,17 +333,24 @@ class CollisionResolutionRunner:
         )
         collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
         candidate_last_codes = None
-        if self._config.strategy != "random" and plan.overflow_rows.size:
-            candidate_last_codes = self._load_candidate_last_codes(
-                plan.overflow_item_ids
-            )
+        if plan.overflow_rows.size:
+            candidate_last_codes = self._prepare_candidate_last_codes(plan)
         result = self._resolver.resolve(
             plan,
             candidate_last_codes,
             collect_grouping=collect_grouping,
         )
         del candidate_last_codes
+        return self._finish_coordinator_run(item_ids, codes, plan, result)
 
+    def _finish_coordinator_run(
+        self,
+        item_ids: np.ndarray,
+        codes: np.ndarray,
+        plan: CollisionPlan,
+        result: CollisionResolutionResult,
+    ) -> CollisionResolutionStats:
+        """Write coordinator-owned outputs and log final statistics."""
         if self._config.rate_only:
             logger.info("rate_only: skipping map and SID group writes")
             del plan
@@ -297,15 +362,272 @@ class CollisionResolutionRunner:
         logger.info("SID collision resolution finished: %s", result.stats)
         return result.stats
 
-    def _make_reader(self, selected_cols: List[str]) -> BaseReader:
-        """Open a repository reader projecting ``selected_cols``."""
-        return create_reader(
-            input_path=self._config.input_path,
-            batch_size=self._config.batch_size,
-            selected_cols=selected_cols,
-            reader_type=self._config.reader_type,
-            quota_name=self._config.odps_data_quota_name,
+    def _run_distributed_coordinator(
+        self, context: DistributedCollisionContext
+    ) -> CollisionResolutionStats:
+        """Prepare, distribute, resolve, merge, and write on rank zero."""
+        item_ids, codes = self._load_codes()
+        plan = prepare_collision_plan(
+            item_ids,
+            codes,
+            self._config.resolution_config,
         )
+        candidates = (
+            self._prepare_candidate_last_codes(plan)
+            if plan.overflow_rows.size
+            else np.empty((0, 0), dtype=np.int64)
+        )
+        shards = partition_collision_bands(
+            plan.overflow_bucket_key_prefixes,
+            plan.bucket_keys,
+            plan.config.layer_sizes[-1],
+            context.world_size,
+            max(int(candidates.shape[1]), 1),
+        )
+        order_hashes = (
+            stable_order_hash(plan.overflow_item_ids)
+            if self._config.placement_policy == "iterative"
+            else None
+        )
+        local_work: Optional[DistributedCollisionWork] = None
+        for shard in shards:
+            shard_work = build_collision_work(plan, shard, candidates, order_hashes)
+            if shard.rank == context.rank:
+                local_work = shard_work
+            else:
+                send_collision_work(shard_work, dst=shard.rank)
+        # Work shards hold copies, so the plan-aligned matrices can be freed.
+        del candidates, order_hashes
+        if local_work is None:
+            raise RuntimeError("rank 0 collision work is unavailable.")
+
+        shard_result = self._resolve_distributed_work(local_work)
+        del local_work
+        shard_results = gather_collision_shard_results(shard_result, context)
+        if shard_results is None:
+            raise RuntimeError("rank 0 did not gather collision shard results.")
+        collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
+        result = self._merge_collision_shards(
+            plan,
+            shards,
+            shard_results,
+            collect_grouping,
+        )
+        del shard_results
+        stats = self._finish_coordinator_run(item_ids, codes, plan, result)
+        return broadcast_collision_stats(stats, context)
+
+    def _run_distributed_worker(
+        self, context: DistributedCollisionContext
+    ) -> CollisionResolutionStats:
+        """Resolve one received work shard and return the shared statistics."""
+        work = receive_collision_work(src=0)
+        shard_result = self._resolve_distributed_work(work)
+        del work
+        gather_collision_shard_results(shard_result, context)
+        del shard_result
+        return broadcast_collision_stats(None, context)
+
+    def _resolve_distributed_work(
+        self, work: DistributedCollisionWork
+    ) -> CollisionShardResult:
+        """Apply the configured placement policy to one numeric work shard."""
+        if self._config.placement_policy == "iterative":
+            if not isinstance(self._resolver, IterativeCollisionResolver):
+                raise RuntimeError("iterative resolver is not available.")
+            if work.order_hashes is None:
+                raise ValueError(
+                    "iterative collision work is missing stable order hashes."
+                )
+            return self._resolver.resolve_shard(
+                work.work_shard,
+                work.candidate_codes,
+                work.order_hashes,
+            )
+        if not isinstance(self._resolver, KnnCollisionResolver):
+            raise RuntimeError("first-fit resolver is not available.")
+        return self._resolver.resolve_shard(work.work_shard, work.candidate_codes)
+
+    @staticmethod
+    def _merge_collision_shards(
+        plan: CollisionPlan,
+        shards: Tuple[CollisionBandShard, ...],
+        shard_results: Sequence[CollisionShardResult],
+        collect_grouping: bool,
+    ) -> CollisionResolutionResult:
+        """Merge and validate rank-ordered complete-band shard results."""
+        if len(shard_results) != len(shards):
+            raise ValueError(
+                f"received {len(shard_results)} results for {len(shards)} shards."
+            )
+        overflow_count = plan.overflow_rows.size
+        covered_until = 0
+        resolved_last_codes = plan.original_last_codes.copy()
+        slot_indices = plan.initial_slot_indices.copy()
+        unresolved_storage = np.empty(overflow_count, dtype=np.int64)
+        unresolved_count = 0
+        bucket_key_parts: List[np.ndarray] = []
+        bucket_count_parts: List[np.ndarray] = []
+        last_size = plan.config.layer_sizes[-1]
+        capacity = plan.config.capacity
+        overflow_bands = (
+            np.unique(plan.overflow_bucket_key_prefixes // last_size)
+            if overflow_count
+            else np.empty(0, dtype=np.int64)
+        )
+        untouched = ~np.isin(plan.bucket_keys // last_size, overflow_bands)
+        untouched_counts = np.minimum(plan.bucket_counts[untouched], capacity)
+        merged_item_count = int(untouched_counts.sum(dtype=np.int64))
+        final_collision_buckets = 0
+        max_final_bucket_size = (
+            int(untouched_counts.max()) if untouched_counts.size else 0
+        )
+        if collect_grouping:
+            bucket_key_parts.append(plan.bucket_keys[untouched])
+            bucket_count_parts.append(untouched_counts)
+
+        for shard, result in zip(shards, shard_results):
+            if shard.overflow_start != covered_until:
+                raise ValueError("collision shards do not cover overflow contiguously.")
+            local_count = shard.overflow_end - shard.overflow_start
+            if result.resolved_last_codes.shape != (local_count,):
+                raise ValueError(
+                    f"rank {shard.rank} returned "
+                    f"{result.resolved_last_codes.shape} resolved codes for "
+                    f"{local_count} overflow rows."
+                )
+            if np.any(result.resolved_last_codes < 0) or np.any(
+                result.resolved_last_codes >= last_size
+            ):
+                raise ValueError(
+                    f"rank {shard.rank} returned a resolved code outside "
+                    f"[0, {last_size})."
+                )
+            if result.slot_indices.shape != (local_count,):
+                raise ValueError(
+                    f"rank {shard.rank} returned invalid slot index shape "
+                    f"{result.slot_indices.shape}."
+                )
+            if np.any(result.slot_indices < 1):
+                raise ValueError(
+                    f"rank {shard.rank} returned nonpositive slot indices."
+                )
+            rows = plan.overflow_rows[shard.overflow_start : shard.overflow_end]
+            if result.unresolved_rows.size and np.any(
+                ~np.isin(result.unresolved_rows, rows)
+            ):
+                raise ValueError(
+                    f"rank {shard.rank} returned an unresolved row it does not own."
+                )
+            if np.unique(result.unresolved_rows).size != result.unresolved_rows.size:
+                raise ValueError(
+                    f"rank {shard.rank} returned duplicate unresolved rows."
+                )
+            if result.final_bucket_keys.shape != result.final_bucket_counts.shape:
+                raise ValueError(
+                    f"rank {shard.rank} returned misaligned final bucket metadata."
+                )
+            if np.any(result.final_bucket_counts < 1):
+                raise ValueError("collision shard bucket counts must be positive.")
+            if (
+                np.unique(result.final_bucket_keys).size
+                != result.final_bucket_keys.size
+            ):
+                raise ValueError("collision shard bucket keys overlap.")
+            owned_bands = np.unique(
+                plan.overflow_bucket_key_prefixes[
+                    shard.overflow_start : shard.overflow_end
+                ]
+                // last_size
+            )
+            if result.final_bucket_keys.size and np.any(
+                ~np.isin(result.final_bucket_keys // last_size, owned_bands)
+            ):
+                raise ValueError(
+                    f"rank {shard.rank} returned a bucket it does not own."
+                )
+            resolved_last_codes[rows] = result.resolved_last_codes
+            slot_indices[rows] = result.slot_indices
+            next_unresolved_count = unresolved_count + result.unresolved_rows.size
+            unresolved_storage[unresolved_count:next_unresolved_count] = (
+                result.unresolved_rows
+            )
+            unresolved_count = next_unresolved_count
+            merged_item_count += int(result.final_bucket_counts.sum(dtype=np.int64))
+            final_collision_buckets += int(
+                (result.final_bucket_counts > capacity).sum()
+            )
+            if result.final_bucket_counts.size:
+                max_final_bucket_size = max(
+                    max_final_bucket_size,
+                    int(result.final_bucket_counts.max()),
+                )
+            if collect_grouping:
+                bucket_key_parts.append(result.final_bucket_keys)
+                bucket_count_parts.append(result.final_bucket_counts)
+            covered_until = shard.overflow_end
+        if covered_until != overflow_count:
+            raise ValueError(
+                f"collision shards cover {covered_until} of {overflow_count} "
+                "overflow rows."
+            )
+        if merged_item_count != plan.item_count:
+            raise ValueError(
+                "merged collision bucket counts do not match the input row count."
+            )
+        unresolved_storage.resize(unresolved_count, refcheck=False)
+        unresolved_rows = unresolved_storage
+        if collect_grouping:
+            all_keys = np.concatenate(bucket_key_parts)
+            all_counts = np.concatenate(bucket_count_parts)
+            order = np.argsort(all_keys, kind="stable")
+            all_keys = all_keys[order]
+            all_counts = all_counts[order]
+            if np.any(all_keys[1:] == all_keys[:-1]):
+                raise ValueError("collision shard bucket keys overlap.")
+        else:
+            all_keys = np.empty(0, dtype=np.int64)
+            all_counts = np.empty(0, dtype=np.int64)
+        stats = CollisionResolutionStats(
+            total_items=plan.item_count,
+            raw_collision_buckets=int((plan.bucket_counts > capacity).sum()),
+            final_collision_buckets=final_collision_buckets,
+            relocated_count=int(overflow_count - unresolved_count),
+            unresolved_count=int(unresolved_count),
+            max_final_bucket_size=max_final_bucket_size,
+        )
+        return CollisionResolutionResult(
+            resolved_last_codes=resolved_last_codes,
+            slot_indices=slot_indices,
+            unresolved_rows=unresolved_rows,
+            final_bucket_keys=all_keys,
+            final_bucket_counts=all_counts,
+            grouping_collected=collect_grouping,
+            stats=stats,
+        )
+
+    def _make_reader(self, selected_cols: List[str]) -> "BaseReader":
+        """Open a repository reader projecting ``selected_cols``."""
+        reader_type = self._config.reader_type
+        if self._config.input_path.startswith("odps://"):
+            reader_type = "OdpsReader"
+        elif self._config.input_path.endswith(".csv"):
+            reader_type = "CsvReader"
+        elif self._config.input_path.endswith(".parquet"):
+            reader_type = "ParquetReader"
+        if reader_type is None:
+            raise ValueError("reader_type is required for an unrecognized input path.")
+        with _rank_zero_io_environment():
+            importlib.import_module(_IO_MODULE_BY_CLASS[reader_type])
+            from tzrec.datasets.dataset import create_reader
+
+            return create_reader(
+                input_path=self._config.input_path,
+                batch_size=self._config.batch_size,
+                selected_cols=selected_cols,
+                reader_type=self._config.reader_type,
+                quota_name=self._config.odps_data_quota_name,
+            )
 
     def _progress_interval_reached(
         self, processed: int, last_progress_count: int
@@ -425,7 +747,33 @@ class CollisionResolutionRunner:
             )
         return flat[:, n_layers - 1 :: n_layers]
 
-    def _load_candidate_last_codes(self, overflow_item_ids: np.ndarray) -> np.ndarray:
+    def _prepare_candidate_last_codes(
+        self,
+        plan: CollisionPlan,
+    ) -> np.ndarray:
+        """Build candidate codes in memory."""
+        if self._config.strategy == "candidate":
+            return self._load_candidate_last_codes(plan.overflow_item_ids)
+
+        overflow_count = plan.overflow_rows.size
+        last_size = plan.config.layer_sizes[-1]
+        candidate_count = min(self._config.random_num_candidates, last_size - 1)
+        if candidate_count < 1:
+            raise ValueError("random candidates require last_size >= 2.")
+        candidates = np.empty((overflow_count, candidate_count), dtype=np.int64)
+        for start in range(0, overflow_count, _MAP_WRITE_ROWS):
+            end = min(start + _MAP_WRITE_ROWS, overflow_count)
+            candidates[start:end] = generate_random_candidate_last_codes(
+                plan.overflow_item_ids[start:end],
+                last_size,
+                self._config.random_num_candidates,
+            )
+        return candidates
+
+    def _load_candidate_last_codes(
+        self,
+        overflow_item_ids: np.ndarray,
+    ) -> np.ndarray:
         """Load fixed-width candidates aligned to ``overflow_item_ids``."""
         item_count = overflow_item_ids.shape[0]
         item_id_lookup = _ItemIdLookup(overflow_item_ids)
@@ -457,6 +805,11 @@ class CollisionResolutionRunner:
 
             selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
             batch_candidates = self._candidate_last_matrix(selected)
+            if np.unique(target_rows).size != target_rows.size:
+                _, reverse_indices = np.unique(target_rows[::-1], return_index=True)
+                keep = np.sort(target_rows.size - 1 - reverse_indices)
+                target_rows = target_rows[keep]
+                batch_candidates = batch_candidates[keep]
             if candidates is None:
                 candidates = np.empty(
                     (item_count, batch_candidates.shape[1]), dtype=np.int64
@@ -484,16 +837,25 @@ class CollisionResolutionRunner:
             )
         return candidates
 
-    def _make_writer(self, output_path: str) -> BaseWriter:
+    def _make_writer(self, output_path: str) -> "BaseWriter":
         """Create a repository writer for one independently resolved output."""
         if self._default_writer_type is None:
             raise RuntimeError("writer type is unavailable before reading input.")
-        return create_writer(
-            output_path,
-            writer_type=self._default_writer_type,
-            quota_name=self._config.odps_data_quota_name,
-            world_size=1,
+        writer_type = (
+            "OdpsWriter"
+            if output_path.startswith("odps://")
+            else self._default_writer_type
         )
+        with _rank_zero_io_environment():
+            importlib.import_module(_IO_MODULE_BY_CLASS[writer_type])
+            from tzrec.datasets.dataset import create_writer
+
+            return create_writer(
+                output_path,
+                writer_type=writer_type,
+                quota_name=self._config.odps_data_quota_name,
+                world_size=1,
+            )
 
     def _item_id_array(self, values: np.ndarray) -> pa.Array:
         """Encode item IDs with the input Arrow type preserved."""
@@ -573,7 +935,7 @@ class CollisionResolutionRunner:
         if output_path is None:
             raise RuntimeError("map output path was not validated.")
         with closing(self._make_writer(output_path)) as writer:
-            is_csv = isinstance(writer, CsvWriter)
+            is_csv = writer.__class__.__name__ == "CsvWriter"
             output_count = item_ids.shape[0]
             progress = ProgressLogger("Writing resolved item map", start_n=0)
             last_progress_count = 0
@@ -682,7 +1044,7 @@ class CollisionResolutionRunner:
 
         offsets = grouping.offsets
         with closing(self._make_writer(output_path)) as writer:
-            is_csv = isinstance(writer, CsvWriter)
+            is_csv = writer.__class__.__name__ == "CsvWriter"
             progress = ProgressLogger(progress_description, start_n=0)
             last_progress_count = 0
             max_codebook_rows = (
@@ -779,6 +1141,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=1_000_000,
         help="Number of processed samples between progress checks.",
     )
+    parser.add_argument(
+        "--distributed_timeout_seconds",
+        type=int,
+        default=86400,
+        help="Maximum wait for distributed preparation and worker results.",
+    )
     parser.add_argument("--item_id_field", default="item_id")
     parser.add_argument("--code_field", default="codes")
     parser.add_argument(
@@ -793,6 +1161,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["candidate", "random"],
         default="candidate",
         help="Use model candidates or deterministic legacy random draws.",
+    )
+    parser.add_argument(
+        "--placement_policy",
+        choices=["first_fit", "iterative"],
+        default="first_fit",
+        help=(
+            "Place candidates greedily or with deterministic SQL-inspired "
+            "multi-round arbitration."
+        ),
     )
     parser.add_argument(
         "--random_num_candidates",
