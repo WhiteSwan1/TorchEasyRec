@@ -87,6 +87,32 @@ class CollisionShardingTest(unittest.TestCase):
             ),
         )
 
+    def test_candidate_width_does_not_change_partition_boundaries(self) -> None:
+        overflow_prefixes = np.asarray(
+            [0, 0, 0, 4, 4, 12, 12, 12, 12, 20], dtype=np.int64
+        )
+        bucket_keys = np.asarray(
+            [0, 1, 4, 5, 8, 12, 13, 15, 16, 20, 21, 22, 24],
+            dtype=np.int64,
+        )
+
+        narrow = partition_collision_bands(
+            overflow_prefixes,
+            bucket_keys,
+            last_size=4,
+            world_size=3,
+            candidate_count=1,
+        )
+        wide = partition_collision_bands(
+            overflow_prefixes,
+            bucket_keys,
+            last_size=4,
+            world_size=3,
+            candidate_count=200,
+        )
+
+        self.assertEqual(narrow, wide)
+
     def test_empty_overflow_returns_empty_ranges(self) -> None:
         shards = partition_collision_bands(
             np.empty(0, dtype=np.int64),

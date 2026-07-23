@@ -11,28 +11,40 @@
 
 """Single-node distributed exchange for SID collision resolution.
 
-Every cross-rank exchange uses PyTorch object collectives on one Gloo process
-group: rank zero sends each worker its complete-band work with
-``send_object_list``, collects compact results with ``gather_object``, and
-shares the final statistics with ``broadcast_object_list``. Failure handling
-is delegated to the launcher: a rank that raises terminates the torchrun job.
+Rank zero sends small work metadata with object communication and transfers
+NumPy arrays as bounded-size Gloo tensors. Compact results and final statistics
+continue to use object collectives. Failure handling is delegated to the
+launcher: a rank that raises terminates the torchrun job.
 """
 
 import os
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple, cast
 
 import numpy as np
+import torch
 from torch import distributed as dist
 
 from tzrec.utils.sid.collision import (
     CollisionPlan,
+    CollisionResolutionConfig,
     CollisionResolutionStats,
     CollisionShardResult,
     CollisionWorkShard,
 )
 from tzrec.utils.sid.collision_sharding import CollisionBandShard
+
+_TENSOR_TRANSFER_CHUNK_BYTES = 128 * 1024 * 1024
+_WORK_ARRAY_NAMES = (
+    "overflow_rows",
+    "overflow_bucket_key_prefixes",
+    "overflow_origin_last_codes",
+    "bucket_keys",
+    "bucket_counts",
+    "candidate_codes",
+    "order_hashes",
+)
 
 
 @dataclass
@@ -89,6 +101,23 @@ class DistributedCollisionWork:
     work_shard: CollisionWorkShard
     candidate_codes: np.ndarray
     order_hashes: Optional[np.ndarray]
+
+
+@dataclass(frozen=True)
+class _ArrayMetadata:
+    """Shape and dtype needed to allocate one received array."""
+
+    shape: Tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class _CollisionWorkMetadata:
+    """Small non-array portion of one distributed collision work shard."""
+
+    band_shard: CollisionBandShard
+    config: CollisionResolutionConfig
+    arrays: Tuple[Optional[_ArrayMetadata], ...]
 
 
 def initialize_distributed_collision(
@@ -160,15 +189,17 @@ def build_collision_work(
 
     Bucket range descriptors span the first through last owned overflow band.
     Occupied buckets belonging to intervening non-overflow bands are removed.
-    Every array is copied, so rank zero can release the full plan-aligned
-    candidate and hash matrices once all work shards are built.
+    Candidate codes and hashes must already be aligned with the local shard.
+    Contiguous arrays with the target dtype are reused without copying, so rank
+    zero can release each shard immediately after it is transmitted.
 
     Args:
         plan: Global collision plan prepared by rank zero.
         band_shard: Complete-band ranges assigned to one rank.
-        candidate_codes: Integer candidate matrix aligned with every overflow
-            row in ``plan``.
-        order_hashes: Optional integer hashes aligned with every overflow row.
+        candidate_codes: Integer candidate matrix aligned with overflow rows
+            owned by ``band_shard``.
+        order_hashes: Optional integer hashes aligned with overflow rows owned
+            by ``band_shard``.
 
     Returns:
         Compact work ready for local resolution or transmission.
@@ -190,25 +221,29 @@ def build_collision_work(
     ):
         raise ValueError("band_shard has an invalid bucket range.")
 
+    local_overflow_count = band_shard.overflow_end - band_shard.overflow_start
     candidates = np.asarray(candidate_codes)
     if candidates.ndim != 2:
         raise ValueError(f"candidate_codes must be 2-D, got {candidates.shape}.")
-    if candidates.shape[0] != overflow_count:
+    if candidates.shape[0] != local_overflow_count:
         raise ValueError(
-            "candidate_codes must align with all overflow rows, got "
-            f"{candidates.shape[0]} candidates for {overflow_count} rows."
+            "candidate_codes must align with shard overflow rows, got "
+            f"{candidates.shape[0]} candidates for {local_overflow_count} rows."
         )
     if not np.issubdtype(candidates.dtype, np.integer):
         raise TypeError("candidate_codes must use an integer dtype.")
+    candidates = np.ascontiguousarray(candidates, dtype=np.int64)
     hashes = None
     if order_hashes is not None:
         hashes = np.asarray(order_hashes)
-        if hashes.shape != (overflow_count,):
+        if hashes.shape != (local_overflow_count,):
             raise ValueError(
-                f"order_hashes must have shape ({overflow_count},), got {hashes.shape}."
+                "order_hashes must align with shard overflow rows, got "
+                f"{hashes.shape} for {local_overflow_count} rows."
             )
         if not np.issubdtype(hashes.dtype, np.integer):
             raise TypeError("order_hashes must use an integer dtype.")
+        hashes = np.ascontiguousarray(hashes, dtype=np.uint64)
 
     overflow_slice = slice(band_shard.overflow_start, band_shard.overflow_end)
     prefixes = plan.overflow_bucket_key_prefixes[overflow_slice].astype(
@@ -242,27 +277,41 @@ def build_collision_work(
             bucket_counts=bucket_counts,
             config=plan.config,
         ),
-        candidate_codes=candidates[overflow_slice].astype(np.int64, copy=True),
-        order_hashes=(
-            None
-            if hashes is None
-            else hashes[overflow_slice].astype(np.uint64, copy=True)
-        ),
+        candidate_codes=candidates,
+        order_hashes=hashes,
     )
 
 
 def send_collision_work(work: DistributedCollisionWork, dst: int) -> None:
-    """Send one numeric work shard to another Gloo rank.
+    """Send one numeric work shard with bounded tensor transfers.
 
     Args:
         work: Complete-band work to transmit.
         dst: Destination process rank.
+
+    Raises:
+        TypeError: If an array does not use its required dtype.
+        ValueError: If work arrays violate the shard contract or are not
+            contiguous.
     """
-    dist.send_object_list([work], dst=dst)
+    arrays = _collision_work_arrays(work)
+    _validate_collision_work_arrays(work, arrays)
+    metadata = _CollisionWorkMetadata(
+        band_shard=work.band_shard,
+        config=work.work_shard.config,
+        arrays=tuple(
+            None if array is None else _ArrayMetadata(array.shape, array.dtype.str)
+            for array in arrays
+        ),
+    )
+    dist.send_object_list([metadata], dst=dst)
+    for array in arrays:
+        if array is not None:
+            _send_array(array, dst)
 
 
 def receive_collision_work(src: int) -> DistributedCollisionWork:
-    """Receive one numeric work shard from another Gloo rank.
+    """Receive one numeric work shard from bounded tensor transfers.
 
     Args:
         src: Source process rank.
@@ -271,14 +320,59 @@ def receive_collision_work(src: int) -> DistributedCollisionWork:
         Received complete-band collision work.
 
     Raises:
-        RuntimeError: If the received object is not collision work.
+        RuntimeError: If the received metadata is malformed.
+        TypeError: If received metadata specifies an unsupported dtype.
+        ValueError: If received array metadata or work shapes are invalid.
     """
     payload: List[Any] = [None]
     dist.recv_object_list(payload, src=src)
-    work = payload[0]
-    if not isinstance(work, DistributedCollisionWork):
-        raise RuntimeError(f"received {type(work).__name__} instead of collision work.")
+    metadata = payload[0]
+    if not isinstance(metadata, _CollisionWorkMetadata):
+        raise RuntimeError(
+            f"received {type(metadata).__name__} instead of collision work metadata."
+        )
+    if not isinstance(metadata.band_shard, CollisionBandShard) or not isinstance(
+        metadata.config, CollisionResolutionConfig
+    ):
+        raise RuntimeError("received invalid collision work metadata.")
+    if len(metadata.arrays) != len(_WORK_ARRAY_NAMES):
+        raise RuntimeError(
+            f"received metadata for {len(metadata.arrays)} arrays, expected "
+            f"{len(_WORK_ARRAY_NAMES)}."
+        )
+    arrays = tuple(
+        None if array_metadata is None else _receive_array(array_metadata, src)
+        for array_metadata in metadata.arrays
+    )
+    if any(array is None for array in arrays[:-1]):
+        raise RuntimeError("received missing required collision work array metadata.")
+    overflow_rows = cast(np.ndarray, arrays[0])
+    overflow_bucket_key_prefixes = cast(np.ndarray, arrays[1])
+    overflow_origin_last_codes = cast(np.ndarray, arrays[2])
+    bucket_keys = cast(np.ndarray, arrays[3])
+    bucket_counts = cast(np.ndarray, arrays[4])
+    candidate_codes = cast(np.ndarray, arrays[5])
+    order_hashes = arrays[6]
+    work = DistributedCollisionWork(
+        band_shard=metadata.band_shard,
+        work_shard=CollisionWorkShard(
+            overflow_rows=overflow_rows,
+            overflow_bucket_key_prefixes=overflow_bucket_key_prefixes,
+            overflow_origin_last_codes=overflow_origin_last_codes,
+            bucket_keys=bucket_keys,
+            bucket_counts=bucket_counts,
+            config=metadata.config,
+        ),
+        candidate_codes=candidate_codes,
+        order_hashes=order_hashes,
+    )
+    _validate_collision_work_arrays(work, arrays)
     return work
+
+
+def synchronize_collision_workers() -> None:
+    """Wait until every rank has received its collision work shard."""
+    dist.barrier()
 
 
 def gather_collision_shard_results(
@@ -351,6 +445,114 @@ def _positive_timeout(value: float) -> float:
             f"timeout_seconds must be a positive finite number, got {value}."
         )
     return float(value)
+
+
+def _collision_work_arrays(
+    work: DistributedCollisionWork,
+) -> Tuple[Optional[np.ndarray], ...]:
+    """Return transmitted arrays in their fixed wire-protocol order."""
+    return (
+        work.work_shard.overflow_rows,
+        work.work_shard.overflow_bucket_key_prefixes,
+        work.work_shard.overflow_origin_last_codes,
+        work.work_shard.bucket_keys,
+        work.work_shard.bucket_counts,
+        work.candidate_codes,
+        work.order_hashes,
+    )
+
+
+def _validate_collision_work_arrays(
+    work: DistributedCollisionWork,
+    arrays: Tuple[Optional[np.ndarray], ...],
+) -> None:
+    """Validate array shapes, dtypes, and storage before transmission."""
+    local_count = work.band_shard.overflow_end - work.band_shard.overflow_start
+    if local_count < 0:
+        raise ValueError("band_shard has an invalid overflow range.")
+    expected_shapes = (
+        (local_count,),
+        (local_count,),
+        (local_count,),
+        None,
+        None,
+        None,
+        (local_count,),
+    )
+    expected_dtypes = (
+        np.dtype(np.int64),
+        np.dtype(np.int64),
+        np.dtype(np.int64),
+        np.dtype(np.int64),
+        np.dtype(np.int64),
+        np.dtype(np.int64),
+        np.dtype(np.uint64),
+    )
+    for index, (name, array, shape, dtype) in enumerate(
+        zip(_WORK_ARRAY_NAMES, arrays, expected_shapes, expected_dtypes)
+    ):
+        if array is None:
+            if name != "order_hashes":
+                raise ValueError(f"{name} must not be None.")
+            continue
+        if not isinstance(array, np.ndarray):
+            raise TypeError(f"{name} must be a NumPy array.")
+        if array.dtype != dtype:
+            raise TypeError(f"{name} must use {dtype}, got {array.dtype}.")
+        if not array.dtype.isnative:
+            raise ValueError(f"{name} must use native byte order.")
+        if not array.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous.")
+        if shape is not None and array.shape != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {array.shape}.")
+        if index in (3, 4) and array.ndim != 1:
+            raise ValueError(f"{name} must be one-dimensional, got {array.shape}.")
+        if name == "candidate_codes" and (
+            array.ndim != 2 or array.shape[0] != local_count
+        ):
+            raise ValueError(
+                "candidate_codes must be 2-D and align with shard overflow rows, "
+                f"got {array.shape}."
+            )
+    bucket_keys = cast(np.ndarray, arrays[3])
+    bucket_counts = cast(np.ndarray, arrays[4])
+    if bucket_keys.shape != bucket_counts.shape:
+        raise ValueError("bucket_keys and bucket_counts must have the same shape.")
+
+
+def _send_array(array: np.ndarray, dst: int) -> None:
+    """Send one contiguous array in bounded-size tensor chunks."""
+    tensor = torch.from_numpy(array).reshape(-1)
+    elements_per_chunk = max(_TENSOR_TRANSFER_CHUNK_BYTES // tensor.element_size(), 1)
+    for start in range(0, tensor.numel(), elements_per_chunk):
+        dist.send(tensor[start : start + elements_per_chunk], dst=dst)
+
+
+def _receive_array(metadata: _ArrayMetadata, src: int) -> np.ndarray:
+    """Allocate and receive one array in bounded-size tensor chunks."""
+    if not isinstance(metadata, _ArrayMetadata):
+        raise RuntimeError(
+            f"received {type(metadata).__name__} instead of array metadata."
+        )
+    if not isinstance(metadata.shape, tuple) or any(
+        isinstance(size, bool) or not isinstance(size, int) or size < 0
+        for size in metadata.shape
+    ):
+        raise ValueError(f"received invalid array shape {metadata.shape!r}.")
+    try:
+        dtype = np.dtype(metadata.dtype)
+    except TypeError as error:
+        raise TypeError(f"received invalid array dtype {metadata.dtype!r}.") from error
+    if dtype not in (np.dtype(np.int64), np.dtype(np.uint64)):
+        raise TypeError(f"received unsupported array dtype {dtype}.")
+    if not dtype.isnative:
+        raise ValueError("received array dtype must use native byte order.")
+    array = np.empty(metadata.shape, dtype=dtype)
+    tensor = torch.from_numpy(array).reshape(-1)
+    elements_per_chunk = max(_TENSOR_TRANSFER_CHUNK_BYTES // tensor.element_size(), 1)
+    for start in range(0, tensor.numel(), elements_per_chunk):
+        dist.recv(tensor[start : start + elements_per_chunk], src=src)
+    return array
 
 
 def _environment_integer(name: str, default: int) -> int:

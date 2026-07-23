@@ -11,6 +11,7 @@
 
 import os
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 from unittest import mock
 
@@ -26,12 +27,14 @@ from tzrec.utils.sid.collision import (
 from tzrec.utils.sid.collision_sharding import CollisionBandShard
 from tzrec.utils.sid.distributed_collision import (
     DistributedCollisionContext,
+    DistributedCollisionWork,
     broadcast_collision_stats,
     build_collision_work,
     gather_collision_shard_results,
     initialize_distributed_collision,
     receive_collision_work,
     send_collision_work,
+    synchronize_collision_workers,
 )
 from tzrec.utils.test_util import parameterized_name_func
 
@@ -181,14 +184,14 @@ class DistributedCollisionTest(unittest.TestCase):
         first = build_collision_work(
             plan,
             CollisionBandShard(0, 0, 2, 0, 1),
-            _candidate_codes(),
-            order_hashes,
+            _candidate_codes()[:2].copy(),
+            order_hashes[:2].copy(),
         )
         second = build_collision_work(
             plan,
             CollisionBandShard(1, 2, 3, 2, 3),
-            _candidate_codes(),
-            order_hashes,
+            _candidate_codes()[2:].copy(),
+            order_hashes[2:].copy(),
         )
 
         np.testing.assert_array_equal(first.work_shard.overflow_rows, [1, 2])
@@ -201,7 +204,7 @@ class DistributedCollisionTest(unittest.TestCase):
         np.testing.assert_array_equal(second.candidate_codes, [[1, 3]])
         np.testing.assert_array_equal(second.order_hashes, order_hashes[2:])
 
-    def test_built_work_copies_plan_aligned_arrays(self) -> None:
+    def test_built_work_reuses_shard_aligned_candidates_and_hashes(self) -> None:
         plan = _collision_plan()
         candidates = _candidate_codes()
         order_hashes = np.asarray([11, 12, 13], dtype=np.uint64)
@@ -213,8 +216,8 @@ class DistributedCollisionTest(unittest.TestCase):
             order_hashes,
         )
 
-        self.assertFalse(np.shares_memory(work.candidate_codes, candidates))
-        self.assertFalse(np.shares_memory(work.order_hashes, order_hashes))
+        self.assertIs(work.candidate_codes, candidates)
+        self.assertIs(work.order_hashes, order_hashes)
         self.assertFalse(
             np.shares_memory(work.work_shard.overflow_rows, plan.overflow_rows)
         )
@@ -234,8 +237,8 @@ class DistributedCollisionTest(unittest.TestCase):
         work = build_collision_work(
             _collision_plan(),
             CollisionBandShard(2, 3, 3, 3, 3),
-            _candidate_codes(),
-            np.asarray([1, 2, 3], dtype=np.uint64),
+            np.empty((0, 2), dtype=np.int64),
+            np.empty(0, dtype=np.uint64),
         )
 
         self.assertEqual(work.candidate_codes.shape, (0, 2))
@@ -250,7 +253,7 @@ class DistributedCollisionTest(unittest.TestCase):
                 "misaligned_candidates",
                 {"candidate_codes": _candidate_codes()[:2]},
                 ValueError,
-                "candidate_codes must align",
+                "candidate_codes must align with shard",
             ),
             (
                 "float_candidates",
@@ -265,7 +268,7 @@ class DistributedCollisionTest(unittest.TestCase):
                     "order_hashes": np.asarray([1, 2], dtype=np.uint64),
                 },
                 ValueError,
-                "order_hashes must have shape",
+                "order_hashes must align with shard",
             ),
             (
                 "bad_overflow_range",
@@ -289,33 +292,122 @@ class DistributedCollisionTest(unittest.TestCase):
         with self.assertRaisesRegex(error_type, message):
             build_collision_work(_collision_plan(), **arguments)
 
-    def test_round_trips_work_through_object_collectives(self) -> None:
+    def test_round_trips_work_with_chunked_tensor_transfers(self) -> None:
         expected = build_collision_work(
             _collision_plan(),
             CollisionBandShard(1, 0, 3, 0, 3),
             _candidate_codes(),
             np.asarray([0, 2**63 + 7, 2**64 - 1], dtype=np.uint64),
         )
-        sent = []
+        sent_metadata = []
+        sent_tensors = []
 
-        def fake_recv(payload, src):
-            payload[0] = sent.pop(0)
+        def fake_recv_object(payload, src):
+            payload[0] = sent_metadata[0]
+
+        def fake_recv_tensor(tensor, src):
+            tensor.copy_(sent_tensors.pop(0))
 
         with (
             mock.patch(
                 "tzrec.utils.sid.distributed_collision.dist.send_object_list",
-                side_effect=lambda objects, dst: sent.append(objects[0]),
-            ) as send,
+                side_effect=lambda objects, dst: sent_metadata.append(objects[0]),
+            ) as send_object,
             mock.patch(
                 "tzrec.utils.sid.distributed_collision.dist.recv_object_list",
-                side_effect=fake_recv,
+                side_effect=fake_recv_object,
+            ),
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.send",
+                side_effect=lambda tensor, dst: sent_tensors.append(tensor.clone()),
+            ) as send_tensor,
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.recv",
+                side_effect=fake_recv_tensor,
+            ),
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision._TENSOR_TRANSFER_CHUNK_BYTES",
+                16,
             ),
         ):
             send_collision_work(expected, dst=1)
+            transmitted_tensors = list(sent_tensors)
             actual = receive_collision_work(src=0)
 
-        send.assert_called_once_with([expected], dst=1)
-        self.assertIs(actual, expected)
+        send_object.assert_called_once()
+        self.assertNotIsInstance(sent_metadata[0], DistributedCollisionWork)
+        self.assertGreater(send_tensor.call_count, 7)
+        self.assertTrue(
+            all(
+                tensor.numel() * tensor.element_size() <= 16
+                for tensor in transmitted_tensors
+            )
+        )
+        self.assertEqual(sent_tensors, [])
+        self.assertEqual(actual.band_shard, expected.band_shard)
+        self.assertEqual(actual.work_shard.config, expected.work_shard.config)
+        for expected_array, actual_array in zip(
+            (
+                *(
+                    getattr(expected.work_shard, name)
+                    for name in (
+                        "overflow_rows",
+                        "overflow_bucket_key_prefixes",
+                        "overflow_origin_last_codes",
+                        "bucket_keys",
+                        "bucket_counts",
+                    )
+                ),
+                expected.candidate_codes,
+                expected.order_hashes,
+            ),
+            (
+                *(
+                    getattr(actual.work_shard, name)
+                    for name in (
+                        "overflow_rows",
+                        "overflow_bucket_key_prefixes",
+                        "overflow_origin_last_codes",
+                        "bucket_keys",
+                        "bucket_counts",
+                    )
+                ),
+                actual.candidate_codes,
+                actual.order_hashes,
+            ),
+        ):
+            np.testing.assert_array_equal(actual_array, expected_array)
+            self.assertFalse(np.shares_memory(actual_array, expected_array))
+
+    @parameterized.expand(
+        [
+            (
+                "wrong_dtype",
+                lambda values: values.astype(np.int32),
+                TypeError,
+                "candidate_codes must use int64",
+            ),
+            (
+                "noncontiguous",
+                lambda values: values[:, ::-1],
+                ValueError,
+                "candidate_codes must be C-contiguous",
+            ),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_send_rejects_invalid_candidate_storage(
+        self, _, transform, error_type, message
+    ) -> None:
+        work = build_collision_work(
+            _collision_plan(),
+            CollisionBandShard(1, 0, 3, 0, 3),
+            _candidate_codes(),
+        )
+        work = replace(work, candidate_codes=transform(work.candidate_codes))
+
+        with self.assertRaisesRegex(error_type, message):
+            send_collision_work(work, dst=1)
 
     def test_receive_rejects_unexpected_object(self) -> None:
         with (
@@ -323,9 +415,53 @@ class DistributedCollisionTest(unittest.TestCase):
                 "tzrec.utils.sid.distributed_collision.dist.recv_object_list",
                 side_effect=lambda payload, src: payload.__setitem__(0, "junk"),
             ),
-            self.assertRaisesRegex(RuntimeError, "received str"),
+            self.assertRaisesRegex(RuntimeError, "received str.*metadata"),
         ):
             receive_collision_work(src=0)
+
+    def test_round_trips_empty_work_without_tensor_messages(self) -> None:
+        expected = build_collision_work(
+            _collision_plan(),
+            CollisionBandShard(2, 3, 3, 3, 3),
+            np.empty((0, 2), dtype=np.int64),
+            np.empty(0, dtype=np.uint64),
+        )
+        sent_metadata = []
+
+        with (
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.send_object_list",
+                side_effect=lambda objects, dst: sent_metadata.append(objects[0]),
+            ),
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.recv_object_list",
+                side_effect=lambda payload, src: payload.__setitem__(
+                    0, sent_metadata[0]
+                ),
+            ),
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.send"
+            ) as send_tensor,
+            mock.patch(
+                "tzrec.utils.sid.distributed_collision.dist.recv"
+            ) as receive_tensor,
+        ):
+            send_collision_work(expected, dst=1)
+            actual = receive_collision_work(src=0)
+
+        send_tensor.assert_not_called()
+        receive_tensor.assert_not_called()
+        self.assertEqual(actual.candidate_codes.shape, (0, 2))
+        self.assertEqual(actual.order_hashes.shape, (0,))
+        self.assertEqual(actual.order_hashes.dtype, np.dtype(np.uint64))
+
+    def test_synchronizes_collision_workers(self) -> None:
+        with mock.patch(
+            "tzrec.utils.sid.distributed_collision.dist.barrier"
+        ) as barrier:
+            synchronize_collision_workers()
+
+        barrier.assert_called_once_with()
 
     def test_gather_returns_rank_ordered_results_on_coordinator(self) -> None:
         local = _result()

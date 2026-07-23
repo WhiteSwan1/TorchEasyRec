@@ -16,6 +16,7 @@ import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
+from threading import Barrier
 from unittest import mock
 
 import numpy as np
@@ -977,6 +978,116 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[10, 11], [20, 21], [10, 11], [10, 11]],
         )
 
+    @parameterized.expand(
+        [("same_batch", 100000), ("across_batches", 1)],
+        name_func=parameterized_name_func,
+    )
+    def test_sharded_candidates_preserve_cross_rank_duplicate_matching(
+        self,
+        _case_name,
+        batch_size,
+    ) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        distinct_ids = np.asarray(["a", "b", "c", "d", "e"], dtype=object)
+        hash_order = np.argsort(stable_order_hash(distinct_ids))
+        ordered_ids = distinct_ids[hash_order]
+        duplicate = ordered_ids[-1]
+        item_ids = [
+            ordered_ids[0],
+            ordered_ids[1],
+            duplicate,
+            ordered_ids[2],
+            ordered_ids[3],
+            duplicate,
+        ]
+        _parquet(
+            inp,
+            item_ids,
+            [[0, 0]] * 3 + [[1, 0]] * 3,
+            [
+                [[0, 1], [0, 2]],
+                [[0, 1], [0, 2]],
+                [[0, 1], [0, 2]],
+                [[1, 1], [1, 2]],
+                [[1, 1], [1, 2]],
+                [[1, 3], [1, 4]],
+            ],
+            item_id_type=pa.string(),
+        )
+        runner = self._runner(
+            inp,
+            out,
+            batch_size=batch_size,
+            layer_sizes=(2, 8),
+            max_items_per_codebook=1,
+        )
+        loaded_item_ids, codes = runner._load_codes()
+        plan = prepare_collision_plan(
+            loaded_item_ids,
+            codes,
+            runner._config.resolution_config,
+        )
+        shards = partition_collision_bands(
+            plan.overflow_bucket_key_prefixes,
+            plan.bucket_keys,
+            plan.config.layer_sizes[-1],
+            world_size=2,
+        )
+
+        expected = runner._load_candidate_last_codes(plan.overflow_item_ids)
+        sharded = runner._load_candidate_shards(plan.overflow_item_ids, shards)
+        parts = [sharded.take(rank) for rank in range(len(shards))]
+        actual = np.concatenate(parts)
+
+        np.testing.assert_array_equal(actual, expected)
+        duplicate_rows = np.flatnonzero(plan.overflow_item_ids == duplicate)
+        self.assertEqual(duplicate_rows.size, 2)
+        self.assertLess(duplicate_rows[0], shards[0].overflow_end)
+        self.assertGreaterEqual(duplicate_rows[1], shards[1].overflow_start)
+        np.testing.assert_array_equal(actual[duplicate_rows], [[3, 4], [3, 4]])
+        self.assertFalse(np.shares_memory(parts[0], parts[1]))
+
+    @parameterized.expand(
+        [
+            ("integer", np.arange(6, dtype=np.int64)),
+            ("string", np.asarray(["a", "b", "c", "d", "e", "f"], dtype=object)),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_random_candidate_shards_match_single_matrix(
+        self, _case_name, item_ids
+    ) -> None:
+        runner = self._runner(
+            os.path.join(self.test_dir, "unused.parquet"),
+            os.path.join(self.test_dir, "out"),
+            strategy="random",
+            random_num_candidates=5,
+            layer_sizes=(3, 8),
+            max_items_per_codebook=1,
+        )
+        plan = prepare_collision_plan(
+            item_ids,
+            np.asarray([[0, 0]] * 3 + [[1, 0]] * 3),
+            runner._config.resolution_config,
+        )
+        shards = partition_collision_bands(
+            plan.overflow_bucket_key_prefixes,
+            plan.bucket_keys,
+            plan.config.layer_sizes[-1],
+            world_size=3,
+        )
+
+        expected = runner._prepare_candidate_last_codes(plan)
+        sharded = runner._prepare_candidate_shards(plan, shards)
+        parts = [sharded.take(rank) for rank in range(len(shards))]
+
+        np.testing.assert_array_equal(np.concatenate(parts), expected)
+        self.assertEqual(parts[-1].shape, (0, expected.shape[1]))
+        self.assertFalse(np.shares_memory(parts[0], parts[1]))
+        with self.assertRaisesRegex(RuntimeError, "already transferred"):
+            sharded.take(0)
+
     def test_random_tolerates_duplicate_item_ids(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
@@ -1035,19 +1146,40 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         np.testing.assert_array_equal(merged.final_bucket_keys, [0, 1, 4, 5, 11])
         np.testing.assert_array_equal(merged.final_bucket_counts, [2, 1, 2, 1, 1])
 
-    def test_distributed_run_matches_single_process(self) -> None:
+    @parameterized.expand(
+        [
+            ("random_first_fit", "random", "first_fit"),
+            ("random_iterative", "random", "iterative"),
+            ("candidate_first_fit", "candidate", "first_fit"),
+            ("candidate_iterative", "candidate", "iterative"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_distributed_run_matches_single_process(
+        self,
+        _case_name,
+        strategy,
+        placement_policy,
+    ) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         single_out = os.path.join(self.test_dir, "single")
         distributed_out = os.path.join(self.test_dir, "distributed")
         # Two overflow bands so both ranks receive real complete-band work.
+        candidates = (
+            [[[0, 1], [0, 2], [0, 3]]] * 3
+            + [[[1, 1], [1, 2], [1, 3]]] * 3
+            + [[[2, 0], [2, 1], [2, 2]]]
+        )
         _parquet(
             inp,
             list(range(7)),
             [[0, 0]] * 3 + [[1, 0]] * 3 + [[2, 3]],
+            candidates,
         )
         run_options = dict(
             max_items_per_codebook=1,
-            strategy="random",
+            strategy=strategy,
+            placement_policy=placement_policy,
             layer_sizes=(3, 4),
         )
         expected_stats = self._run(inp, single_out, **run_options)
@@ -1074,6 +1206,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 return stats
             return stats_queue.get(timeout=30)
 
+        transfer_barrier = Barrier(2)
+
+        def fake_synchronize():
+            transfer_barrier.wait(timeout=30)
+
         coordinator = self._runner(inp, distributed_out, **run_options)
         worker = self._runner(inp, distributed_out, **run_options)
         with (
@@ -1091,6 +1228,18 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             mock.patch.object(
                 resolve_sid_collisions, "broadcast_collision_stats", fake_broadcast
             ),
+            mock.patch.object(
+                resolve_sid_collisions,
+                "synchronize_collision_workers",
+                side_effect=fake_synchronize,
+            ) as synchronize,
+            mock.patch.object(
+                coordinator,
+                "_prepare_candidate_last_codes",
+                side_effect=AssertionError(
+                    "distributed execution built a full candidate matrix"
+                ),
+            ),
             ThreadPoolExecutor(max_workers=1) as pool,
         ):
             worker_future = pool.submit(
@@ -1104,6 +1253,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
         self.assertEqual(stats, expected_stats)
         self.assertEqual(worker_stats, expected_stats)
+        self.assertEqual(synchronize.call_count, 2)
         self.assertEqual(
             self._read_parquet(distributed_out), self._read_parquet(single_out)
         )
