@@ -20,12 +20,10 @@ import numpy as np
 
 from tzrec.utils.logging_util import ProgressLogger
 from tzrec.utils.sid.collision import (
-    CollisionPlan,
-    CollisionResolutionResult,
     CollisionResolver,
     CollisionShardResult,
     CollisionWorkShard,
-    stable_order_hash,
+    overflow_band_bucket_mask,
 )
 
 
@@ -98,94 +96,39 @@ class IterativeCollisionResolver(CollisionResolver):
     round.
     """
 
-    def resolve(
-        self,
-        plan: CollisionPlan,
-        candidate_codes: Optional[np.ndarray] = None,
-        collect_grouping: bool = True,
-    ) -> CollisionResolutionResult:
-        """Resolve every overflow band and return the shared result contract.
+    requires_order_hashes: bool = True
 
-        Args:
-            plan: Grouping and overflow plan from
-                :func:`tzrec.utils.sid.collision.prepare_collision_plan`.
-            candidate_codes: Integer last-layer candidate matrix aligned with
-                ``plan.overflow_rows``. Columns are one-based priorities by
-                position and duplicate values remain distinct edges.
-            collect_grouping: Whether to retain final bucket metadata.
-
-        Returns:
-            Resolved last codes, final dense slots, unresolved rows, and
-            diagnostics.
-
-        Raises:
-            TypeError: If candidate codes do not use an integer dtype.
-            ValueError: If candidates are missing, malformed, misaligned, or
-                contain out-of-range last-layer codes.
-        """
-        if candidate_codes is None:
-            if plan.overflow_rows.size:
-                raise ValueError(
-                    "candidate_codes are required when the collision plan has "
-                    "overflow rows."
-                )
-            candidate_codes = np.empty((0, 0), dtype=np.int64)
-
-        def resolve_shard(
-            shard: CollisionWorkShard, candidates: np.ndarray
-        ) -> CollisionShardResult:
-            result, _ = self._resolve_validated_shard(
-                shard,
-                candidates,
-                stable_order_hash(plan.overflow_item_ids),
-                log_progress=True,
-                collect_diagnostics=False,
-            )
-            return result
-
-        return self._resolve_plan(
-            plan, candidate_codes, collect_grouping, resolve_shard
-        )
-
-    def resolve_shard(
+    def _resolve_shard_impl(
         self,
         shard: CollisionWorkShard,
-        candidate_codes: np.ndarray,
-        overflow_order_hashes: np.ndarray,
+        candidates: np.ndarray,
+        order_hashes: Optional[np.ndarray],
     ) -> CollisionShardResult:
-        """Resolve a compact numeric shard made of complete bands.
-
-        This API is intended for process-local execution after an orchestrator
-        partitions a plan by complete band. Neither string item IDs nor
-        full-input arrays are required by the worker.
+        """Arbitrate one validated-candidate shard made of complete bands.
 
         Args:
-            shard: Numeric overflow and initial-occupancy inputs for one or more
-                complete bands.
-            candidate_codes: Two-dimensional candidate matrix aligned only
-                with ``shard.overflow_rows``.
-            overflow_order_hashes: Precomputed stable uint64 hashes aligned
-                with ``shard.overflow_rows``.
+            shard: Numeric overflow and initial-occupancy inputs for one or
+                more complete bands. Candidate columns are one-based
+                priorities by position and duplicate values remain distinct
+                edges.
+            candidates: Validated candidate matrix aligned with the shard.
+            order_hashes: Stable uint64 hashes aligned with
+                ``shard.overflow_rows``.
 
         Returns:
             Compact assignments and bucket metadata for the selected bands.
 
         Raises:
-            TypeError: If shard, candidate, or hash arrays have invalid dtypes.
-            ValueError: If shard arrays are malformed, bands are incomplete,
-                or candidates are misaligned or out of range.
+            TypeError: If shard or hash arrays have invalid dtypes.
+            ValueError: If hashes are missing or shard arrays are malformed.
         """
-        order_hashes = self._validate_work_shard(shard, overflow_order_hashes)
-        candidates = self._validate_candidate_last_codes(
-            candidate_codes,
-            shard.overflow_rows.shape[0],
-            shard.config.layer_sizes[-1],
-        )
+        if order_hashes is None:
+            raise ValueError("iterative collision work is missing stable order hashes.")
+        validated_hashes = self._validate_work_shard(shard, order_hashes)
         result, _ = self._resolve_validated_shard(
             shard,
             candidates,
-            order_hashes,
-            log_progress=True,
+            validated_hashes,
             collect_diagnostics=False,
         )
         return result
@@ -219,7 +162,7 @@ class IterativeCollisionResolver(CollisionResolver):
             shard.config.layer_sizes[-1],
         )
         result, diagnostics = self._resolve_validated_shard(
-            shard, candidates, order_hashes, log_progress=True
+            shard, candidates, order_hashes
         )
         if diagnostics is None:
             raise RuntimeError("iterative collision diagnostics were not collected.")
@@ -290,9 +233,9 @@ class IterativeCollisionResolver(CollisionResolver):
         if overflow_count == 0:
             return order_hashes
 
-        selected_bands = np.unique(prefixes // last_size)
-        bucket_bands = shard.bucket_keys // last_size
-        if np.any(~np.isin(bucket_bands, selected_bands)):
+        if not np.all(
+            overflow_band_bucket_mask(shard.bucket_keys, prefixes, last_size)
+        ):
             raise ValueError("bucket_keys contain a band outside the overflow shard.")
         origin_keys = prefixes + shard.overflow_origin_last_codes
         origin_positions = np.searchsorted(shard.bucket_keys, origin_keys)
@@ -310,7 +253,6 @@ class IterativeCollisionResolver(CollisionResolver):
         shard: CollisionWorkShard,
         candidates: np.ndarray,
         overflow_order_hashes: np.ndarray,
-        log_progress: bool = False,
         collect_diagnostics: bool = True,
     ) -> tuple[
         CollisionShardResult,
@@ -318,15 +260,7 @@ class IterativeCollisionResolver(CollisionResolver):
     ]:
         """Resolve validated candidates for a compact complete-band shard."""
         if shard.overflow_rows.size == 0:
-            result = CollisionShardResult(
-                resolved_last_codes=np.empty(0, dtype=np.int64),
-                slot_indices=np.empty(0, dtype=np.int64),
-                unresolved_rows=np.empty(0, dtype=np.int64),
-                final_bucket_keys=shard.bucket_keys.copy(),
-                final_bucket_counts=np.minimum(
-                    shard.bucket_counts, shard.config.capacity
-                ),
-            )
+            result = self._empty_shard_result(shard)
             diagnostics = (
                 IterativeCollisionDiagnostics(
                     assignment_rounds=np.empty(0, dtype=np.int64),
@@ -354,13 +288,12 @@ class IterativeCollisionResolver(CollisionResolver):
             np.empty(local_rows.size, dtype=np.int64) if collect_diagnostics else None
         )
         round_stats = []
-        progress = (
-            ProgressLogger("Resolving collision overflow", start_n=0)
-            if log_progress
-            else None
+        progress = ProgressLogger(
+            "Resolving collision overflow",
+            start_n=0,
+            miniters=self._progress_interval,
         )
         processed_count = 0
-        next_progress = self._progress_interval
         for band_start, band_stop in zip(band_starts, band_stops):
             band_start_int = int(band_start)
             band_stop_int = int(band_stop)
@@ -389,14 +322,7 @@ class IterativeCollisionResolver(CollisionResolver):
                 )
                 round_stats.extend(band_diagnostics.round_stats)
             processed_count += band_stop_int - band_start_int
-            if progress is not None and processed_count >= next_progress:
-                progress.log(
-                    processed_count,
-                    suffix=f"{processed_count} samples processed",
-                )
-                next_progress = (
-                    processed_count // self._progress_interval + 1
-                ) * self._progress_interval
+            progress.log(processed_count)
 
         unresolved_rows.resize(unresolved_count, refcheck=False)
         result = CollisionShardResult(
@@ -442,9 +368,6 @@ class IterativeCollisionResolver(CollisionResolver):
         item_count = overflow_rows.shape[0]
         item_positions = np.arange(item_count, dtype=np.int64)
         proposal_order = np.lexsort((overflow_rows, item_ties, origin_last_codes))
-        sorted_origins = origin_last_codes[proposal_order]
-        origin_starts = _run_starts(sorted_origins)
-        origin_stops = np.append(origin_starts[1:], item_count)
 
         assigned = np.zeros(item_count, dtype=bool)
         resolved = origin_last_codes.copy()
@@ -455,26 +378,33 @@ class IterativeCollisionResolver(CollisionResolver):
 
         while True:
             round_index += 1
-            active_items = int((~assigned).sum())
+            active = proposal_order[~assigned[proposal_order]]
+            active_items = int(active.size)
             active_edges = 0
             proposal_item_parts = []
             proposal_priority_parts = []
             proposal_target_parts = []
-            for origin_start, origin_stop in zip(origin_starts, origin_stops):
-                ordered_items = proposal_order[int(origin_start) : int(origin_stop)]
-                unassigned_items = ordered_items[~assigned[ordered_items]]
+            if active.size:
+                # Every (origin, priority) group proposes at most `capacity`
+                # valid edges: rank valid edges within each origin run.
+                run_starts = _run_starts(origin_last_codes[active])
+                run_lengths = np.diff(np.append(run_starts, active.size))
                 for priority in range(candidates.shape[1]):
-                    targets = candidates[unassigned_items, priority]
+                    targets = candidates[active, priority]
                     valid = occupancy[targets] < capacity
                     active_edges += int(valid.sum())
-                    proposed_items = unassigned_items[valid][:capacity]
-                    if proposed_items.size == 0:
-                        continue
-                    proposal_item_parts.append(proposed_items)
-                    proposal_priority_parts.append(
-                        np.full(proposed_items.size, priority, dtype=np.int64)
+                    valid_counts = np.cumsum(valid, dtype=np.int64)
+                    run_offsets = np.repeat(
+                        valid_counts[run_starts] - valid[run_starts], run_lengths
                     )
-                    proposal_target_parts.append(candidates[proposed_items, priority])
+                    keep = valid & (valid_counts - run_offsets <= capacity)
+                    if not np.any(keep):
+                        continue
+                    proposal_item_parts.append(active[keep])
+                    proposal_priority_parts.append(
+                        np.full(int(keep.sum()), priority, dtype=np.int64)
+                    )
+                    proposal_target_parts.append(targets[keep])
 
             if proposal_item_parts:
                 proposal_items = np.concatenate(proposal_item_parts)

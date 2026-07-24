@@ -381,10 +381,12 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         ) as progress_cls:
             IterativeCollisionResolver(progress_interval=3).resolve(plan, candidates)
 
-        progress_cls.assert_called_once_with("Resolving collision overflow", start_n=0)
+        progress_cls.assert_called_once_with(
+            "Resolving collision overflow", start_n=0, miniters=3
+        )
         self.assertEqual(
             progress_cls.return_value.log.call_args_list,
-            [mock.call(4, suffix="4 samples processed")],
+            [mock.call(2), mock.call(4)],
         )
 
     def test_empty_overflow_supports_full_and_worker_apis(self) -> None:

@@ -11,7 +11,6 @@
 
 import os
 import unittest
-from dataclasses import replace
 from datetime import timedelta
 from unittest import mock
 
@@ -51,6 +50,7 @@ def _collision_plan() -> CollisionPlan:
         overflow_item_ids=np.asarray(["one", "two", "five"]),
         overflow_bucket_key_prefixes=np.asarray([0, 0, 8], dtype=np.int64),
         overflow_origin_last_codes=np.asarray([0, 0, 0], dtype=np.int64),
+        overflow_order_hashes=np.asarray([11, 12, 13], dtype=np.uint64),
         config=CollisionResolutionConfig((3, 4), 1),
     )
 
@@ -81,11 +81,7 @@ def _stats() -> CollisionResolutionStats:
 
 
 def _context(world_size=1, rank=0) -> DistributedCollisionContext:
-    return DistributedCollisionContext(
-        world_size=world_size,
-        rank=rank,
-        local_world_size=world_size,
-    )
+    return DistributedCollisionContext(world_size=world_size, rank=rank)
 
 
 class DistributedCollisionTest(unittest.TestCase):
@@ -218,7 +214,7 @@ class DistributedCollisionTest(unittest.TestCase):
 
         self.assertIs(work.candidate_codes, candidates)
         self.assertIs(work.order_hashes, order_hashes)
-        self.assertFalse(
+        self.assertTrue(
             np.shares_memory(work.work_shard.overflow_rows, plan.overflow_rows)
         )
 
@@ -378,36 +374,6 @@ class DistributedCollisionTest(unittest.TestCase):
         ):
             np.testing.assert_array_equal(actual_array, expected_array)
             self.assertFalse(np.shares_memory(actual_array, expected_array))
-
-    @parameterized.expand(
-        [
-            (
-                "wrong_dtype",
-                lambda values: values.astype(np.int32),
-                TypeError,
-                "candidate_codes must use int64",
-            ),
-            (
-                "noncontiguous",
-                lambda values: values[:, ::-1],
-                ValueError,
-                "candidate_codes must be C-contiguous",
-            ),
-        ],
-        name_func=parameterized_name_func,
-    )
-    def test_send_rejects_invalid_candidate_storage(
-        self, _, transform, error_type, message
-    ) -> None:
-        work = build_collision_work(
-            _collision_plan(),
-            CollisionBandShard(1, 0, 3, 0, 3),
-            _candidate_codes(),
-        )
-        work = replace(work, candidate_codes=transform(work.candidate_codes))
-
-        with self.assertRaisesRegex(error_type, message):
-            send_collision_work(work, dst=1)
 
     def test_receive_rejects_unexpected_object(self) -> None:
         with (

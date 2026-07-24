@@ -90,12 +90,11 @@ def partition_collision_bands(
     bucket_keys: np.ndarray,
     last_size: int,
     world_size: int,
-    candidate_count: int = 1,
 ) -> Tuple[CollisionBandShard, ...]:
     """Partition sorted collision work without splitting a SID band.
 
     Overflow bands are assigned contiguously with a greedy balance based on
-    ``overflow_rows * candidate_count``. Bucket ranges include every occupied
+    each band's overflow row count. Bucket ranges include every occupied
     band from the first through the last overflow band assigned to a rank.
     Ranks beyond the number of overflow bands receive empty ranges.
 
@@ -106,7 +105,6 @@ def partition_collision_bands(
         bucket_keys: Sorted flattened keys for occupied SID buckets.
         last_size: Cardinality of the final SID layer.
         world_size: Number of worker ranks.
-        candidate_count: Estimated candidates examined per overflow row.
 
     Returns:
         One band-aligned range descriptor per rank.
@@ -118,7 +116,6 @@ def partition_collision_bands(
     """
     last_size = _positive_integer("last_size", last_size)
     world_size = _positive_integer("world_size", world_size)
-    candidate_count = _positive_integer("candidate_count", candidate_count)
     overflow_prefixes = _sorted_nonnegative_integer_array(
         "overflow_bucket_key_prefixes", overflow_bucket_key_prefixes
     )
@@ -144,7 +141,7 @@ def partition_collision_bands(
     if np.any(missing_band):
         raise ValueError("every overflow band must have at least one occupied bucket.")
 
-    band_costs = [int(count) * candidate_count for count in band_counts]
+    band_costs = [int(count) for count in band_counts]
     active_shards = min(world_size, len(band_costs))
     shards = []
     band_start = 0

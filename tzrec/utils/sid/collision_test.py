@@ -20,7 +20,6 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     CollisionWorkShard,
     KnnCollisionResolver,
-    RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
     generate_random_candidate_last_codes,
@@ -85,20 +84,23 @@ class CollisionTest(unittest.TestCase):
             [[0], [0], [0], [0], [0]],
         )
         candidates = np.asarray([[1], [2], [3], [4]], dtype=np.int64)
-        with mock.patch.object(collision, "ProgressLogger") as progress_cls:
+        with (
+            mock.patch.object(collision, "ProgressLogger") as progress_cls,
+            mock.patch.object(collision, "_ROW_CHUNK_SIZE", 3),
+        ):
             KnnCollisionResolver(progress_interval=3).resolve(plan, candidates)
 
-        progress_cls.assert_called_once_with("Resolving collision overflow", start_n=0)
+        progress_cls.assert_called_once_with(
+            "Resolving collision overflow", start_n=0, miniters=3
+        )
         self.assertEqual(
             progress_cls.return_value.log.call_args_list,
-            [mock.call(3, suffix="3 samples processed")],
+            [mock.call(3), mock.call(4)],
         )
 
     def test_resolvers_reject_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             KnnCollisionResolver(progress_interval=0)
-        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
-            RandomCollisionResolver(num_candidates=1, progress_interval=0)
 
     def test_golden_candidate_resolution(self) -> None:
         item_ids = np.arange(10, dtype=np.int64)
@@ -309,8 +311,9 @@ class CollisionTest(unittest.TestCase):
 
     def test_random_resolution_golden(self) -> None:
         plan = _plan((4,), 1, [0, 1, 2], [[0], [0], [3]])
+        candidates = generate_random_candidate_last_codes(plan.overflow_item_ids, 4, 3)
 
-        result = RandomCollisionResolver(num_candidates=3).resolve(plan)
+        result = KnnCollisionResolver().resolve(plan, candidates)
 
         np.testing.assert_array_equal(result.resolved_last_codes, [0, 2, 3])
         np.testing.assert_array_equal(result.slot_indices, [1, 1, 1])
@@ -321,32 +324,14 @@ class CollisionTest(unittest.TestCase):
         self.assertEqual(result.stats.final_collision_buckets, 0)
         self.assertEqual(result.stats.relocated_count, 1)
 
-    def test_random_rejects_external_candidates(self) -> None:
-        plan = _plan((2,), 1, [0], [[0]])
-
-        with self.assertRaisesRegex(ValueError, "does not accept candidate_codes"):
-            RandomCollisionResolver(num_candidates=1).resolve(
-                plan, np.empty((0, 1), dtype=np.int64)
-            )
-
-    def test_random_no_overflow_supports_single_code_space(self) -> None:
-        plan = _plan((1,), 1, [0], [[0]])
-
-        result = RandomCollisionResolver(num_candidates=1).resolve(
-            plan, collect_grouping=False
-        )
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0])
-        np.testing.assert_array_equal(result.final_bucket_keys, [])
-        self.assertFalse(result.grouping_collected)
-
     def test_random_candidate_exhaustion_keeps_original(self) -> None:
         plan = _plan((2,), 1, [0, 1], [[0], [0]])
 
         # The overflow item's single deterministic draw is its origin code.
-        resolver = RandomCollisionResolver(num_candidates=1)
-        grouped = resolver.resolve(plan)
-        rate_only = resolver.resolve(plan, collect_grouping=False)
+        candidates = generate_random_candidate_last_codes(plan.overflow_item_ids, 2, 1)
+        resolver = KnnCollisionResolver()
+        grouped = resolver.resolve(plan, candidates)
+        rate_only = resolver.resolve(plan, candidates, collect_grouping=False)
 
         np.testing.assert_array_equal(grouped.resolved_last_codes, [0, 0])
         np.testing.assert_array_equal(grouped.unresolved_rows, [1])
@@ -363,13 +348,13 @@ class CollisionTest(unittest.TestCase):
         self, _case_name, num_candidates
     ) -> None:
         with self.assertRaisesRegex(ValueError, "num_candidates must be >= 1"):
-            RandomCollisionResolver(num_candidates=num_candidates)
+            generate_random_candidate_last_codes(
+                np.asarray([0], dtype=np.int64), 4, num_candidates
+            )
 
     def test_random_rejects_single_code_space(self) -> None:
-        one_code_plan = _plan((1,), 1, [0, 1], [[0], [0]])
-
         with self.assertRaisesRegex(ValueError, "last_size >= 2"):
-            RandomCollisionResolver(num_candidates=1).resolve(one_code_plan)
+            generate_random_candidate_last_codes(np.asarray([0], dtype=np.int64), 1, 1)
 
     @parameterized.expand(
         [
