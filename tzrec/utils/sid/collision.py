@@ -619,16 +619,9 @@ class RandomCollisionResolver(CollisionResolver):
         Raises:
             ValueError: If ``last_size`` is smaller than two.
         """
-        if last_size < 2:
-            raise ValueError("random candidates require last_size >= 2.")
-        candidate_count = min(self._num_candidates, last_size - 1)
-        hashes = stable_order_hash(item_ids)
-        draw_indices = np.arange(candidate_count, dtype=np.uint64)
-        with np.errstate(over="ignore"):
-            mixed = _splitmix64(
-                hashes[:, None] + draw_indices[None, :] * np.uint64(_SPLITMIX_INCREMENT)
-            )
-        return (mixed % np.uint64(last_size)).astype(np.int64)
+        return generate_random_candidate_last_codes(
+            item_ids, last_size, self._num_candidates
+        )
 
     def resolve(
         self,
@@ -663,6 +656,37 @@ class RandomCollisionResolver(CollisionResolver):
         return self._resolve_first_fit(
             plan, candidate_codes, collect_grouping=collect_grouping
         )
+
+
+def generate_random_candidate_last_codes(
+    item_ids: np.ndarray, last_size: int, num_candidates: int
+) -> np.ndarray:
+    """Generate the random strategy's deterministic candidate matrix.
+
+    Args:
+        item_ids: One-dimensional IDs for overflow rows.
+        last_size: Cardinality of the final SID layer.
+        num_candidates: Positive number of raw random draws per row.
+
+    Returns:
+        An integer matrix aligned with ``item_ids``.
+
+    Raises:
+        ValueError: If ``last_size`` is smaller than two or
+            ``num_candidates`` is not positive.
+    """
+    if num_candidates < 1:
+        raise ValueError(f"num_candidates must be >= 1, got {num_candidates}.")
+    if last_size < 2:
+        raise ValueError("random candidates require last_size >= 2.")
+    candidate_count = min(num_candidates, last_size - 1)
+    hashes = stable_order_hash(item_ids)
+    draw_indices = np.arange(candidate_count, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        mixed = _splitmix64(
+            hashes[:, None] + draw_indices[None, :] * np.uint64(_SPLITMIX_INCREMENT)
+        )
+    return (mixed % np.uint64(last_size)).astype(np.int64)
 
 
 def _splitmix64(values: np.ndarray) -> np.ndarray:

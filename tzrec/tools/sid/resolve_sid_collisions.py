@@ -31,6 +31,11 @@ The random strategy intentionally preserves the legacy deterministic baseline:
 it draws with replacement from the full last-layer space. Placement skips an
 item's origin, so an origin draw or a duplicate draw is not replaced.
 
+Candidate sourcing and placement are independent. ``--strategy`` selects
+model-provided or deterministic random candidates; ``--placement_policy``
+selects greedy ``first_fit`` placement or synchronous ``iterative`` proposal
+and arbitration rounds. The default remains ``first_fit``.
+
 Both item_to_sid and sid_to_items carry an ``offset_codebook`` column
 alongside ``codebook``: the same SID with each layer shifted into one
 contiguous vocabulary, so layer ``i`` is offset by ``sum(codebook[:i])``. With
@@ -49,7 +54,7 @@ Example::
     python -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate \
+        --strategy candidate --placement_policy iterative \
         --output_path sid_collision \
         --generation v1
 
@@ -119,12 +124,14 @@ from tzrec.utils.sid.collision import (
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
+    generate_random_candidate_last_codes,
     lookup_sorted,
     prepare_collision_plan,
     sid_band_ids,
     sid_bucket_keys,
     sid_offset_codes,
 )
+from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 
 _ITEM_TO_SID_WRITE_ROWS = 1_000_000
 _SID_TO_ITEMS_WRITE_SIZE = 1_000_000
@@ -210,6 +217,7 @@ class ResolveSidCollisionsConfig:
     rate_only: bool
     odps_data_quota_name: str
     from_generation: Optional[str] = None
+    placement_policy: str = "first_fit"
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -224,6 +232,10 @@ class ResolveSidCollisionsConfig:
             )
         if self.strategy not in {"candidate", "random"}:
             raise ValueError(f"unsupported strategy: {self.strategy!r}.")
+        if self.placement_policy not in {"first_fit", "iterative"}:
+            raise ValueError(
+                f"unsupported placement_policy: {self.placement_policy!r}."
+            )
         if not self.rate_only and not self.generation:
             raise ValueError("generation is required unless rate_only is set.")
         if not self.output_path and (not self.rate_only or self.is_append):
@@ -303,6 +315,7 @@ class ResolveSidCollisionsConfig:
             layer_sizes=layer_sizes,
             max_items_per_codebook=args.max_items_per_codebook,
             strategy=args.strategy,
+            placement_policy=args.placement_policy,
             random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
@@ -336,7 +349,11 @@ class CollisionResolutionRunner:
     ) -> None:
         self._config = config
         self._resolver: CollisionResolver
-        if self._config.strategy == "random":
+        if self._config.placement_policy == "iterative":
+            self._resolver = IterativeCollisionResolver(
+                progress_interval=self._config.progress_interval
+            )
+        elif self._config.strategy == "random":
             self._resolver = RandomCollisionResolver(
                 self._config.random_num_candidates,
                 progress_interval=self._config.progress_interval,
@@ -368,10 +385,17 @@ class CollisionResolutionRunner:
         )
         collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
         candidate_last_codes = None
-        if self._config.strategy != "random" and plan.overflow_rows.size:
-            candidate_last_codes = self._load_candidate_last_codes(
-                plan.overflow_item_ids
-            )
+        if plan.overflow_rows.size:
+            if self._config.strategy == "candidate":
+                candidate_last_codes = self._load_candidate_last_codes(
+                    plan.overflow_item_ids
+                )
+            elif self._config.placement_policy == "iterative":
+                candidate_last_codes = generate_random_candidate_last_codes(
+                    plan.overflow_item_ids,
+                    plan.config.layer_sizes[-1],
+                    self._config.random_num_candidates,
+                )
         result = self._resolver.resolve(
             plan,
             candidate_last_codes,
@@ -1343,6 +1367,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["candidate", "random"],
         default="candidate",
         help="Use model candidates or deterministic legacy random draws.",
+    )
+    parser.add_argument(
+        "--placement_policy",
+        choices=["first_fit", "iterative"],
+        default="first_fit",
+        help=(
+            "Place sourced candidates greedily or with deterministic multi-round "
+            "arbitration."
+        ),
     )
     parser.add_argument(
         "--random_num_candidates",
