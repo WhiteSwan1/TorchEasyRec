@@ -116,7 +116,8 @@ class BaseDataset(IterableDataset, metaclass=_dataset_meta_cls):
         self._prompt_assembler = (
             PromptAssembler(
                 compiled_prompt.prompt_plan,
-                compiled_prompt.sid_space,
+                compiled_prompt.sid_spaces,
+                compiled_prompt.sentinel_token_id,
                 include_response=mode != Mode.PREDICT,
             )
             if compiled_prompt is not None

@@ -409,7 +409,10 @@ class ScriptWrapper(BaseModule):
         prompt = getattr(module, "compiled_prompt", None)
         self._prompt_assembler = (
             PromptAssembler(
-                prompt.prompt_plan, prompt.sid_space, include_response=False
+                prompt.prompt_plan,
+                prompt.sid_spaces,
+                prompt.sentinel_token_id,
+                include_response=False,
             )
             if prompt is not None
             else None

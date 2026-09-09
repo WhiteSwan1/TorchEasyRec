@@ -75,7 +75,11 @@ def _projected(name: str, dim: int) -> feature_pb2.FeatureConfig:
 def _batch(compiled_prompt, parsed, sparse=None) -> Batch:
     batch = Batch(sparse_features={BASE_DATA_GROUP: sparse} if sparse else {})
     batch.additional_infos.update(
-        PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(parsed)
+        PromptAssembler(
+            compiled_prompt.prompt_plan,
+            compiled_prompt.sid_spaces,
+            compiled_prompt.sentinel_token_id,
+        )(parsed)
     )
     return batch
 
@@ -105,7 +109,9 @@ class BaseGenRecModelTest(unittest.TestCase):
         self.model, self.compiled_prompt = create_genrec_test_model(self.test_dir)
 
     def test_tokens_to_local_codes_undoes_shifts_and_groups_beams(self) -> None:
-        space = self.compiled_prompt.sid_space
+        space = self.compiled_prompt.sid_spaces[
+            self.compiled_prompt.target_sid_space_index
+        ]
         local_codes = torch.tensor(
             [
                 [0, 1, 3],
@@ -202,7 +208,7 @@ class BaseGenRecModelTest(unittest.TestCase):
         )
 
     def test_init_from_pretrained_replaces_the_empty_weights(self) -> None:
-        base_vocab_size = self.compiled_prompt.sid_space.base_vocab_size
+        base_vocab_size = self.compiled_prompt.sid_spaces[0].base_vocab_size
         embeddings = self.model.lm.get_input_embeddings()
         before = embeddings.weight[:base_vocab_size].clone()
         self.model.init_from_pretrained()
@@ -218,8 +224,14 @@ class BaseGenRecModelTest(unittest.TestCase):
 
     def test_model_resizes_to_target_vocab_size(self) -> None:
         rows = self.model.lm.get_input_embeddings().weight.shape[0]
-        self.assertEqual(rows, self.compiled_prompt.sid_space.target_vocab_size)
-        self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
+        self.assertEqual(rows, self.compiled_prompt.target_vocab_size)
+        self.assertGreater(
+            rows, max(space.band_hi[-1] for space in self.compiled_prompt.sid_spaces)
+        )
+        self.assertEqual(
+            self.model._sid_base_vocabs.tolist(),
+            [space.base_vocab_size for space in self.compiled_prompt.sid_spaces],
+        )
 
     def test_loss_is_finite_and_backpropagates_into_the_backbone(self) -> None:
         batch = _batch(
@@ -271,7 +283,10 @@ class GenRecFrontEndTest(unittest.TestCase):
         out = self.wrapped(self.data)
         compiled = self.compiled_prompt
         walk = PromptAssembler(
-            compiled.prompt_plan, compiled.sid_space, include_response=False
+            compiled.prompt_plan,
+            compiled.sid_spaces,
+            compiled.sentinel_token_id,
+            include_response=False,
         )(self.data)
         for key in (INPUT_IDS, HOLE_POSITIONS):
             self.assertTrue(torch.equal(out[key], walk[key]), key)

@@ -12,7 +12,7 @@
 """Products of ``compile_prompt``.
 
 This namespace disambiguates ``plan.ResolvedSidSpace``, the resolved token space, from
-``prompt_pb2.SidSpace``, the four knobs a user declares. Nothing here stores a
+``prompt_pb2.SidSpace``, the knobs a user declares. Nothing here stores a
 physical dimension: the model resolves those at ``__init__``.
 """
 
@@ -73,29 +73,26 @@ class ResolvedSidSpace:
     which is what ``lm_head`` generates.
 
     Args:
+        name: underlying INLINE feature or label field bound to this space.
         codebook: per-level vocabulary sizes.
+        token_format: token string template for this namespace.
+        manifest_sha256: canonical digest of the manifest, if configured.
         num_levels: codes per item; also the answer width.
         base_vocab_size: tokenizer size before the SID tokens were appended.
         level_offsets: ``cumsum(codebook) - codebook``.
         band_lo: inclusive lower token-id bound of each level.
         band_hi: inclusive upper token-id bound of each level.
-        target_vocab_size: embedding rows after padding, what the LM resizes to.
-        sentinel_token_id: id reserved for projected positions, None when no
-            slot is projected.
-        eos_token_id: end-of-sequence id of the extended tokenizer.
-        pad_token_id: padding id of the extended tokenizer.
     """
 
+    name: str
     codebook: Tuple[int, ...]
+    token_format: str
+    manifest_sha256: Optional[str]
     num_levels: int
     base_vocab_size: int
     level_offsets: Tuple[int, ...]
     band_lo: Tuple[int, ...]
     band_hi: Tuple[int, ...]
-    target_vocab_size: int
-    sentinel_token_id: Optional[int]
-    eos_token_id: int
-    pad_token_id: int
 
 
 @dataclass(frozen=True)
@@ -121,6 +118,8 @@ class SlotSeg:
         output_key: "" for DEEP, ".sequence" otherwise.
         fill: INLINE writes token ids, PROJECTED writes sentinels and a hole.
         width: position count of this slot.
+        sid_space_index: index into ``CompiledPrompt.sid_spaces`` for INLINE,
+            None for PROJECTED.
     """
 
     slot_id: int
@@ -130,6 +129,7 @@ class SlotSeg:
     output_key: str
     fill: FillMode
     width: Width
+    sid_space_index: Optional[int] = None
 
 
 Segment = Union[Static, SlotSeg]
@@ -186,11 +186,24 @@ class CompiledPrompt:
     """Everything ``compile_prompt`` produces.
 
     Args:
-        sid_space: the resolved SID token space.
+        sid_spaces: resolved SID token spaces in declaration order.
+        target_sid_space_index: SID space used by the response label.
+        target_vocab_size: embedding rows after global vocabulary padding.
+        tokenizer_sha256: canonical digest of the fully extended tokenizer.
+        sentinel_token_id: id reserved for projected positions, None when no
+            slot is projected.
+        eos_token_id: end-of-sequence id of the extended tokenizer.
+        pad_token_id: padding id of the extended tokenizer.
         prompt_plan: assembler walk order and ceilings.
         projection_plan: projection topology.
     """
 
-    sid_space: ResolvedSidSpace
+    sid_spaces: Tuple[ResolvedSidSpace, ...]
+    target_sid_space_index: int
+    target_vocab_size: int
+    tokenizer_sha256: str
+    sentinel_token_id: Optional[int]
+    eos_token_id: int
+    pad_token_id: int
     prompt_plan: PromptPlan
     projection_plan: ProjectionPlan

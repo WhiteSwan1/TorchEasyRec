@@ -126,9 +126,9 @@ class HoleKeyBuilderTest(unittest.TestCase):
             }
         )
         keys = HoleKeyBuilder(_plan((a, Static((7,)), b)))(batch)
-        counts = PromptAssembler(_plan((a, Static((7,)), b)), _SID_SPACE)(batch)[
-            HOLE_SLOT_COUNTS
-        ]
+        counts = PromptAssembler(_plan((a, Static((7,)), b)), (_SID_SPACE,), _SENTINEL)(
+            batch
+        )[HOLE_SLOT_COUNTS]
         self.assertEqual(counts.tolist(), [3, 3])
         self.assertEqual(keys.numel(), 6)
         self.assertTrue(torch.equal(keys[:3], HoleKeyBuilder(_plan((a,)))(batch)))
@@ -282,17 +282,17 @@ class HoleKeyBuilderTest(unittest.TestCase):
 
 
 _SID_SPACE = ResolvedSidSpace(
+    name="sid",
     codebook=(4, 4, 4),
+    token_format="<|sid_{i}|>",
+    manifest_sha256=None,
     num_levels=3,
     base_vocab_size=1000,
     level_offsets=(0, 4, 8),
     band_lo=(1000, 1004, 1008),
     band_hi=(1003, 1007, 1011),
-    target_vocab_size=1152,
-    sentinel_token_id=1099,
-    eos_token_id=2,
-    pad_token_id=3,
 )
+_SENTINEL = 1099
 
 
 if __name__ == "__main__":

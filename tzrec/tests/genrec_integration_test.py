@@ -33,6 +33,7 @@ from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
 from tzrec.tests import utils
 from tzrec.utils import config_util
+from tzrec.utils.hf_export_util import build_sid_abi
 from tzrec.utils.test_util import (
     create_genrec_test_tokenizer,
     create_tiny_causal_lm,
@@ -84,7 +85,8 @@ class GenRecIntegrationTest(unittest.TestCase):
         config.eval_input_path = self.data_glob
         config.model_config.genrec_causal_lm_model.hf_model_name_or_path = backbone
         config.prompt_config.tokenizer_path = tokenizer
-        config.prompt_config.sid_space.manifest_path = manifest
+        for sid_space in config.prompt_config.sid_space:
+            sid_space.manifest_path = manifest
         text_format.Merge(_BEH, config.feature_configs.add())
         config.prompt_config.prompt = "History : {{hist}} . {{beh}} Predict :"
         config_path = os.path.join(self.test_dir, "genrec.config")
@@ -146,7 +148,10 @@ class GenRecIntegrationTest(unittest.TestCase):
         out = front_end(data)
         with_device = front_end(data, torch.device("cpu"))
         walk = PromptAssembler(
-            compiled.prompt_plan, compiled.sid_space, include_response=False
+            compiled.prompt_plan,
+            compiled.sid_spaces,
+            compiled.sentinel_token_id,
+            include_response=False,
         )(data)
         for key in (INPUT_IDS, CU_SEQLENS, HOLE_POSITIONS, HOLE_SLOT_COUNTS):
             self.assertTrue(torch.equal(out[key], walk[key]), key)
@@ -157,11 +162,7 @@ class GenRecIntegrationTest(unittest.TestCase):
         positions = out[HOLE_POSITIONS]
         self.assertGreater(positions.numel(), 0)
         self.assertTrue(
-            bool(
-                torch.all(
-                    out[INPUT_IDS][positions] == compiled.sid_space.sentinel_token_id
-                )
-            )
+            bool(torch.all(out[INPUT_IDS][positions] == compiled.sentinel_token_id))
         )
         self.assertEqual(tuple(out["slot_embeds"].shape), (int(positions.numel()), 32))
         self.assertEqual(out["slot_embeds"].dtype, torch.float32)
@@ -175,24 +176,40 @@ class GenRecIntegrationTest(unittest.TestCase):
             hf_config["text_config"]["architectures"], ["Qwen2ForCausalLM"]
         )
         self.assertEqual(hf_config["text_config"]["model_type"], "qwen2")
-        self.assertEqual(hf_config["vocab_size"], compiled.sid_space.target_vocab_size)
-        self.assertEqual(hf_config["eos_token_id"], compiled.sid_space.eos_token_id)
-        self.assertEqual(hf_config["pad_token_id"], compiled.sid_space.pad_token_id)
-        self.assertNotIn("sid_space", hf_config)
+        self.assertEqual(hf_config["vocab_size"], compiled.target_vocab_size)
+        self.assertEqual(hf_config["target_vocab_size"], compiled.target_vocab_size)
+        self.assertEqual(hf_config["eos_token_id"], compiled.eos_token_id)
+        self.assertEqual(hf_config["pad_token_id"], compiled.pad_token_id)
+        self.assertEqual(hf_config["sentinel_token_id"], compiled.sentinel_token_id)
+        self.assertEqual(
+            [space["name"] for space in hf_config["sid_spaces"]],
+            [space.name for space in compiled.sid_spaces],
+        )
+        self.assertEqual(
+            hf_config["target_sid_space_index"], compiled.target_sid_space_index
+        )
+        self.assertEqual(hf_config["sid_abi"], build_sid_abi(compiled))
         from transformers import AutoTokenizer
 
-        # the index builder derives the token base from the first SID token
+        # each declared SID namespace remains independently addressable
         tokenizer = AutoTokenizer.from_pretrained(export_dir)
         self.assertEqual(
-            tokenizer.convert_tokens_to_ids("<|sid_0|>"),
-            compiled.sid_space.base_vocab_size,
+            tokenizer.convert_tokens_to_ids("<|hist_sid_0|>"),
+            compiled.sid_spaces[0].base_vocab_size,
         )
-        self.assertEqual(tokenizer.decode([compiled.sid_space.band_lo[0]]), "<|sid_0|>")
+        target_space = compiled.sid_spaces[compiled.target_sid_space_index]
         self.assertEqual(
-            tokenizer.convert_ids_to_tokens(compiled.sid_space.sentinel_token_id),
+            tokenizer.convert_tokens_to_ids("<|answer_sid_0|>"),
+            target_space.base_vocab_size,
+        )
+        self.assertEqual(
+            tokenizer.decode([target_space.band_lo[0]]), "<|answer_sid_0|>"
+        )
+        self.assertEqual(
+            tokenizer.convert_ids_to_tokens(compiled.sentinel_token_id),
             "<|pg_hole|>",
         )
-        self.assertEqual(tokenizer.eos_token_id, compiled.sid_space.eos_token_id)
+        self.assertEqual(tokenizer.eos_token_id, compiled.eos_token_id)
 
     @unittest.skipIf(*gpu_unavailable)
     @mark_ci_scope("gpu")

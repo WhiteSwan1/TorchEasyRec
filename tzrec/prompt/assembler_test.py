@@ -34,30 +34,30 @@ from tzrec.prompt.types import (
 )
 from tzrec.protos.model_pb2 import FeatureGroupType
 
+_CODEBOOK = (4, 4, 4)
+_NUM_LEVELS = len(_CODEBOOK)
 _BASE_VOCAB_SIZE = 1000
+_RESOLVED_BASE_VOCAB_SIZE = _BASE_VOCAB_SIZE + sum(_CODEBOOK)
 _SENTINEL = 1099
 
 
-_CODEBOOK = (4, 4, 4)
-_NUM_LEVELS = len(_CODEBOOK)
-
-
-def _sid_space(codebook=_CODEBOOK) -> ResolvedSidSpace:
+def _sid_space(
+    codebook=_CODEBOOK, name="hist", base_vocab_size=_BASE_VOCAB_SIZE
+) -> ResolvedSidSpace:
     offsets, running = [], 0
     for size in codebook:
         offsets.append(running)
         running += size
     return ResolvedSidSpace(
+        name=name,
         codebook=tuple(codebook),
+        token_format=f"<|{name}_sid_{{i}}|>",
+        manifest_sha256=None,
         num_levels=len(codebook),
-        base_vocab_size=_BASE_VOCAB_SIZE,
+        base_vocab_size=base_vocab_size,
         level_offsets=tuple(offsets),
-        band_lo=tuple(_BASE_VOCAB_SIZE + o for o in offsets),
-        band_hi=tuple(_BASE_VOCAB_SIZE + o + s - 1 for o, s in zip(offsets, codebook)),
-        target_vocab_size=1152,
-        sentinel_token_id=_SENTINEL,
-        eos_token_id=2,
-        pad_token_id=3,
+        band_lo=tuple(base_vocab_size + o for o in offsets),
+        band_hi=tuple(base_vocab_size + o + s - 1 for o, s in zip(offsets, codebook)),
     )
 
 
@@ -68,6 +68,7 @@ def _slot(
     feature_names=None,
     group_type=FeatureGroupType.JAGGED_SEQUENCE,
     slot_id=0,
+    sid_space_index=0,
 ) -> SlotSeg:
     return SlotSeg(
         slot_id=slot_id,
@@ -81,6 +82,7 @@ def _slot(
         width=Width(WidthKind.BOUNDED, width_n)
         if width_n
         else Width(WidthKind.STATIC, _NUM_LEVELS),
+        sid_space_index=sid_space_index if fill is FillMode.INLINE else None,
     )
 
 
@@ -102,11 +104,12 @@ def _plan(segments, response=()) -> PromptPlan:
     )
 
 
-def _asm(segments, response=(), sid_space=None) -> PromptAssembler:
+def _asm(segments, response=(), sid_spaces=None) -> PromptAssembler:
     """An assembler over one ad-hoc plan."""
     return PromptAssembler(
         _plan(segments, response=response),
-        _sid_space() if sid_space is None else sid_space,
+        (_sid_space(),) if sid_spaces is None else sid_spaces,
+        _SENTINEL,
     )
 
 
@@ -178,7 +181,7 @@ class PromptAssemblerTest(unittest.TestCase):
                 _slot("a", FillMode.PROJECTED, 2),
             )
         )
-        asm = PromptAssembler(plan, _sid_space())
+        asm = PromptAssembler(plan, (_sid_space(),), _SENTINEL)
         out = asm(
             _parsed(projected={"a": [1, 2], "b": [2, 1]})
             | {"a.values": torch.tensor([1, 2, 3]), "b.values": torch.tensor([4, 5, 6])}
@@ -191,29 +194,36 @@ class PromptAssemblerTest(unittest.TestCase):
     def test_response_is_optional_and_its_length_is_recorded(self) -> None:
         plan = _plan(
             (Static((7,)), _slot("hist", FillMode.INLINE)),
-            response=(Static((9,)), _slot("answer", FillMode.INLINE)),
+            response=(
+                Static((9,)),
+                _slot("answer", FillMode.INLINE, sid_space_index=1),
+            ),
         )
         parsed = _parsed(
-            {"hist": [np.array([1, 6, 11])], "answer": [np.array([0, 4, 8])]}
+            {"hist": [np.array([1, 5, 9])], "answer": [np.array([1, 5, 8])]}
         )
-        out = PromptAssembler(plan, _sid_space())(parsed)
+        spaces = (
+            _sid_space(),
+            _sid_space(name="answer", base_vocab_size=_RESOLVED_BASE_VOCAB_SIZE),
+        )
+        out = PromptAssembler(plan, spaces, _SENTINEL)(parsed)
 
         self.assertEqual(
             out[INPUT_IDS].tolist(),
             [
                 7,
                 _BASE_VOCAB_SIZE + 1,
-                _BASE_VOCAB_SIZE + 6,
-                _BASE_VOCAB_SIZE + 11,
+                _BASE_VOCAB_SIZE + 5,
+                _BASE_VOCAB_SIZE + 9,
                 9,
-                _BASE_VOCAB_SIZE,
-                _BASE_VOCAB_SIZE + 4,
-                _BASE_VOCAB_SIZE + 8,
+                _RESOLVED_BASE_VOCAB_SIZE + 1,
+                _RESOLVED_BASE_VOCAB_SIZE + 5,
+                _RESOLVED_BASE_VOCAB_SIZE + 8,
             ],
         )
         self.assertEqual(out[RESPONSE_LENGTHS].tolist(), [4])
 
-        prompt_only = PromptAssembler(plan, _sid_space(), include_response=False)(
+        prompt_only = PromptAssembler(plan, spaces, _SENTINEL, include_response=False)(
             _parsed({"hist": [np.array([1, 6, 11])]})
         )
         self.assertEqual(
@@ -251,6 +261,110 @@ class PromptAssemblerTest(unittest.TestCase):
         self.assertEqual(out[INPUT_IDS].tolist()[0], _BASE_VOCAB_SIZE + 1)
         self.assertEqual(int(out[MAX_SEQLEN]), 3)
 
+    def test_body_sid_row_length_must_be_a_multiple_of_levels(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"field \[hist\].*sid_space \[hist\].*divisible by 3.*row 1 has 2",
+        ):
+            asm(_parsed({"hist": [np.array([1, 6, 11]), np.array([0, 4])]}))
+
+    def test_label_sid_row_length_must_equal_levels(self) -> None:
+        spaces = (
+            _sid_space(),
+            _sid_space(name="answer", base_vocab_size=_RESOLVED_BASE_VOCAB_SIZE),
+        )
+        asm = _asm(
+            (_slot("hist", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE, sid_space_index=1),),
+            sid_spaces=spaces,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"label field \[answer\].*sid_space \[answer\].*exactly 3.*row 1 has 4",
+        ):
+            asm(
+                _parsed(
+                    {
+                        "hist": [np.array([1, 6, 11]), np.array([0, 4, 8])],
+                        "answer": [np.array([1, 5, 8]), np.array([0, 4, 8, 9])],
+                    }
+                )
+            )
+
+    def test_sid_flat_code_must_fall_in_its_positional_level_band(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"field \[hist\].*sid_space \[hist\].*flat code 3.*row 0, level 1"
+            r".*expected \[4, 8\)",
+        ):
+            asm(_parsed({"hist": [np.array([1, 3, 11])]}))
+
+    def test_sid_flat_code_rejects_negative_and_oov_values(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+
+        for invalid, expected_range in ((-1, r"\[0, 4\)"), (12, r"\[8, 12\)")):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    rf"flat code {invalid}.*expected {expected_range}",
+                ):
+                    values = [invalid, 6, 11] if invalid < 0 else [1, 6, invalid]
+                    asm(_parsed({"hist": [np.array(values)]}))
+
+    def test_multi_value_sid_item_must_have_every_level(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+        batch = {
+            "hist.values": torch.tensor([1, 6, 1, 6, 11, 2]),
+            "hist.lengths": torch.tensor([2]),
+            "hist.key_lengths": torch.tensor([2, 4]),
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"field \[hist\].*sid_space \[hist\].*exactly 3.*item 0 has 2",
+        ):
+            asm(batch)
+
+    def test_sid_lengths_and_values_must_describe_the_same_flat_stream(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+        batch = {
+            "hist.values": torch.tensor([1, 6]),
+            "hist.lengths": torch.tensor([3]),
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"field \[hist\].*sid_space \[hist\].*carries 2.*declare 3",
+        ):
+            asm(batch)
+
+    def test_sid_lengths_must_not_be_silently_truncated(self) -> None:
+        asm = _asm((_slot("hist", FillMode.INLINE),))
+        batch = {
+            "hist.values": torch.tensor([1, 6, 11]),
+            "hist.lengths": torch.tensor([3.5]),
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"field \[hist\].*sid_space \[hist\].*row lengths must contain integers",
+        ):
+            asm(batch)
+
+    def test_scripted_assembler_rejects_sid_outside_its_level_band(self) -> None:
+        asm = torch.jit.script(_asm((_slot("hist", FillMode.INLINE),)))
+
+        with self.assertRaisesRegex(
+            torch.jit.Error,
+            r"field \[hist\].*sid_space \[hist\].*expected \[4, 8\)",
+        ):
+            asm(_parsed({"hist": [np.array([1, 3, 11])]}))
+
     def test_the_first_slot_member_sizes_the_batch(self) -> None:
         """A dense anchor counts rows; a jagged anchor counts lengths."""
         dense = _asm(
@@ -278,7 +392,7 @@ class PromptAssemblerTest(unittest.TestCase):
                 ),
             )
         )
-        asm = PromptAssembler(plan, _sid_space())
+        asm = PromptAssembler(plan, (_sid_space(),), _SENTINEL)
         out = asm(
             {
                 "dense.values": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
@@ -293,7 +407,7 @@ class PromptAssemblerTest(unittest.TestCase):
 
     def test_output_keys_match_the_module_constants(self) -> None:
         """``forward`` writes literals; they must equal the exported names."""
-        module = PromptAssembler(_plan((Static((7,)),)), _sid_space())
+        module = PromptAssembler(_plan((Static((7,)),)), (_sid_space(),), _SENTINEL)
         out = module({"batch_size": torch.tensor(2)})
         self.assertEqual(
             set(out.keys()),
@@ -316,9 +430,16 @@ class PromptAssemblerTest(unittest.TestCase):
                 _slot("hist", FillMode.INLINE),
                 _slot("beh", FillMode.PROJECTED, 4),
             ),
-            response=(_slot("answer", FillMode.INLINE),),
+            response=(_slot("answer", FillMode.INLINE, sid_space_index=1),),
         )
-        module = PromptAssembler(plan, _sid_space())
+        module = PromptAssembler(
+            plan,
+            (
+                _sid_space(),
+                _sid_space(name="answer", base_vocab_size=_RESOLVED_BASE_VOCAB_SIZE),
+            ),
+            _SENTINEL,
+        )
         batch = {
             "hist.values": torch.tensor([1, 6, 11, 2, 7, 10]),
             "hist.lengths": torch.tensor([1, 1]),

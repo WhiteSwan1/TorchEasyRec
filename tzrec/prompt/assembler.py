@@ -19,7 +19,7 @@ The walk is prompt structure only; ``hole_keys.py`` folds the prefix-cache
 identity of each hole beside it.
 """
 
-from typing import Dict, Final, List, Tuple
+from typing import Dict, Final, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -94,12 +94,13 @@ class PromptAssembler(nn.Module):
     """Walks a compiled plan to build one batch's packed token stream.
 
     The collator calls it eagerly on the host; export scripts the same module
-    into the serving front-end. It trusts the parsed batch as every scripted
-    module does: the data contract belongs to the parser and to the request.
+    into the serving front-end. SID values are validated against the compiled
+    field-to-space contract before their vocabulary shift is applied.
 
     Args:
         prompt_plan: the compiled walk order and its constants.
-        sid_space: the resolved SID token space.
+        sid_spaces: the resolved SID token spaces, in declaration order.
+        sentinel_token_id: id reserved for projected positions, if any.
         include_response: whether to read and emit the supervised tail.
     """
 
@@ -114,11 +115,18 @@ class PromptAssembler(nn.Module):
     hole_slots: List[int]
     is_sequences: List[bool]
     member_names: List[List[str]]
+    sid_base_vocabs: List[int]
+    sid_codebooks: List[List[int]]
+    sid_level_offsets: List[List[int]]
+    sid_num_levels: List[int]
+    sid_space_names: List[str]
+    sid_space_indices: List[int]
 
     def __init__(
         self,
         prompt_plan: PromptPlan,
-        sid_space: ResolvedSidSpace,
+        sid_spaces: Tuple[ResolvedSidSpace, ...],
+        sentinel_token_id: Optional[int],
         include_response: bool = True,
     ) -> None:
         super().__init__()
@@ -130,15 +138,20 @@ class PromptAssembler(nn.Module):
         # compile reserves a sentinel whenever a slot is PROJECTED, so -1 is
         # never written
         self.sentinel = -1
-        if sid_space.sentinel_token_id is not None:
-            self.sentinel = int(sid_space.sentinel_token_id)
-        self.id_shift = int(sid_space.base_vocab_size)
+        if sentinel_token_id is not None:
+            self.sentinel = int(sentinel_token_id)
+        self.sid_base_vocabs = [int(space.base_vocab_size) for space in sid_spaces]
+        self.sid_codebooks = [list(space.codebook) for space in sid_spaces]
+        self.sid_level_offsets = [list(space.level_offsets) for space in sid_spaces]
+        self.sid_num_levels = [int(space.num_levels) for space in sid_spaces]
+        self.sid_space_names = [space.name for space in sid_spaces]
 
         self.kinds = []
         self.static_tokens = []
         self.hole_slots = []
         self.is_sequences = []
         self.member_names = []
+        self.sid_space_indices = []
         # the first slot member sizes the batch; an all-static plan reads the
         # batch_size the parser passes along
         self.anchor = ""
@@ -149,7 +162,12 @@ class PromptAssembler(nn.Module):
         for seg in segments:
             if isinstance(seg, Static):
                 self._append(
-                    self.KIND_STATIC, [int(t) for t in seg.token_ids], -1, False, []
+                    self.KIND_STATIC,
+                    [int(t) for t in seg.token_ids],
+                    -1,
+                    False,
+                    [],
+                    -1,
                 )
                 continue
             assert isinstance(seg, SlotSeg)
@@ -157,8 +175,14 @@ class PromptAssembler(nn.Module):
                 self.anchor = seg.feature_names[0]
             is_sequence = seg.group_type == FeatureGroupType.JAGGED_SEQUENCE
             if seg.fill is FillMode.INLINE:
+                assert seg.sid_space_index is not None
                 self._append(
-                    self.KIND_INLINE, [], -1, is_sequence, [seg.feature_names[0]]
+                    self.KIND_INLINE,
+                    [],
+                    -1,
+                    is_sequence,
+                    [seg.feature_names[0]],
+                    int(seg.sid_space_index),
                 )
             else:
                 self._append(
@@ -167,6 +191,7 @@ class PromptAssembler(nn.Module):
                     occurrences,
                     is_sequence,
                     list(seg.feature_names),
+                    -1,
                 )
                 occurrences += 1
 
@@ -180,6 +205,7 @@ class PromptAssembler(nn.Module):
         hole_slot: int,
         is_sequence: bool,
         members: List[str],
+        sid_space_index: int,
     ) -> None:
         """Record one unrolled segment's constants."""
         self.kinds.append(kind)
@@ -187,6 +213,7 @@ class PromptAssembler(nn.Module):
         self.hole_slots.append(hole_slot)
         self.is_sequences.append(is_sequence)
         self.member_names.append(members)
+        self.sid_space_indices.append(sid_space_index)
 
     def _batch_size(self, batch: Dict[str, torch.Tensor]) -> int:
         """Row count, from the anchor member.
@@ -213,13 +240,184 @@ class PromptAssembler(nn.Module):
         count is a segmented sum rather than ``lengths`` itself.
         """
         member = self.member_names[index][0]
-        lengths = batch[member + ".lengths"].to(torch.int64)
+        raw_lengths = batch[member + ".lengths"].reshape(-1)
+        lengths = raw_lengths.to(torch.int64)
+        sid_space_index = self.sid_space_indices[index]
+        space_name = self.sid_space_names[sid_space_index]
+        num_levels = self.sid_num_levels[sid_space_index]
+        if lengths.numel() != batch_size:
+            raise RuntimeError(
+                "INLINE SID field ["
+                + member
+                + "] in sid_space ["
+                + space_name
+                + "] has "
+                + str(lengths.numel())
+                + " row lengths, but the batch has "
+                + str(batch_size)
+                + " rows."
+            )
+        if bool(torch.any(raw_lengths != lengths)):
+            raise RuntimeError(
+                "INLINE SID field ["
+                + member
+                + "] in sid_space ["
+                + space_name
+                + "] row lengths must contain integers."
+            )
+        if bool(torch.any(lengths < 0)):
+            bad_index = int(torch.nonzero(lengths < 0).reshape(-1)[0])
+            raise RuntimeError(
+                "INLINE SID field ["
+                + member
+                + "] in sid_space ["
+                + space_name
+                + "] has a negative row length at row "
+                + str(bad_index)
+                + "."
+            )
         key = member + ".key_lengths"
         if key in batch:
-            key_lengths = batch[key].to(torch.int64).reshape(-1)
+            raw_key_lengths = batch[key].reshape(-1)
+            key_lengths = raw_key_lengths.to(torch.int64)
+            item_count = int(torch.sum(lengths))
+            if key_lengths.numel() != item_count:
+                raise RuntimeError(
+                    "INLINE SID field ["
+                    + member
+                    + "] in sid_space ["
+                    + space_name
+                    + "] has "
+                    + str(key_lengths.numel())
+                    + " key lengths, but row lengths declare "
+                    + str(item_count)
+                    + " items."
+                )
+            if bool(torch.any(raw_key_lengths != key_lengths)):
+                raise RuntimeError(
+                    "INLINE SID field ["
+                    + member
+                    + "] in sid_space ["
+                    + space_name
+                    + "] key lengths must contain integers."
+                )
+            invalid_key_lengths = key_lengths != num_levels
+            if bool(torch.any(invalid_key_lengths)):
+                bad_index = int(torch.nonzero(invalid_key_lengths).reshape(-1)[0])
+                raise RuntimeError(
+                    "INLINE SID field ["
+                    + member
+                    + "] in sid_space ["
+                    + space_name
+                    + "] requires exactly "
+                    + str(num_levels)
+                    + " flat codes per item, but item "
+                    + str(bad_index)
+                    + " has "
+                    + str(int(key_lengths[bad_index]))
+                    + "."
+                )
             counts = torch.zeros(batch_size, dtype=torch.int64, device=lengths.device)
             lengths = counts.index_add_(0, _row_ids(lengths), key_lengths)
         return lengths
+
+    def _validate_inline(
+        self,
+        values: torch.Tensor,
+        counts: torch.Tensor,
+        index: int,
+    ) -> None:
+        """Validate one INLINE segment against its named SID space."""
+        member = self.member_names[index][0]
+        sid_space_index = self.sid_space_indices[index]
+        space_name = self.sid_space_names[sid_space_index]
+        num_levels = self.sid_num_levels[sid_space_index]
+
+        if index >= self.num_body:
+            invalid_lengths = counts != num_levels
+            if bool(torch.any(invalid_lengths)):
+                bad_row = int(torch.nonzero(invalid_lengths).reshape(-1)[0])
+                raise RuntimeError(
+                    "INLINE SID label field ["
+                    + member
+                    + "] in sid_space ["
+                    + space_name
+                    + "] requires exactly "
+                    + str(num_levels)
+                    + " flat codes per row, but row "
+                    + str(bad_row)
+                    + " has "
+                    + str(int(counts[bad_row]))
+                    + "."
+                )
+        else:
+            invalid_lengths = torch.remainder(counts, num_levels) != 0
+            if bool(torch.any(invalid_lengths)):
+                bad_row = int(torch.nonzero(invalid_lengths).reshape(-1)[0])
+                raise RuntimeError(
+                    "INLINE SID body field ["
+                    + member
+                    + "] in sid_space ["
+                    + space_name
+                    + "] requires each row length to be divisible by "
+                    + str(num_levels)
+                    + ", but row "
+                    + str(bad_row)
+                    + " has "
+                    + str(int(counts[bad_row]))
+                    + "."
+                )
+
+        expected_values = int(torch.sum(counts))
+        if values.numel() != expected_values:
+            raise RuntimeError(
+                "INLINE SID field ["
+                + member
+                + "] in sid_space ["
+                + space_name
+                + "] carries "
+                + str(values.numel())
+                + " flat codes, but its lengths declare "
+                + str(expected_values)
+                + "."
+            )
+
+        positions = _within_row_index(counts)
+        levels = torch.remainder(positions, num_levels)
+        level_offsets = torch.tensor(
+            self.sid_level_offsets[sid_space_index],
+            dtype=torch.int64,
+            device=values.device,
+        )
+        codebooks = torch.tensor(
+            self.sid_codebooks[sid_space_index],
+            dtype=torch.int64,
+            device=values.device,
+        )
+        lower = level_offsets[levels]
+        upper = lower + codebooks[levels]
+        invalid_values = (values < lower) | (values >= upper)
+        if bool(torch.any(invalid_values)):
+            bad_index = int(torch.nonzero(invalid_values).reshape(-1)[0])
+            row = int(_row_ids(counts)[bad_index])
+            level = int(levels[bad_index])
+            raise RuntimeError(
+                "INLINE SID field ["
+                + member
+                + "] in sid_space ["
+                + space_name
+                + "] has flat code "
+                + str(int(values[bad_index]))
+                + " at row "
+                + str(row)
+                + ", level "
+                + str(level)
+                + "; expected ["
+                + str(int(lower[bad_index]))
+                + ", "
+                + str(int(upper[bad_index]))
+                + ")."
+            )
 
     def _segment(
         self,
@@ -244,8 +442,19 @@ class PromptAssembler(nn.Module):
             # the data carries ``level_offsets[l] + code``; the LM vocabulary
             # needs one further uniform shift by ``base_vocab_size``
             counts = self._inline_counts(batch, index, batch_size)
-            values = batch[member + ".values"].to(torch.int64).reshape(-1)
-            return counts, values + self.id_shift
+            raw_values = batch[member + ".values"].reshape(-1)
+            values = raw_values.to(torch.int64)
+            sid_space_index = self.sid_space_indices[index]
+            if bool(torch.any(raw_values != values)):
+                raise RuntimeError(
+                    "INLINE SID field ["
+                    + member
+                    + "] in sid_space ["
+                    + self.sid_space_names[sid_space_index]
+                    + "] must contain integer flat codes."
+                )
+            self._validate_inline(values, counts, index)
+            return counts, values + self.sid_base_vocabs[sid_space_index]
 
         if self.is_sequences[index]:
             seg_len = batch[member + ".lengths"].to(torch.int64)

@@ -77,7 +77,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Args:
             common: the shared model config.
         """
-        space = self._prompt.sid_space
+        space = self._prompt.sid_spaces[self._prompt.target_sid_space_index]
         self._num_return_sequences = int(common.num_return_sequences)
         beam_widths = list(common.beam_widths)
         if not beam_widths:

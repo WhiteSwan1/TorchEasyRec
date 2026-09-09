@@ -71,6 +71,8 @@ class BaseGenRecModel(BaseModel):
         compiled_prompt: the compiled prompt; required.
     """
 
+    _sid_base_vocabs: torch.Tensor
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -101,14 +103,25 @@ class BaseGenRecModel(BaseModel):
         self.init_backbone(cfg.hf_model_name_or_path, cfg.common.lm_parameter_dtype)
         # Every run replaces this initialization from pretrained or DCP weights.
         self.lm.resize_token_embeddings(
-            compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
+            compiled_prompt.target_vocab_size, mean_resizing=False
         )
         self.init_input()
 
-        # decode subtracts these every step; a buffer follows the module's device
+        self._target_sid_space_index = compiled_prompt.target_sid_space_index
+        self.register_buffer(
+            "_sid_base_vocabs",
+            torch.tensor(
+                [space.base_vocab_size for space in compiled_prompt.sid_spaces],
+                dtype=torch.int64,
+            ),
+            persistent=False,
+        )
+        target_sid_space = compiled_prompt.sid_spaces[
+            compiled_prompt.target_sid_space_index
+        ]
         self.register_buffer(
             "_level_offsets",
-            torch.tensor(compiled_prompt.sid_space.level_offsets),
+            torch.tensor(target_sid_space.level_offsets),
             persistent=False,
         )
 
@@ -191,6 +204,11 @@ class BaseGenRecModel(BaseModel):
         """The HF module export and checkpointing reach for."""
         return self.lm
 
+    @property
+    def compiled_prompt(self) -> CompiledPrompt:
+        """The compiled prompt that defines the checkpoint SID vocabulary ABI."""
+        return self._prompt
+
     def build_input(self, batch: Batch) -> torch.Tensor:
         """Build packed LM input embeddings and fill projected positions.
 
@@ -228,8 +246,12 @@ class BaseGenRecModel(BaseModel):
         Returns:
             ``(batch_size, beams, num_levels)`` local codes.
         """
-        space = self._prompt.sid_space
-        codes = tokens - space.base_vocab_size - self._level_offsets
+        space = self._prompt.sid_spaces[self._target_sid_space_index]
+        codes = (
+            tokens
+            - self._sid_base_vocabs[self._target_sid_space_index]
+            - self._level_offsets
+        )
         return codes.view(batch_size, -1, space.num_levels)
 
     def init_loss(self) -> None:
@@ -294,7 +316,7 @@ class BaseGenRecModel(BaseModel):
         logger.info(f"loading pretrained weights from [{source}].")
         pretrained = AutoModelForCausalLM.from_pretrained(source)
         pretrained.resize_token_embeddings(
-            self._prompt.sid_space.target_vocab_size, mean_resizing=True
+            self._prompt.target_vocab_size, mean_resizing=True
         )
         self.lm.load_state_dict(pretrained.state_dict())
         del pretrained

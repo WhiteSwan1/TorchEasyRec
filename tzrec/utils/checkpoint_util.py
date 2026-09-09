@@ -1044,6 +1044,15 @@ def restore_model(
     if not os.path.exists(checkpoint_dir):
         raise RuntimeError(f"checkpoint_dir[{checkpoint_dir}] not exists.")
 
+    prompt_model = unwrap_to(model, "compiled_prompt")
+    if prompt_model is not None:
+        # Local import avoids a circular import (hf_export_util imports us).
+        from tzrec.utils.hf_export_util import validate_checkpoint_sid_abi
+
+        compiled_prompt = prompt_model.compiled_prompt
+        if compiled_prompt is not None:
+            validate_checkpoint_sid_abi(checkpoint_dir, compiled_prompt)
+
     meta_path = os.path.join(checkpoint_dir, CKPT_META_FILENAME)
     model_ckpt_path = os.path.join(checkpoint_dir, "model")
     optim_ckpt_path = os.path.join(checkpoint_dir, "optimizer")

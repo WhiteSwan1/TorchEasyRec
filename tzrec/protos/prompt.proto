@@ -20,11 +20,9 @@ message PromptConfig {
     // single-feature slot named after it.
     repeated PromptSlot slots = 4;
 
-    // The codebook sizes the answer, extends the vocabulary and fixes the
-    // decode bands. Required in this version because every prompt-native
-    // model here emits SIDs; relax it once a non-SID one exists. text_format
-    // does not enforce required, so compile_prompt raises the actual error.
-    required SidSpace sid_space = 5;
+    // Named SID token spaces. Every INLINE feature and label binds to one by
+    // its underlying field name. compile_prompt requires at least one space.
+    repeated SidSpace sid_space = 5;
 
     // Compile-time ceiling, not a truncation trigger: compile_prompt refuses a
     // plan whose proven maximum length exceeds it. Rows are neither measured
@@ -69,4 +67,6 @@ message SidSpace {
     // SID manifest to cross-check codebook against. A mismatch is fatal: it
     // means the data and the decode bands disagree.
     optional string manifest_path = 4;
+    // Underlying INLINE feature or label field that uses this token space.
+    required string name = 5;
 }

@@ -16,6 +16,7 @@ tokenizer. It resolves no physical dimension: the model does that at
 ``__init__`` from ``group_total_dim``.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -125,7 +126,8 @@ def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     fmt = sid_space.token_format
     if "{i}" not in fmt:
         raise ValueError(
-            f"sid_space.token_format [{fmt}] has no '{{i}}' placeholder, so "
+            f"sid_space [{sid_space.name}] token_format [{fmt}] has no '{{i}}' "
+            f"placeholder, so "
             f"every SID token would render the same string and the tokenizer "
             f"would gain one row where the bands assume "
             f"{sum(sid_space.codebook)}."
@@ -133,90 +135,128 @@ def _render_sid_tokens(sid_space: SidSpace) -> List[str]:
     return [fmt.replace("{i}", str(i)) for i in range(sum(sid_space.codebook))]
 
 
-def _read_manifest(path: str) -> List[int]:
-    """Read ``codebook`` from a SID manifest."""
+def _canonical_json_sha256(value: object) -> str:
+    """Return a stable digest of a JSON-compatible value."""
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_manifest(path: str, space_name: str) -> Tuple[List[int], str]:
+    """Read ``codebook`` and the stable identity of a SID manifest."""
     if not os.path.exists(path):
-        raise ValueError(f"sid_space.manifest_path [{path}] does not exist.")
+        raise ValueError(
+            f"sid_space [{space_name}] manifest_path [{path}] does not exist."
+        )
     with open(path, "r") as f:
         manifest = json.load(f)
-    return [int(c) for c in manifest["codebook"]]
+    return [int(c) for c in manifest["codebook"]], _canonical_json_sha256(manifest)
 
 
-def _build_sid_space(
-    cfg: PromptConfig, tok: Tokenizer, base_vocab_size: int, has_projection: bool
-) -> ResolvedSidSpace:
-    """Extend the tokenizer with SID tokens and resolve the token space."""
-    if not cfg.HasField("sid_space"):
+def _build_sid_spaces(
+    cfg: PromptConfig, tok: Tokenizer
+) -> Tuple[Tuple[ResolvedSidSpace, ...], int]:
+    """Extend the tokenizer with every named SID space in declaration order."""
+    if not cfg.sid_space:
         raise ValueError(
-            "prompt_config.sid_space is required: it declares the codebook the "
-            "SID vocabulary is built from, and every prompt-native model needs "
-            "one to extend its embedding table and to decode."
+            "prompt_config.sid_space requires at least one named SID space."
         )
-    space = cfg.sid_space
-    codebook = [int(c) for c in space.codebook]
-    if not codebook:
-        raise ValueError("sid_space.codebook is required; one size per SID level.")
-    if any(c <= 0 for c in codebook):
-        raise ValueError(f"every codebook size must be positive, got {codebook}.")
 
-    if space.HasField("manifest_path"):
-        declared = _read_manifest(space.manifest_path)
-        if declared != codebook:
+    names = [space.name for space in cfg.sid_space]
+    empty_names = [index for index, name in enumerate(names) if not name.strip()]
+    if empty_names:
+        raise ValueError(
+            f"sid_space entries {empty_names} have an empty name; every SID "
+            "space must match one underlying INLINE feature or label field."
+        )
+    duplicate_names = sorted({name for name in names if names.count(name) > 1})
+    if duplicate_names:
+        raise ValueError(f"sid_space names must be unique, got {duplicate_names}.")
+
+    padding_multiples = {int(space.vocab_pad_to_multiple_of) for space in cfg.sid_space}
+    if len(padding_multiples) != 1:
+        raise ValueError(
+            "all sid_space entries must use the same "
+            "vocab_pad_to_multiple_of, got "
+            f"{sorted(padding_multiples)}."
+        )
+
+    resolved: List[ResolvedSidSpace] = []
+    for space in cfg.sid_space:
+        codebook = [int(c) for c in space.codebook]
+        if not codebook:
             raise ValueError(
-                f"sid_space.codebook {codebook} does not match the manifest at "
-                f"[{space.manifest_path}] which describes {declared}. The data "
-                f"and the decode bands would disagree."
+                f"sid_space [{space.name}] codebook is required; one size per "
+                "SID level."
+            )
+        if any(c <= 0 for c in codebook):
+            raise ValueError(
+                f"every codebook size in sid_space [{space.name}] must be "
+                f"positive, got {codebook}."
             )
 
-    sid_tokens = _render_sid_tokens(space)
-    existing_sid_tokens = [
-        token for token in sid_tokens if tok.token_to_id(token) is not None
-    ]
-    if existing_sid_tokens:
-        raise ValueError(
-            "SID tokens are already in the base tokenizer, e.g. "
-            f"{existing_sid_tokens[:3]}; change sid_space.token_format."
-        )
-    tok.add_special_tokens(sid_tokens)
+        manifest_sha256 = None
+        if space.HasField("manifest_path"):
+            declared, manifest_sha256 = _read_manifest(space.manifest_path, space.name)
+            if declared != codebook:
+                raise ValueError(
+                    f"sid_space [{space.name}] codebook {codebook} does not "
+                    f"match the manifest at [{space.manifest_path}] which "
+                    f"describes {declared}. The data and the decode bands would "
+                    "disagree."
+                )
 
-    sentinel_id = None
-    if has_projection:
-        if tok.token_to_id(cfg.sentinel_token) is not None:
+        sid_tokens = _render_sid_tokens(space)
+        existing_sid_tokens = [
+            token for token in sid_tokens if tok.token_to_id(token) is not None
+        ]
+        if existing_sid_tokens:
             raise ValueError(
-                f"sentinel_token [{cfg.sentinel_token}] is already in the base "
-                f"tokenizer; a projected position would be indistinguishable "
-                f"from real content."
+                f"SID tokens for sid_space [{space.name}] already exist in the "
+                f"tokenizer, e.g. {existing_sid_tokens[:3]}; change its "
+                "token_format."
             )
-        tok.add_special_tokens([cfg.sentinel_token])
-        sentinel_id = tok.token_to_id(cfg.sentinel_token)
 
-    offsets: List[int] = []
-    running = 0
-    for size in codebook:
-        offsets.append(running)
-        running += size
-    lo = [base_vocab_size + o for o in offsets]
-    hi = [lo[i] + codebook[i] - 1 for i in range(len(codebook))]
+        base_vocab_size = tok.get_vocab_size(with_added_tokens=True)
+        tok.add_special_tokens(sid_tokens)
+        actual_ids = [tok.token_to_id(token) for token in sid_tokens]
+        expected_ids = list(range(base_vocab_size, base_vocab_size + len(sid_tokens)))
+        if actual_ids != expected_ids:
+            raise ValueError(
+                f"sid_space [{space.name}] tokens did not receive the expected "
+                f"contiguous ids starting at {base_vocab_size}."
+            )
 
-    return ResolvedSidSpace(
-        codebook=tuple(codebook),
-        num_levels=len(codebook),
-        base_vocab_size=base_vocab_size,
-        level_offsets=tuple(offsets),
-        band_lo=tuple(lo),
-        band_hi=tuple(hi),
-        target_vocab_size=_ceil_to(
-            tok.get_vocab_size(with_added_tokens=True),
-            space.vocab_pad_to_multiple_of,
-        ),
-        sentinel_token_id=sentinel_id,
-        eos_token_id=_special_id(tok, ("<|im_end|>", "<|endoftext|>")),
-        pad_token_id=_special_id(tok, ("<|endoftext|>", "<|im_end|>")),
-    )
+        offsets: List[int] = []
+        running = 0
+        for size in codebook:
+            offsets.append(running)
+            running += size
+        lo = [base_vocab_size + offset for offset in offsets]
+        hi = [lo[index] + codebook[index] - 1 for index in range(len(codebook))]
+        resolved.append(
+            ResolvedSidSpace(
+                name=space.name,
+                codebook=tuple(codebook),
+                token_format=space.token_format,
+                manifest_sha256=manifest_sha256,
+                num_levels=len(codebook),
+                base_vocab_size=base_vocab_size,
+                level_offsets=tuple(offsets),
+                band_lo=tuple(lo),
+                band_hi=tuple(hi),
+            )
+        )
+
+    return tuple(resolved), padding_multiples.pop()
 
 
 def _save_tokenizer_dir(
-    tok: Tokenizer, sid_space: ResolvedSidSpace, tokenizer_dir: str
+    tok: Tokenizer, eos_token_id: int, pad_token_id: int, tokenizer_dir: str
 ) -> None:
     """Write the extended tokenizer as a directory ``AutoTokenizer`` loads.
 
@@ -229,11 +269,16 @@ def _save_tokenizer_dir(
     tok.save(os.path.join(tokenizer_dir, "tokenizer.json"))
     config = {
         "tokenizer_class": "PreTrainedTokenizerFast",
-        "eos_token": tok.id_to_token(sid_space.eos_token_id),
-        "pad_token": tok.id_to_token(sid_space.pad_token_id),
+        "eos_token": tok.id_to_token(eos_token_id),
+        "pad_token": tok.id_to_token(pad_token_id),
     }
     with open(os.path.join(tokenizer_dir, "tokenizer_config.json"), "w") as f:
         json.dump(config, f, indent=2)
+
+
+def _tokenizer_sha256(tok: Tokenizer) -> str:
+    """Return a stable digest of the fully extended tokenizer definition."""
+    return _canonical_json_sha256(json.loads(tok.to_str()))
 
 
 def _special_id(tok: Tokenizer, candidates: Sequence[str]) -> int:
@@ -272,6 +317,18 @@ def compile_prompt(
 
     body_runs, body_names = _split_template(cfg.prompt)
     resp_runs, resp_names = _split_template(cfg.response or "")
+    if len(resp_names) != 1:
+        if not cfg.HasField("response") or not cfg.response:
+            raise ValueError(
+                "prompt_config.response is required: it defines the supervised "
+                "span, and without it the loss window collapses to one ignored "
+                "position and the loss is nan. Inference drops the response by "
+                "mode, so a predict-only run keeps it declared."
+            )
+        raise ValueError(
+            "prompt_config.response must contain exactly one SID label "
+            f"placeholder, got {resp_names}."
+        )
     resolved_slots_by_name = {
         name: _resolve_slot(name, declared_slots_by_name)
         for name in body_names + resp_names
@@ -335,21 +392,58 @@ def compile_prompt(
             )
 
     tok = Tokenizer.from_file(cfg.tokenizer_path)
-    base_vocab_size = tok.get_vocab_size(with_added_tokens=True)
     has_projection = any(
         fill_mode is FillMode.PROJECTED
         for fill_mode in fill_modes_by_slot_name.values()
     )
-    sid_space = _build_sid_space(cfg, tok, base_vocab_size, has_projection)
+    sid_spaces, vocab_pad_to_multiple_of = _build_sid_spaces(cfg, tok)
+    sid_space_indices_by_name = {
+        space.name: index for index, space in enumerate(sid_spaces)
+    }
+
+    sentinel_token_id = None
+    if has_projection:
+        if tok.token_to_id(cfg.sentinel_token) is not None:
+            raise ValueError(
+                f"sentinel_token [{cfg.sentinel_token}] already exists in the "
+                "tokenizer; a projected position would be indistinguishable "
+                "from real content."
+            )
+        tok.add_special_tokens([cfg.sentinel_token])
+        sentinel_token_id = tok.token_to_id(cfg.sentinel_token)
+
+    target_vocab_size = _ceil_to(
+        tok.get_vocab_size(with_added_tokens=True), vocab_pad_to_multiple_of
+    )
+    tokenizer_sha256 = _tokenizer_sha256(tok)
+    eos_token_id = _special_id(tok, ("<|im_end|>", "<|endoftext|>"))
+    pad_token_id = _special_id(tok, ("<|endoftext|>", "<|im_end|>"))
 
     if tokenizer_dir:
-        _save_tokenizer_dir(tok, sid_space, tokenizer_dir)
+        _save_tokenizer_dir(tok, eos_token_id, pad_token_id, tokenizer_dir)
 
     slot_ids = {name: i for i, name in enumerate(resolved_slots_by_name)}
     segs: Dict[str, SlotSeg] = {}
     for name, slot in resolved_slots_by_name.items():
         group_type = group_types_by_slot_name[name]
         fill_mode = fill_modes_by_slot_name[name]
+        sid_space_index = None
+        if fill_mode is FillMode.INLINE:
+            sid_field_name = slot.feature_names[0]
+            if sid_field_name not in sid_space_indices_by_name:
+                raise ValueError(
+                    f"INLINE prompt slot [{name}] uses field [{sid_field_name}], "
+                    "but no sid_space has that name."
+                )
+            sid_space_index = sid_space_indices_by_name[sid_field_name]
+        if name in response_slot_names:
+            assert sid_space_index is not None
+            width = Width(
+                WidthKind.STATIC,
+                sid_spaces[sid_space_index].num_levels,
+            )
+        else:
+            width = _slot_width(members[name], group_type)
         segs[name] = SlotSeg(
             slot_id=slot_ids[name],
             name=name,
@@ -359,12 +453,30 @@ def compile_prompt(
                 ".sequence" if group_type == FeatureGroupType.JAGGED_SEQUENCE else ""
             ),
             fill=fill_mode,
-            width=(
-                Width(WidthKind.STATIC, sid_space.num_levels)
-                if name in response_slot_names
-                else _slot_width(members[name], group_type)
-            ),
+            width=width,
+            sid_space_index=sid_space_index,
         )
+
+    used_sid_space_indices = {
+        seg.sid_space_index for seg in segs.values() if seg.sid_space_index is not None
+    }
+    unused_sid_spaces = [
+        space.name
+        for index, space in enumerate(sid_spaces)
+        if index not in used_sid_space_indices
+    ]
+    if unused_sid_spaces:
+        raise ValueError(
+            f"sid_space entries {unused_sid_spaces} do not match any INLINE "
+            "feature or label field referenced by the prompt."
+        )
+
+    target_seg = segs[resp_names[0]]
+    if target_seg.sid_space_index is None:
+        raise ValueError(
+            f"response slot [{target_seg.name}] did not resolve to a SID space."
+        )
+    target_sid_space_index = target_seg.sid_space_index
 
     body = _build_template_segments(body_runs, body_names, segs, tok)
     response = _build_template_segments(resp_runs, resp_names, segs, tok)
@@ -389,7 +501,15 @@ def compile_prompt(
     _validate(plan)
 
     return CompiledPrompt(
-        sid_space=sid_space, prompt_plan=plan, projection_plan=projection_plan
+        sid_spaces=sid_spaces,
+        target_sid_space_index=target_sid_space_index,
+        target_vocab_size=target_vocab_size,
+        tokenizer_sha256=tokenizer_sha256,
+        sentinel_token_id=sentinel_token_id,
+        eos_token_id=eos_token_id,
+        pad_token_id=pad_token_id,
+        prompt_plan=plan,
+        projection_plan=projection_plan,
     )
 
 

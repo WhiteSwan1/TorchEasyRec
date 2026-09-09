@@ -434,7 +434,12 @@ def create_genrec_test_model(
         prompt=prompt,
         response=response,
     )
-    prompt_config.sid_space.codebook.extend([4, 4, 4])
+    history_space = prompt_config.sid_space.add(name="hist")
+    history_space.codebook.extend([4, 4, 4])
+    history_space.token_format = "<|hist_sid_{i}|>"
+    answer_space = prompt_config.sid_space.add(name="answer")
+    answer_space.codebook.extend([4, 4, 4])
+    answer_space.token_format = "<|answer_sid_{i}|>"
     prompt_config.slots.extend(slots)
     compiled_prompt = compile_prompt(prompt_config, features, ["answer"])
 

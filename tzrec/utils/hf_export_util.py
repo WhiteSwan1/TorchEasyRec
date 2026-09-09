@@ -28,6 +28,7 @@ from torch import nn
 from tzrec.constant import HF_EXPORT_META_FILENAME
 from tzrec.features.feature import BaseFeature
 from tzrec.prompt.compile import compile_prompt
+from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.utils import checkpoint_util
 from tzrec.utils.filesystem_util import url_to_fs
@@ -46,12 +47,103 @@ _HF_ASSET_FILES = (
     "special_tokens_map.json",
 )
 
+_SID_ABI_META_KEY = "sid_abi"
+_SID_ABI_VERSION = 1
+
+
+def build_sid_abi(compiled_prompt: CompiledPrompt) -> Dict[str, Any]:
+    """Build the canonical ordered SID vocabulary ABI for a compiled prompt.
+
+    Args:
+        compiled_prompt: prompt whose tokenizer layout is being checkpointed.
+
+    Returns:
+        A JSON-serializable ABI dictionary whose list order is significant.
+    """
+    spaces = [
+        {
+            "name": space.name,
+            "codebook": list(space.codebook),
+            "num_levels": space.num_levels,
+            "token_format": space.token_format,
+            "manifest_sha256": space.manifest_sha256,
+            "base_vocab_size": space.base_vocab_size,
+            "level_offsets": list(space.level_offsets),
+            "band_lo": list(space.band_lo),
+            "band_hi": list(space.band_hi),
+        }
+        for space in compiled_prompt.sid_spaces
+    ]
+    return {
+        "version": _SID_ABI_VERSION,
+        "sid_spaces": spaces,
+        "target_sid_space_index": compiled_prompt.target_sid_space_index,
+        "target_vocab_size": compiled_prompt.target_vocab_size,
+        "sentinel_token_id": compiled_prompt.sentinel_token_id,
+        "eos_token_id": compiled_prompt.eos_token_id,
+        "pad_token_id": compiled_prompt.pad_token_id,
+        "tokenizer_sha256": compiled_prompt.tokenizer_sha256,
+    }
+
+
+def validate_checkpoint_sid_abi(
+    checkpoint_path: str, compiled_prompt: CompiledPrompt
+) -> None:
+    """Require a checkpoint SID ABI to exactly match the current prompt.
+
+    Args:
+        checkpoint_path: checkpoint directory containing HF export metadata.
+        compiled_prompt: prompt compiled from the configuration being restored.
+
+    Raises:
+        RuntimeError: if ABI metadata is absent, malformed, or different.
+    """
+    meta_path = os.path.join(checkpoint_path, HF_EXPORT_META_FILENAME)
+    if not os.path.exists(meta_path):
+        raise RuntimeError(
+            f"checkpoint [{checkpoint_path}] has no SID ABI metadata; it cannot "
+            "be restored by the multi-SID runtime."
+        )
+    try:
+        with open(meta_path, "r") as f:
+            checkpoint_meta = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"checkpoint [{checkpoint_path}] has unreadable SID ABI metadata."
+        ) from e
+
+    if not isinstance(checkpoint_meta, dict):
+        raise RuntimeError(
+            f"checkpoint [{checkpoint_path}] has malformed SID ABI metadata."
+        )
+    if _SID_ABI_META_KEY not in checkpoint_meta:
+        raise RuntimeError(
+            f"checkpoint [{checkpoint_path}] has no SID ABI metadata; it cannot "
+            "be restored by the multi-SID runtime."
+        )
+    checkpoint_abi = checkpoint_meta[_SID_ABI_META_KEY]
+    current_abi = build_sid_abi(compiled_prompt)
+    checkpoint_json = json.dumps(
+        checkpoint_abi, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    current_json = json.dumps(
+        current_abi, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+    if checkpoint_json != current_json:
+        raise RuntimeError(
+            "SID checkpoint ABI mismatch; vocabulary rows cannot be restored "
+            "without an explicit migration. "
+            f"checkpoint={json.dumps(checkpoint_abi, sort_keys=True)}; "
+            f"current={json.dumps(current_abi, sort_keys=True)}"
+        )
+
 
 def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
     """Write HF config, optional tokenizer, and export metadata beside a checkpoint.
 
-    The backbone's FQN prefix goes into ``hf_export_meta.json`` so ``dcp_to_hf``
-    can strip it without hard-coding a wrapper convention. Rank 0 only.
+    The backbone's FQN prefix and canonical SID ABI go into
+    ``hf_export_meta.json`` so restore and export can reject incompatible
+    vocabulary layouts. Rank 0 only.
     """
     if int(os.environ.get("RANK", 0)) != 0:
         return
@@ -74,7 +166,12 @@ def write_hf_assets(wrapped_model: nn.Module, save_dir: str) -> None:
         (n for n, m in wrapped_model.named_modules() if m is backbone), ""
     )
     prefix = checkpoint_util._strip_dmp_prefix(raw_prefix)
-    meta = {"backbone_state_dict_prefix": prefix + ("." if prefix else "")}
+    meta: Dict[str, Any] = {
+        "backbone_state_dict_prefix": prefix + ("." if prefix else "")
+    }
+    compiled_prompt = getattr(inner, "compiled_prompt", None)
+    if compiled_prompt is not None:
+        meta[_SID_ABI_META_KEY] = build_sid_abi(compiled_prompt)
     with open(os.path.join(save_dir, HF_EXPORT_META_FILENAME), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -198,19 +295,42 @@ def export_hf_assets(
     if fs is not None:
         local_dir = tempfile.mkdtemp()
     try:
-        backbone = dcp_to_hf(checkpoint_path, local_dir)
         compiled = compile_prompt(
+            pipeline_config.prompt_config,
+            features,
+            list(pipeline_config.data_config.label_fields),
+        )
+        validate_checkpoint_sid_abi(checkpoint_path, compiled)
+        backbone = dcp_to_hf(checkpoint_path, local_dir)
+        exported_prompt = compile_prompt(
             pipeline_config.prompt_config,
             features,
             list(pipeline_config.data_config.label_fields),
             tokenizer_dir=local_dir,
         )
+        if exported_prompt != compiled:
+            raise RuntimeError(
+                "prompt compilation changed while exporting the checkpoint."
+            )
+        backbone_vocab_size = int(backbone.get("vocab_size", -1))
+        if backbone_vocab_size != compiled.target_vocab_size:
+            raise RuntimeError(
+                f"checkpoint backbone vocab_size [{backbone_vocab_size}] does not "
+                f"match the SID ABI target_vocab_size "
+                f"[{compiled.target_vocab_size}]."
+            )
+        sid_abi = build_sid_abi(compiled)
         composite: Dict[str, Any] = {
             "architectures": [SERVING_ARCH],
             "model_type": SERVING_MODEL_TYPE,
             "text_config": backbone,
-            "eos_token_id": compiled.sid_space.eos_token_id,
-            "pad_token_id": compiled.sid_space.pad_token_id,
+            "eos_token_id": compiled.eos_token_id,
+            "pad_token_id": compiled.pad_token_id,
+            "sentinel_token_id": compiled.sentinel_token_id,
+            "sid_spaces": sid_abi["sid_spaces"],
+            "target_sid_space_index": compiled.target_sid_space_index,
+            "target_vocab_size": compiled.target_vocab_size,
+            _SID_ABI_META_KEY: sid_abi,
         }
         # a runtime that reads only the outer config still needs to size its cache
         for key in ("vocab_size", "hidden_size", "num_hidden_layers", "torch_dtype"):

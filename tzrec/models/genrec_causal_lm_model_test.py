@@ -91,8 +91,17 @@ class GenRecCausalLMModelTest(unittest.TestCase):
             self.test_dir, beam_widths=beam_widths, num_return_sequences=1
         )
         self.assertEqual(model._capped_widths, expected)
-        space = compiled_prompt.sid_space
+        space = compiled_prompt.sid_spaces[compiled_prompt.target_sid_space_index]
         self.assertEqual(model._bands, list(zip(space.band_lo, space.band_hi)))
+        self.assertNotEqual(
+            model._bands,
+            list(
+                zip(
+                    compiled_prompt.sid_spaces[0].band_lo,
+                    compiled_prompt.sid_spaces[0].band_hi,
+                )
+            ),
+        )
 
     def test_rejects_a_schedule_that_does_not_match_the_codebook(self) -> None:
         with self.assertRaisesRegex(ValueError, "entries but the codebook has"):
@@ -112,7 +121,11 @@ class GenRecCausalLMModelTest(unittest.TestCase):
         model, compiled_prompt = create_genrec_test_model(self.test_dir)
         batch = Batch()
         batch.additional_infos.update(
-            PromptAssembler(compiled_prompt.prompt_plan, compiled_prompt.sid_space)(
+            PromptAssembler(
+                compiled_prompt.prompt_plan,
+                compiled_prompt.sid_spaces,
+                compiled_prompt.sentinel_token_id,
+            )(
                 {
                     # offset SID codes for the (4, 4, 4) codebook
                     "hist.values": torch.tensor([0, 5, 10]),
@@ -128,6 +141,40 @@ class GenRecCausalLMModelTest(unittest.TestCase):
             model.predict(batch)
 
         self.assertIs(spy.call_args.kwargs["use_cache"], False)
+
+    def test_training_mask_supervises_only_the_target_sid_space(self) -> None:
+        model, compiled_prompt = create_genrec_test_model(self.test_dir)
+        batch = Batch()
+        batch.additional_infos.update(
+            PromptAssembler(
+                compiled_prompt.prompt_plan,
+                compiled_prompt.sid_spaces,
+                compiled_prompt.sentinel_token_id,
+            )(
+                {
+                    "hist.values": torch.tensor([1, 5, 9]),
+                    "hist.lengths": torch.tensor([3]),
+                    "answer.values": torch.tensor([1, 5, 8]),
+                    "answer.lengths": torch.tensor([3]),
+                }
+            )
+        )
+        input_ids = batch.additional_infos[INPUT_IDS]
+        history_space = compiled_prompt.sid_spaces[0]
+        target_space = compiled_prompt.sid_spaces[
+            compiled_prompt.target_sid_space_index
+        ]
+        self.assertEqual(
+            input_ids[-3:].tolist(),
+            [target_space.base_vocab_size + code for code in (1, 5, 8)],
+        )
+        self.assertIn(history_space.base_vocab_size + 1, input_ids[:-3].tolist())
+
+        embeds = model.build_input(batch)
+        _, _, labels = model._left_pad_packed_inputs(embeds, batch, build_labels=True)
+        assert labels is not None
+        supervised = labels[labels != model._ignore_index]
+        self.assertEqual(supervised.tolist(), input_ids[-3:].tolist())
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import os
 import shutil
 import threading
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import torch
@@ -21,9 +22,17 @@ from safetensors.torch import load_file
 from torch import nn
 
 from tzrec.constant import HF_EXPORT_META_FILENAME
-from tzrec.utils.checkpoint_util import save_model, unwrap_to
+from tzrec.prompt.types import (
+    CompiledPrompt,
+    ProjectionPlan,
+    PromptPlan,
+    ResolvedSidSpace,
+)
+from tzrec.utils.checkpoint_util import restore_model, save_model, unwrap_to
 from tzrec.utils.hf_export_util import (
+    build_sid_abi,
     dcp_to_hf,
+    validate_checkpoint_sid_abi,
     write_hf_assets,
 )
 from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
@@ -32,6 +41,56 @@ from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
 def _tied_lm():
     """The tied-head backbone every case here needs; dcp_to_hf must drop the tie."""
     return create_tiny_causal_lm(64, tie_word_embeddings=True)
+
+
+def _compiled_prompt(
+    label_token_format: str = "<|label_sid_{i}|>",
+) -> CompiledPrompt:
+    """Build the minimal two-space prompt metadata needed by ABI tests."""
+    spaces = (
+        ResolvedSidSpace(
+            name="history_sid",
+            codebook=(3, 3, 3),
+            num_levels=3,
+            token_format="<|history_sid_{i}|>",
+            manifest_sha256=None,
+            base_vocab_size=64,
+            level_offsets=(0, 3, 6),
+            band_lo=(64, 67, 70),
+            band_hi=(66, 69, 72),
+        ),
+        ResolvedSidSpace(
+            name="label_sid",
+            codebook=(3, 3, 2),
+            num_levels=3,
+            token_format=label_token_format,
+            manifest_sha256="label-manifest-sha256",
+            base_vocab_size=73,
+            level_offsets=(0, 3, 6),
+            band_lo=(73, 76, 79),
+            band_hi=(75, 78, 80),
+        ),
+    )
+    return CompiledPrompt(
+        sid_spaces=spaces,
+        target_sid_space_index=1,
+        target_vocab_size=128,
+        sentinel_token_id=81,
+        eos_token_id=1,
+        pad_token_id=0,
+        tokenizer_sha256="extended-tokenizer-sha256",
+        prompt_plan=PromptPlan(
+            segments=(),
+            response_segments=(),
+            max_length=0,
+            max_total_length=0,
+            max_holes=0,
+            logits_suffix_len=0,
+            static_prefix_len=0,
+            projected_slots=(),
+        ),
+        projection_plan=ProjectionPlan(projections={}, slot_to_module={}),
+    )
 
 
 class _FakeTokenizer:
@@ -46,10 +105,15 @@ class _FakeTokenizer:
 class _GenRec(nn.Module):
     """Stand-in for an HF-backed model exposing the optional tokenizer protocol."""
 
-    def __init__(self, lm):
+    def __init__(self, lm, compiled_prompt=None):
         super().__init__()
         self.lm = lm
+        if compiled_prompt is not None:
+            self.lm.resize_token_embeddings(
+                compiled_prompt.target_vocab_size, mean_resizing=False
+            )
         self.other = nn.Linear(4, 4)
+        self.compiled_prompt = compiled_prompt
 
     def hf_backbone(self):
         return self.lm
@@ -112,6 +176,13 @@ class HfExportUtilTest(unittest.TestCase):
         write_hf_assets(wrapped, ckpt_dir)
         return ckpt_dir
 
+    def _write_sid_abi(self, compiled):
+        ckpt_dir = os.path.join(self.test_dir, "abi.ckpt")
+        os.makedirs(ckpt_dir)
+        with open(os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME), "w") as f:
+            json.dump({"sid_abi": build_sid_abi(compiled)}, f)
+        return ckpt_dir
+
     def test_write_hf_assets_records_state_dict_prefix(self) -> None:
         lm = _tied_lm()
         wrapped = _TrainWrapper(_GenRec(lm))
@@ -124,6 +195,72 @@ class HfExportUtilTest(unittest.TestCase):
         # the prefix must reconstruct the exact FQNs save_model wrote
         saved = set(wrapped.state_dict())
         self.assertTrue(all(prefix + k in saved for k in lm.state_dict()))
+
+    def test_write_hf_assets_records_and_validates_sid_abi(self) -> None:
+        compiled = _compiled_prompt()
+        ckpt_dir = self._save_ckpt(
+            _TrainWrapper(_GenRec(_tied_lm(), compiled_prompt=compiled))
+        )
+        with open(os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)) as f:
+            meta = json.load(f)
+        self.assertEqual(meta["sid_abi"], build_sid_abi(compiled))
+        validate_checkpoint_sid_abi(ckpt_dir, compiled)
+
+    def test_validate_checkpoint_sid_abi_rejects_prefix_change(self) -> None:
+        ckpt_dir = self._write_sid_abi(_compiled_prompt())
+        changed = _compiled_prompt(label_token_format="<|collision_sid_{i}|>")
+        with self.assertRaisesRegex(RuntimeError, "SID checkpoint ABI mismatch"):
+            validate_checkpoint_sid_abi(ckpt_dir, changed)
+
+    def test_validate_checkpoint_sid_abi_rejects_space_reordering(self) -> None:
+        compiled = _compiled_prompt()
+        ckpt_dir = self._write_sid_abi(compiled)
+        changed = replace(
+            compiled,
+            sid_spaces=tuple(reversed(compiled.sid_spaces)),
+            target_sid_space_index=0,
+        )
+        with self.assertRaisesRegex(RuntimeError, "SID checkpoint ABI mismatch"):
+            validate_checkpoint_sid_abi(ckpt_dir, changed)
+
+    def test_validate_checkpoint_sid_abi_rejects_tokenizer_change(self) -> None:
+        compiled = _compiled_prompt()
+        ckpt_dir = self._write_sid_abi(compiled)
+        changed = replace(compiled, tokenizer_sha256="different-tokenizer-sha256")
+        with self.assertRaisesRegex(RuntimeError, "SID checkpoint ABI mismatch"):
+            validate_checkpoint_sid_abi(ckpt_dir, changed)
+
+    def test_validate_checkpoint_sid_abi_rejects_manifest_change(self) -> None:
+        compiled = _compiled_prompt()
+        ckpt_dir = self._write_sid_abi(compiled)
+        changed_target = replace(
+            compiled.sid_spaces[1], manifest_sha256="different-manifest-sha256"
+        )
+        changed = replace(
+            compiled,
+            sid_spaces=(compiled.sid_spaces[0], changed_target),
+        )
+        with self.assertRaisesRegex(RuntimeError, "SID checkpoint ABI mismatch"):
+            validate_checkpoint_sid_abi(ckpt_dir, changed)
+
+    def test_validate_checkpoint_sid_abi_rejects_json_type_change(self) -> None:
+        compiled = _compiled_prompt()
+        ckpt_dir = self._write_sid_abi(compiled)
+        meta_path = os.path.join(ckpt_dir, HF_EXPORT_META_FILENAME)
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["sid_abi"]["version"] = True
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+        with self.assertRaisesRegex(RuntimeError, "SID checkpoint ABI mismatch"):
+            validate_checkpoint_sid_abi(ckpt_dir, compiled)
+
+    def test_restore_model_requires_sid_abi_metadata(self) -> None:
+        ckpt_dir = os.path.join(self.test_dir, "legacy.ckpt")
+        os.makedirs(ckpt_dir)
+        model = _TrainWrapper(_GenRec(_tied_lm(), _compiled_prompt()))
+        with self.assertRaisesRegex(RuntimeError, "has no SID ABI metadata"):
+            restore_model(ckpt_dir, model)
 
     def test_dcp_to_hf_round_trip_drops_tied_head(self) -> None:
         from transformers import AutoModelForCausalLM
