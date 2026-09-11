@@ -82,11 +82,11 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
         self.assertGreater(rows, self.compiled_prompt.sid_space.band_hi[-1])
 
     @parameterized.expand(
-        [["qwen2"], ["qwen3"]],
+        [["qwen2", False], ["qwen3", False], ["qwen2", True], ["qwen3", True]],
         name_func=parameterized_name_func,
     )
     def test_packed_rows_match_solo_runs_and_backpropagate(
-        self, model_type: str
+        self, model_type: str, weighted: bool
     ) -> None:
         device = torch.device("cuda")
         backbone = os.path.join(self.test_dir, model_type)
@@ -107,6 +107,7 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
             model = self._model(
                 lm_parameter_dtype=GenrecModelConfig.BF16,
                 hf_model_name_or_path=backbone,
+                sample_weights=["target_weight"] if weighted else None,
             ).to(device)
         model.eval()
         hist_rows = [[0, 1, 2], [3, 0, 1, 2, 3, 0]]
@@ -136,7 +137,27 @@ class PromptStackIntegrationTest(GenrecModelTestBase):
             packed["logits"][1], changed["logits"][1], atol=0, rtol=0
         )
 
+        if weighted:
+            packed_batch.sample_weights["target_weight"] = torch.tensor(
+                [0.5, 1.5], device=device
+            )
         loss = model.loss(packed, packed_batch)["ce_loss"]
+        if weighted:
+            solo_losses = torch.stack(
+                [
+                    model.lm.loss_function(
+                        logits=result["logits"],
+                        labels=result["labels"],
+                        vocab_size=model.lm.config.vocab_size,
+                        ignore_index=model._ignore_index,
+                    )
+                    for result in solos
+                ]
+            )
+            expected = (
+                solo_losses * packed_batch.sample_weights["target_weight"]
+            ).mean()
+            torch.testing.assert_close(loss, expected, atol=1e-2, rtol=1e-2)
         self.assertTrue(bool(torch.isfinite(loss)))
         loss.backward()
         grad = model.lm.get_input_embeddings().weight.grad

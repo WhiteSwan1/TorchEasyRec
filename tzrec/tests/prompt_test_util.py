@@ -139,6 +139,7 @@ class GenrecModelTestBase(unittest.TestCase):
         num_return_sequences=2,
         lm_parameter_dtype=None,
         hf_model_name_or_path=None,
+        sample_weights=None,
     ):
         model_config = ModelConfig()
         lm_cfg = model_config.genrec_causal_lm_model
@@ -151,6 +152,7 @@ class GenrecModelTestBase(unittest.TestCase):
             model_config,
             self.features if features is None else features,
             ["answer"],
+            sample_weights=sample_weights,
             compiled_prompt=(
                 self.compiled_prompt if compiled_prompt == -1 else compiled_prompt
             ),

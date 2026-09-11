@@ -11,15 +11,17 @@
 
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 from parameterized import parameterized
 from torchrec import KeyedJaggedTensor
 from transformers import AutoModelForCausalLM
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 from tzrec.datasets.utils import Batch
-from tzrec.models.genrec_model import _PARAM_DTYPE
+from tzrec.models.genrec_model import _PARAM_DTYPE, BaseGenrecModel
 from tzrec.models.model import TrainWrapper
 from tzrec.prompt.assembler import (
     PROMPT_HOLE_POSITIONS,
@@ -289,6 +291,73 @@ class BaseGenrecModelTest(GenrecModelTestBase):
         expected = reference.get_input_embeddings().weight[:base_vocab_size]
         self.assertFalse(torch.allclose(before, expected))
         torch.testing.assert_close(after, expected)
+
+
+class WeightedResponseLossTest(unittest.TestCase):
+    def setUp(self):
+        self.model = BaseGenrecModel.__new__(BaseGenrecModel)
+        torch.nn.Module.__init__(self.model)
+        self.model._ignore_index = -100
+        self.model._sample_weight_name = "target_weight"
+        self.model.lm = torch.nn.Module()
+        self.model.lm.config = SimpleNamespace(vocab_size=7)
+        self.model.lm.loss_function = mock.Mock(wraps=ForCausalLMLoss)
+
+    @parameterized.expand(
+        [("flat", [0.5, 1.5], [2]), ("column", [0.0, 2.0], [2, 1])],
+        name_func=parameterized_name_func,
+    )
+    def test_weighted_row_means_and_gradients(self, _, weights, shape):
+        logits = torch.randn(2, 4, 7, requires_grad=True)
+        reference = logits.detach().clone().requires_grad_()
+        labels = torch.tensor([[-100, 1, 2, 3], [-100, -100, 4, 5]])
+        weight = torch.tensor(weights)
+        batch = Batch(sample_weights={"target_weight": weight.reshape(shape)})
+        result = self.model.loss({"logits": logits, "labels": labels}, batch)
+        row_means = torch.stack(
+            [
+                torch.nn.functional.cross_entropy(reference[0, :3], labels[0, 1:]),
+                torch.nn.functional.cross_entropy(reference[1, 1:3], labels[1, 2:]),
+            ]
+        )
+        expected = (row_means * weight).mean()
+        torch.testing.assert_close(result["ce_loss"], expected)
+        result["ce_loss"].backward()
+        expected.backward()
+        torch.testing.assert_close(logits.grad, reference.grad)
+        self.model.lm.loss_function.assert_not_called()
+
+    def test_expanded_targets_preserve_original_row_weight(self):
+        logits = torch.randn(3, 4, 7)
+        labels = torch.tensor([[-100, 1, 2, 3], [-100, 2, 3, 4], [-100, 3, 4, 5]])
+        row_ce = (
+            torch.nn.functional.cross_entropy(
+                logits[:, :3].reshape(-1, 7),
+                labels[:, 1:].reshape(-1),
+                reduction="none",
+            )
+            .reshape(3, 3)
+            .mean(1)
+        )
+        weights = torch.tensor([0.75, 0.75, 1.5])
+        order = torch.tensor([2, 0, 1])
+        loss = self.model.loss(
+            {"logits": logits[order], "labels": labels[order]},
+            Batch(sample_weights={"target_weight": weights[order]}),
+        )["ce_loss"]
+        torch.testing.assert_close(loss, (row_ce[:2].mean() + row_ce[2]) / 2)
+
+    def test_unconfigured_weights_keep_backbone_loss(self):
+        self.model._sample_weight_name = None
+        logits = torch.randn(2, 4, 7)
+        labels = torch.tensor([[-100, 1, 2, 3], [-100, -100, 4, 5]])
+        loss = self.model.loss(
+            {"logits": logits, "labels": labels},
+            Batch(sample_weights={"target_weight": torch.zeros(2)}),
+        )["ce_loss"]
+        expected = ForCausalLMLoss(logits, labels, vocab_size=7)
+        torch.testing.assert_close(loss, expected)
+        self.model.lm.loss_function.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -133,6 +133,7 @@ class PackedForwardTest(unittest.TestCase):
         nn.Module.__init__(model)
         model.lm = _DifferentiableLM(hidden_size=6, vocab_size=32)
         model._ignore_index = -7
+        model._sample_weight_name = None
         model._prompt = SimpleNamespace(
             prompt_plan=SimpleNamespace(logits_suffix_len=4)
         )

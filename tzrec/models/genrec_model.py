@@ -73,6 +73,7 @@ class BaseGenrecModel(BaseModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(model_config, features, labels, sample_weights, **kwargs)
+        self._sample_weight_name = sample_weights[0] if sample_weights else None
         if compiled_prompt is None:
             raise ValueError(
                 f"{type(self).__name__} needs a compiled prompt; call "
@@ -248,15 +249,31 @@ class BaseGenrecModel(BaseModel):
     def loss(
         self, predictions: Dict[str, torch.Tensor], batch: Batch
     ) -> Dict[str, torch.Tensor]:
-        """Score the response window with the backbone's own causal-LM loss.
+        """Score response tokens, optionally weighting each row's mean CE.
 
         Args:
             predictions: the response-window logits and labels.
-            batch: the batch, unused.
+            batch: carries the configured per-row sample weights.
 
         Returns:
             The named loss.
         """
+        if self._sample_weight_name is not None:
+            logits = predictions["logits"].float()
+            labels = nn.functional.pad(
+                predictions["labels"], (0, 1), value=self._ignore_index
+            )[..., 1:].contiguous()
+            token_loss = nn.functional.cross_entropy(
+                logits.reshape(-1, self.lm.config.vocab_size),
+                labels.reshape(-1),
+                ignore_index=self._ignore_index,
+                reduction="none",
+            ).view_as(labels)
+            row_loss = token_loss.sum(dim=-1) / labels.ne(self._ignore_index).sum(
+                dim=-1
+            )
+            weights = batch.sample_weights[self._sample_weight_name].reshape(-1)
+            return {"ce_loss": (row_loss * weights).mean()}
         return {
             "ce_loss": self.lm.loss_function(
                 logits=predictions["logits"],
