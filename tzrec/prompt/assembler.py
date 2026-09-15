@@ -39,6 +39,8 @@ HOLE_POSITIONS = "hole_positions"
 HOLE_SLOT_COUNTS = "hole_slot_counts"
 RESPONSE_LENGTHS = "response_lengths"
 MAX_SEQLEN = "max_seqlen"
+# emitted only by a plan with attached slots
+ATTACH_POSITIONS = "attach_positions"
 # every stream the walk emits; a caller under FX tracing indexes these rather
 # than iterating the result, which is one opaque proxy there
 OUTPUT_KEYS = (
@@ -121,6 +123,10 @@ class PromptAssembler(nn.Module):
     sid_num_levels: List[int]
     sid_space_names: List[str]
     sid_space_indices: List[int]
+    attach_segments: List[int]
+    attach_members: List[List[str]]
+    attach_names: List[str]
+    attach_num_levels: List[int]
 
     def __init__(
         self,
@@ -197,6 +203,23 @@ class PromptAssembler(nn.Module):
 
         self.num_segments = len(self.kinds)
         self.num_hole_slots = occurrences
+
+        inline_body_indices = {
+            seg.name: index
+            for index, seg in enumerate(prompt_plan.segments)
+            if isinstance(seg, SlotSeg) and seg.fill is FillMode.INLINE
+        }
+        self.attach_segments = []
+        self.attach_members = []
+        self.attach_names = []
+        self.attach_num_levels = []
+        for seg in prompt_plan.attached_slots:
+            assert seg.attach_to is not None and seg.sid_space_index is not None
+            self.attach_segments.append(inline_body_indices[seg.attach_to])
+            self.attach_members.append(list(seg.feature_names))
+            self.attach_names.append(seg.name)
+            self.attach_num_levels.append(self.sid_num_levels[seg.sid_space_index])
+        self.num_attached = len(self.attach_segments)
 
     def _append(
         self,
@@ -477,7 +500,9 @@ class PromptAssembler(nn.Module):
             ``hole_slot_counts``, ``response_lengths`` and ``max_seqlen``. Holes
             are grouped by projected occurrence in emission order, then by
             sample; the front-end's ``slot_embeds`` and ``hole_keys`` follow the
-            same order.
+            same order. A plan with attached slots also emits
+            ``attach_positions``: the SID tokens of each attached slot's target
+            run, by attached slot, then sample, then token.
         """
         batch_size = self._batch_size(batch)
         device = batch_device(batch)
@@ -518,6 +543,32 @@ class PromptAssembler(nn.Module):
                 response_lengths = response_lengths + seg_lens[i]
         out.index_copy_(0, torch.cat(dests, dim=0), torch.cat(seg_values, dim=0))
 
+        attach_parts: List[torch.Tensor] = []
+        for a in range(self.num_attached):
+            target = self.attach_segments[a]
+            num_levels = self.attach_num_levels[a]
+            for member in self.attach_members[a]:
+                items = batch[member + ".lengths"].to(torch.int64).reshape(-1)
+                mismatch = items * num_levels != seg_lens[target]
+                if bool(torch.any(mismatch)):
+                    bad_row = int(torch.nonzero(mismatch).reshape(-1)[0])
+                    raise RuntimeError(
+                        "attached prompt slot ["
+                        + self.attach_names[a]
+                        + "] member ["
+                        + member
+                        + "] has "
+                        + str(int(items[bad_row]))
+                        + " items at row "
+                        + str(bad_row)
+                        + ", but its SID run has "
+                        + str(int(seg_lens[target][bad_row]))
+                        + " tokens; expected "
+                        + str(num_levels)
+                        + " tokens per item."
+                    )
+            attach_parts.append(dests[target])
+
         hole_positions = torch.cat(hole_parts, dim=0)
         # how many of those holes each projected occurrence owns, so a host can
         # cut the flat streams back into per-slot spans without the plan
@@ -537,7 +588,7 @@ class PromptAssembler(nn.Module):
             max_seqlen = torch.zeros((), dtype=torch.int64, device=device)
         # literals rather than the module constants above: TorchScript cannot
         # see a module-level global. ``assembler_test`` pins the two together.
-        return {
+        streams = {
             "input_ids": out,
             "cu_seqlens": cu_seqlens.to(torch.int32),
             "hole_positions": hole_positions,
@@ -545,3 +596,6 @@ class PromptAssembler(nn.Module):
             "response_lengths": response_lengths,
             "max_seqlen": max_seqlen,
         }
+        if self.num_attached > 0:
+            streams["attach_positions"] = torch.cat(attach_parts, dim=0)
+        return streams

@@ -118,8 +118,9 @@ class SlotSeg:
         output_key: "" for DEEP, ".sequence" otherwise.
         fill: INLINE writes token ids, PROJECTED writes sentinels and a hole.
         width: position count of this slot.
-        sid_space_index: index into ``CompiledPrompt.sid_spaces`` for INLINE,
-            None for PROJECTED.
+        sid_space_index: index into ``CompiledPrompt.sid_spaces`` for INLINE and
+            attached slots, None for PROJECTED.
+        attach_to: the INLINE body slot an attached slot adds onto, else None.
     """
 
     slot_id: int
@@ -130,6 +131,7 @@ class SlotSeg:
     fill: FillMode
     width: Width
     sid_space_index: Optional[int] = None
+    attach_to: Optional[str] = None
 
 
 Segment = Union[Static, SlotSeg]
@@ -151,6 +153,8 @@ class PromptPlan:
         projected_slots: PROJECTED occurrences in emission order, which is also
             ascending hole position; nothing may reorder them by slot id or by
             shared module, because the serving scatter is positional.
+        attached_slots: slots added onto an INLINE SID run; they take no
+            positions and have no holes.
     """
 
     segments: Tuple[Segment, ...]
@@ -161,6 +165,7 @@ class PromptPlan:
     logits_suffix_len: Optional[int]
     static_prefix_len: int
     projected_slots: Tuple[SlotSeg, ...]
+    attached_slots: Tuple[SlotSeg, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,9 +176,10 @@ class ProjectionPlan:
         projections: resolved module id to its configuration.
         slot_to_module: slot id to the module id it uses, so slots sharing a
             ``projection_name`` resolve to one module.
-        feature_groups: one derived group per PROJECTED slot. Derived rather
-            than declared: a prompt group is never shared with a model tower,
-            and four of FeatureGroupConfig's six fields are meaningless here.
+        feature_groups: one derived group per PROJECTED or attached slot.
+            Derived rather than declared: a prompt group is never shared with a
+            model tower, and four of FeatureGroupConfig's six fields are
+            meaningless here.
     """
 
     projections: Mapping[str, PromptProjection]

@@ -33,6 +33,7 @@ from tzrec.models.model import BaseModel
 from tzrec.modules.embedding import EmbeddingGroup
 from tzrec.modules.prompt_projection import PromptProjection
 from tzrec.prompt.assembler import (
+    ATTACH_POSITIONS,
     CU_SEQLENS,
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
@@ -173,7 +174,8 @@ class BaseGenRecModel(BaseModel):
         """One module per resolved id, aligned with ``prompt_plan.projected_slots``.
 
         Slots sharing a ``projection_name`` share a module by reference, so
-        they must agree on ``group_total_dim``.
+        they must agree on ``group_total_dim``. An attached slot's module has a
+        zero final Linear, so the model starts from its unattached outputs.
         """
         prompt_plan = self._prompt.prompt_plan
         projection_plan = self._prompt.projection_plan
@@ -197,8 +199,22 @@ class BaseGenRecModel(BaseModel):
                     f"{in_dim}); they cannot share a module."
                 )
             aligned_modules.append(modules_by_id[module_id])
+        attach_modules: List[PromptProjection] = []
+        for seg in prompt_plan.attached_slots:
+            module_id = projection_plan.slot_to_module[seg.slot_id]
+            module = PromptProjection(
+                projection_plan.projections[module_id],
+                self.embedding_group.group_total_dim(seg.name + seg.output_key),
+                hidden_size,
+            )
+            nn.init.zeros_(module.head.weight)
+            if module.head.bias is not None:
+                nn.init.zeros_(module.head.bias)
+            modules_by_id[module_id] = module
+            attach_modules.append(module)
         self.projections = nn.ModuleDict(modules_by_id)
         self._slot_projections = aligned_modules
+        self._attach_projections = attach_modules
 
     def hf_backbone(self) -> nn.Module:
         """The HF module export and checkpointing reach for."""
@@ -210,7 +226,7 @@ class BaseGenRecModel(BaseModel):
         return self._prompt
 
     def build_input(self, batch: Batch) -> torch.Tensor:
-        """Build packed LM input embeddings and fill projected positions.
+        """Build packed LM input embeddings, fill projected positions, add attachments.
 
         Args:
             batch: carries the packed prompt in ``additional_infos``.
@@ -218,21 +234,32 @@ class BaseGenRecModel(BaseModel):
         Returns:
             ``(total_tokens, hidden_size)``.
         """
-        ids = batch.additional_infos[INPUT_IDS]
-        embeds = self.lm.get_input_embeddings()(ids)
-        if not self._prompt.prompt_plan.projected_slots:
+        infos = batch.additional_infos
+        embeds = self.lm.get_input_embeddings()(infos[INPUT_IDS])
+        prompt_plan = self._prompt.prompt_plan
+        if not prompt_plan.projected_slots and not prompt_plan.attached_slots:
             return embeds
-        projected = project_slots(
-            self.embedding_group,
-            self._prompt.prompt_plan,
-            self._slot_projections,
-            batch,
-            embeds.shape[-1],
-        )
-        # out of place: embeds carries grad from the embedding lookup
-        return embeds.index_copy(
-            0, batch.additional_infos[HOLE_POSITIONS], projected.to(embeds.dtype)
-        )
+        # one lookup: a pipelined sharded embedding runs once per batch
+        grouped = self.embedding_group(batch)
+        if prompt_plan.projected_slots:
+            projected = project_slots(
+                grouped, prompt_plan, self._slot_projections, embeds.shape[-1]
+            )
+            # out of place: embeds carries grad from the embedding lookup
+            embeds = embeds.index_copy(
+                0, infos[HOLE_POSITIONS], projected.to(embeds.dtype)
+            )
+        if prompt_plan.attached_slots:
+            sides = []
+            for seg, proj in zip(prompt_plan.attached_slots, self._attach_projections):
+                assert seg.sid_space_index is not None
+                num_levels = self._prompt.sid_spaces[seg.sid_space_index].num_levels
+                side = proj(grouped[seg.name + seg.output_key])
+                sides.append(side.repeat_interleave(num_levels, dim=0))
+            embeds = embeds.index_add(
+                0, infos[ATTACH_POSITIONS], torch.cat(sides).to(embeds.dtype)
+            )
+        return embeds
 
     def _tokens_to_local_codes(
         self, tokens: torch.Tensor, batch_size: int
@@ -323,26 +350,23 @@ class BaseGenRecModel(BaseModel):
 
 
 def project_slots(
-    embedding_group: EmbeddingGroup,
+    grouped: Dict[str, torch.Tensor],
     prompt_plan: PromptPlan,
     slot_projections: Sequence[nn.Module],
-    batch: Batch,
     hidden_size: int,
 ) -> torch.Tensor:
-    """Look every projected slot up and project it into the LM input space.
+    """Project every looked-up projected slot into the LM input space.
 
     Args:
-        embedding_group: the model's prompt groups.
+        grouped: the model's prompt groups, already looked up.
         prompt_plan: fixes the slot order.
         slot_projections: one module per projected slot, in the same order.
-        batch: the batch to look up.
         hidden_size: the LM hidden size.
 
     Returns:
         ``(total_holes, hidden_size)`` in the order the assembler records holes:
         projected occurrence first, then sample.
     """
-    grouped = embedding_group(batch)
     parts = [
         proj(grouped[seg.name + seg.output_key]).reshape(-1, hidden_size)
         for seg, proj in zip(prompt_plan.projected_slots, slot_projections)
@@ -370,6 +394,11 @@ class GenRecFrontEnd(nn.Module):
 
     def __init__(self, model: BaseGenRecModel) -> None:
         super().__init__()
+        if model._prompt.prompt_plan.attached_slots:
+            raise ValueError(
+                "attached prompt slots are not part of the serving contract: "
+                "slot_embeds only fills hole_positions."
+            )
         if acc_utils.is_aot() or acc_utils.is_trt() or env_util.use_rtp():
             raise ValueError(
                 "the genrec front-end is exported with TorchScript only: its "
@@ -417,10 +446,9 @@ class GenRecFrontEnd(nn.Module):
         }
         if self._prompt.prompt_plan.projected_slots:
             out[SLOT_EMBEDS] = project_slots(
-                self.embedding_group,
+                self.embedding_group(batch),
                 self._prompt.prompt_plan,
                 self._slot_projections,
-                batch,
                 self._hidden_size,
             )
         else:

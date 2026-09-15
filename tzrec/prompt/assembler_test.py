@@ -10,11 +10,13 @@
 # limitations under the License.
 
 import unittest
+from dataclasses import replace
 
 import numpy as np
 import torch
 
 from tzrec.prompt.assembler import (
+    ATTACH_POSITIONS,
     CU_SEQLENS,
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
@@ -453,6 +455,65 @@ class PromptAssemblerTest(unittest.TestCase):
         scripted = torch.jit.script(module)
         for key, value in scripted(batch).items():
             self.assertTrue(torch.equal(eager[key], value), key)
+
+    def _attached_plan(self) -> PromptPlan:
+        plan = _plan(
+            (
+                Static((7,)),
+                _slot("hist", FillMode.INLINE),
+                _slot("beh", FillMode.PROJECTED, 4),
+            ),
+        )
+        attr = replace(
+            _slot("attr", FillMode.PROJECTED, 2, ("ta", "tb"), slot_id=2),
+            sid_space_index=0,
+            attach_to="hist",
+        )
+        return replace(plan, attached_slots=(attr,))
+
+    def _attached_batch(self) -> dict:
+        return {
+            "hist.values": torch.tensor([1, 6, 11, 0, 4, 8, 2, 7, 10]),
+            "hist.lengths": torch.tensor([3, 6]),
+            "beh.values": torch.tensor([7, 8, 9]),
+            "beh.lengths": torch.tensor([2, 1]),
+            "ta.values": torch.tensor([1, 2, 3]),
+            "ta.lengths": torch.tensor([1, 2]),
+            "tb.values": torch.tensor([4, 5, 6]),
+            "tb.lengths": torch.tensor([1, 2]),
+        }
+
+    def test_attached_slot_exports_its_sid_run_positions(self) -> None:
+        plan = self._attached_plan()
+        batch = self._attached_batch()
+        out = PromptAssembler(plan, (_sid_space(),), _SENTINEL)(batch)
+        plain = PromptAssembler(
+            replace(plan, attached_slots=()), (_sid_space(),), _SENTINEL
+        )(batch)
+
+        # sample 0: [7, h, h, h, S, S]   sample 1: [7, h x 6, S]
+        self.assertEqual(out[ATTACH_POSITIONS].tolist(), [1, 2, 3, 7, 8, 9, 10, 11, 12])
+        self.assertEqual(set(out), set(plain) | {ATTACH_POSITIONS})
+        for key, value in plain.items():
+            self.assertTrue(torch.equal(out[key], value), key)
+        sid_tokens = out[INPUT_IDS][out[ATTACH_POSITIONS]]
+        self.assertTrue(bool(torch.all(sid_tokens >= _BASE_VOCAB_SIZE)))
+        self.assertTrue(bool(torch.all(sid_tokens < _BASE_VOCAB_SIZE + 12)))
+        scripted = torch.jit.script(PromptAssembler(plan, (_sid_space(),), _SENTINEL))
+        for key, value in scripted(batch).items():
+            self.assertTrue(torch.equal(out[key], value), key)
+
+    def test_attached_slot_item_count_must_match_its_sid_run(self) -> None:
+        batch = self._attached_batch()
+        batch["tb.lengths"] = torch.tensor([2, 1])
+        asm = PromptAssembler(self._attached_plan(), (_sid_space(),), _SENTINEL)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"attached prompt slot \[attr\] member \[tb\] has 2 items at row 0, "
+            r"but its SID run has 3 tokens; expected 3 tokens per item",
+        ):
+            asm(batch)
 
 
 if __name__ == "__main__":

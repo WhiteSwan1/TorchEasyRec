@@ -13,16 +13,23 @@ import hashlib
 import json
 import os
 import unittest
+from dataclasses import replace
 
 from google.protobuf import text_format
+from parameterized import parameterized
 from tokenizers import Tokenizer
 
 from tzrec.features.feature import FgMode, create_features
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.types import FillMode, SlotSeg, Static, WidthKind
 from tzrec.protos import feature_pb2
+from tzrec.protos.model_pb2 import FeatureGroupType
 from tzrec.protos.prompt_pb2 import PromptConfig
-from tzrec.utils.test_util import create_genrec_test_tokenizer, make_test_dir
+from tzrec.utils.test_util import (
+    create_genrec_test_tokenizer,
+    make_test_dir,
+    parameterized_name_func,
+)
 
 _WORDS = ["History", "Profile", "Predict", ":", ".", "Histor0", "<unk>", "<|im_end|>"]
 
@@ -33,6 +40,17 @@ _PROF = (
     "num_buckets: 768 embedding_dim: 16 sequence_length: 4 }"
 )
 _AGE = 'id_feature { feature_name: "age" expression: "user:age" num_buckets: 8 }'
+_HIST12 = (
+    'sequence_raw_feature { feature_name: "hist" expression: "user:hist" '
+    "sequence_length: 12 }"
+)
+
+
+def _attr(name: str, sequence_length: int = 4) -> str:
+    return (
+        f'sequence_id_feature {{ feature_name: "{name}" expression: "user:{name}" '
+        f"num_buckets: 8 embedding_dim: 4 sequence_length: {sequence_length} }}"
+    )
 
 
 def _feature(text: str):
@@ -486,6 +504,106 @@ class CompilePromptTest(unittest.TestCase):
         seg = next(s for s in compiled.prompt_plan.segments if isinstance(s, SlotSeg))
         self.assertIs(seg.width.kind, WidthKind.BOUNDED)
         self.assertEqual(seg.width.num_positions, 16)
+
+    def _attach_config(self, prompt="History : {{hist}} . Profile : {{prof}}"):
+        cfg = self._config(prompt=prompt)
+        self._add_hist_and_answer_spaces(cfg, (4, 4, 4))
+        return cfg
+
+    def _attach_features(self):
+        return [
+            _feature(_HIST12),
+            _feature(_PROF),
+            _feature(_AGE),
+            _feature(_attr("ta")),
+            _feature(_attr("tb")),
+            _feature(_attr("tlong", 5)),
+            _feature(_attr("tnocap", 0)),
+        ]
+
+    def test_attached_slot_adds_a_group_and_no_positions(self) -> None:
+        features = self._attach_features()
+        plain = self._compile(self._attach_config(), features)
+        cfg = self._attach_config()
+        slot = cfg.slots.add(name="hist_attr", attach_to="hist")
+        slot.feature_names.extend(["ta", "tb"])
+        slot.projection.bias = True
+        attached = self._compile(cfg, features)
+
+        (seg,) = attached.prompt_plan.attached_slots
+        self.assertEqual(seg.name, "hist_attr")
+        self.assertEqual(seg.attach_to, "hist")
+        self.assertEqual(seg.feature_names, ("ta", "tb"))
+        self.assertEqual(seg.group_type, FeatureGroupType.JAGGED_SEQUENCE)
+        self.assertEqual(seg.output_key, ".sequence")
+        self.assertEqual(seg.sid_space_index, 0)
+        self.assertEqual(seg.slot_id, 3)
+        groups = attached.projection_plan.feature_groups
+        self.assertEqual([g.group_name for g in groups], ["prof", "hist_attr"])
+        self.assertEqual(list(groups[1].feature_names), ["ta", "tb"])
+        self.assertEqual(attached.projection_plan.slot_to_module[3], "hist_attr")
+        # everything the unattached compile produced is unchanged
+        self.assertEqual(
+            replace(attached.prompt_plan, attached_slots=()), plain.prompt_plan
+        )
+        self.assertEqual(plain.prompt_plan.attached_slots, ())
+        self.assertEqual(
+            replace(
+                attached,
+                prompt_plan=plain.prompt_plan,
+                projection_plan=plain.projection_plan,
+            ),
+            plain,
+        )
+
+    @parameterized.expand(
+        [
+            ["in_template", "{{hist_attr}}", "hist", ["ta"], True, "", "appear in"],
+            ["projected_target", "", "prof", ["ta"], True, "", "not an INLINE"],
+            ["response_target", "", "answer", ["ta"], True, "", "not an INLINE"],
+            ["unknown_target", "", "ghost", ["ta"], True, "", "not an INLINE"],
+            ["no_projection", "", "hist", ["ta"], False, "", "requires projection"],
+            ["scalar", "", "hist", ["age"], True, "", "embedded sequence"],
+            ["no_embedding", "", "hist", ["hist"], True, "", "embedded sequence"],
+            ["no_members", "", "hist", [], True, "", "embedded sequence"],
+            ["unknown_feature", "", "hist", ["nope"], True, "", "not in"],
+            ["too_long", "", "hist", ["ta", "tlong"], True, "", "<= 4"],
+            ["no_cap", "", "hist", ["tnocap"], True, "", "<= 4"],
+            ["shared", "", "hist", ["ta"], True, "shared", "projection_name"],
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_rejects_an_invalid_attached_slot(
+        self, _, extra, attach_to, members, projection, projection_name, error
+    ) -> None:
+        cfg = self._attach_config("History : {{hist}} . Profile : {{prof}}" + extra)
+        slot = cfg.slots.add(name="hist_attr", attach_to=attach_to)
+        slot.feature_names.extend(members)
+        if projection:
+            slot.projection.bias = True
+        if projection_name:
+            slot.projection_name = projection_name
+        with self.assertRaisesRegex(ValueError, error):
+            self._compile(cfg, self._attach_features())
+
+    def test_rejects_a_template_slot_sharing_an_attached_projection(self) -> None:
+        cfg = self._attach_config()
+        cfg.slots.add(name="prof", projection_name="hist_attr").feature_names.append(
+            "prof"
+        )
+        slot = cfg.slots.add(name="hist_attr", attach_to="hist")
+        slot.feature_names.append("ta")
+        slot.projection.bias = True
+        with self.assertRaisesRegex(ValueError, "projection_name"):
+            self._compile(cfg, self._attach_features())
+
+    def test_rejects_an_attach_target_used_twice(self) -> None:
+        cfg = self._attach_config("History : {{hist}} {{hist}}")
+        slot = cfg.slots.add(name="hist_attr", attach_to="hist")
+        slot.feature_names.append("ta")
+        slot.projection.bias = True
+        with self.assertRaisesRegex(ValueError, "used exactly once"):
+            self._compile(cfg, [_feature(_HIST12), _feature(_attr("ta"))])
 
 
 if __name__ == "__main__":

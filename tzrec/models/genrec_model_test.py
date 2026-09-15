@@ -28,6 +28,7 @@ from tzrec.models.genrec_model import (
 )
 from tzrec.models.model import ScriptWrapper, TrainWrapper
 from tzrec.prompt.assembler import (
+    ATTACH_POSITIONS,
     HOLE_POSITIONS,
     HOLE_SLOT_COUNTS,
     INPUT_IDS,
@@ -295,10 +296,9 @@ class GenRecFrontEndTest(unittest.TestCase):
         )
         batch = self.wrapped.get_batch(self.data)
         expected = project_slots(
-            self.model.embedding_group,
+            self.model.embedding_group(batch),
             compiled.prompt_plan,
             self.model._slot_projections,
-            batch,
             int(self.model.lm.config.hidden_size),
         )
         self.assertTrue(torch.allclose(out[SLOT_EMBEDS], expected))
@@ -344,6 +344,91 @@ class GenRecFrontEndTest(unittest.TestCase):
                 self.assertTrue(torch.allclose(out[key], value), key)
             else:
                 self.assertTrue(torch.equal(out[key], value), key)
+
+
+class GenRecAttachedSlotTest(unittest.TestCase):
+    """A slot added onto the history SID tokens through a zero-initialized map."""
+
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir()
+        self.plain, plain_prompt = create_genrec_test_model(self.test_dir)
+        slot = PromptSlot(
+            name="hist_attr", feature_names=["ta", "tb"], attach_to="hist"
+        )
+        slot.projection.bias = True
+        self.attached, attached_prompt = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("ta", 8), _projected("tb", 4)],
+            slots=[slot],
+        )
+        init_parameters(self.attached, device=torch.device("cpu"))
+        self.attached.lm.load_state_dict(self.plain.lm.state_dict())
+        parsed = {
+            "hist.values": torch.tensor(_LONG_HIST_CODES),
+            "hist.lengths": torch.tensor([6]),
+            "answer.values": torch.tensor(_ANSWER_CODES),
+            "answer.lengths": torch.tensor([3]),
+        }
+        self.plain_batch = _batch(plain_prompt, parsed)
+        attributes = {
+            "ta.values": torch.tensor([3, 9]),
+            "ta.lengths": torch.tensor([2]),
+            "tb.values": torch.tensor([1, 4]),
+            "tb.lengths": torch.tensor([2]),
+        }
+        self.attached_batch = _batch(
+            attached_prompt,
+            parsed | attributes,
+            sparse=KeyedJaggedTensor.from_lengths_sync(
+                keys=["ta", "tb"],
+                values=torch.tensor([3, 9, 1, 4]),
+                lengths=torch.tensor([2, 2]),
+            ),
+        )
+
+    def test_attached_projection_is_created_zero_initialized(self) -> None:
+        proj = self.attached.projections["hist_attr"]
+        self.assertEqual(list(self.attached.projections), ["hist_attr"])
+        self.assertIs(self.attached._attach_projections[0], proj)
+        self.assertEqual(self.attached._slot_projections, [])
+        self.assertEqual(proj.head.in_features, 12)
+        self.assertFalse(bool(proj.head.weight.any()))
+        self.assertFalse(bool(proj.head.bias.any()))
+
+    def test_input_is_unchanged_until_the_projection_moves(self) -> None:
+        expected = self.plain.build_input(self.plain_batch)
+        infos = self.attached_batch.additional_infos
+        self.assertTrue(
+            torch.equal(infos[INPUT_IDS], self.plain_batch.additional_infos[INPUT_IDS])
+        )
+        self.assertTrue(
+            torch.equal(self.attached.build_input(self.attached_batch), expected)
+        )
+
+        with torch.no_grad():
+            self.attached.projections["hist_attr"].head.weight.fill_(0.5)
+        embeds = self.attached.build_input(self.attached_batch)
+        changed = ~torch.isclose(embeds, expected).all(dim=-1)
+        self.assertEqual(
+            changed.nonzero().flatten().tolist(), infos[ATTACH_POSITIONS].tolist()
+        )
+        self.assertEqual(infos[ATTACH_POSITIONS].numel(), len(_LONG_HIST_CODES))
+
+    def test_training_forward_with_an_attached_slot_survives_fx_tracing(self) -> None:
+        torch.fx.symbolic_trace(TrainWrapper(self.attached))
+
+    def test_front_end_rejects_attached_slots(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not part of the serving contract"):
+            GenRecFrontEnd(self.attached)
+
+    def test_zero_init_keeps_logits_and_trains_the_projection(self) -> None:
+        expected = self.plain.predict(self.plain_batch)
+        predictions = self.attached.predict(self.attached_batch)
+        self.assertTrue(torch.equal(predictions["logits"], expected["logits"]))
+        loss = self.attached.loss(predictions, self.attached_batch)["ce_loss"]
+        loss.backward()
+        head = self.attached.projections["hist_attr"].head
+        self.assertGreater(float(head.weight.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":

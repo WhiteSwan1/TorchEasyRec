@@ -328,7 +328,12 @@ def compile_prompt(
         The compiled prompt.
     """
     features_by_name = {feature.name: feature for feature in features}
-    declared_slots_by_name = {slot.name: slot for slot in cfg.slots}
+    declared_slots_by_name = {
+        slot.name: slot for slot in cfg.slots if not slot.HasField("attach_to")
+    }
+    attached_slots_by_name = {
+        slot.name: slot for slot in cfg.slots if slot.HasField("attach_to")
+    }
 
     body_runs, body_names = _split_template(cfg.prompt)
     resp_runs, resp_names = _split_template(cfg.response or "")
@@ -354,6 +359,23 @@ def compile_prompt(
         raise ValueError(
             f"declared prompt slots {sorted(unreferenced)} are never referenced "
             f"by a {{{{name}}}} placeholder."
+        )
+    placed_attached = sorted(set(attached_slots_by_name) & set(body_names + resp_names))
+    if placed_attached:
+        raise ValueError(
+            f"attached prompt slots {placed_attached} appear in the template; an "
+            "attached slot adds onto its attach_to run and takes no positions."
+        )
+    projection_names = {slot.projection_name for slot in cfg.slots}
+    shared_attached = sorted(
+        name
+        for name, slot in attached_slots_by_name.items()
+        if slot.projection_name or name in projection_names
+    )
+    if shared_attached:
+        raise ValueError(
+            f"attached prompt slots {shared_attached} own a zero-initialized "
+            "projection and cannot share one through projection_name."
         )
 
     response_slot_names = set(resp_names)
@@ -495,13 +517,23 @@ def compile_prompt(
 
     body = _build_template_segments(body_runs, body_names, segs, tok)
     response = _build_template_segments(resp_runs, resp_names, segs, tok)
+    attached = _build_attached_slots(
+        attached_slots_by_name,
+        features_by_name,
+        body_names,
+        segs,
+        sid_spaces,
+        len(slot_ids),
+    )
 
     projected = tuple(
         s
         for s in body + response
         if isinstance(s, SlotSeg) and s.fill is FillMode.PROJECTED
     )
-    projection_plan = _build_projection_plan(projected, resolved_slots_by_name)
+    projection_plan = _build_projection_plan(
+        projected + attached, {**resolved_slots_by_name, **attached_slots_by_name}
+    )
 
     plan = PromptPlan(
         segments=body,
@@ -512,6 +544,7 @@ def compile_prompt(
         logits_suffix_len=_suffix_keep(response),
         static_prefix_len=_static_prefix_len(body),
         projected_slots=projected,
+        attached_slots=attached,
     )
     _validate(plan)
 
@@ -545,6 +578,77 @@ def _build_template_segments(
         if index < len(slot_names):
             segments.append(slot_segments_by_name[slot_names[index]])
     return tuple(segments)
+
+
+def _build_attached_slots(
+    slots_by_name: Dict[str, PromptSlot],
+    features_by_name: Dict[str, BaseFeature],
+    body_names: Sequence[str],
+    slot_segments_by_name: Dict[str, SlotSeg],
+    sid_spaces: Sequence[ResolvedSidSpace],
+    first_slot_id: int,
+) -> Tuple[SlotSeg, ...]:
+    """Resolve the slots that add a projected vector onto every SID token.
+
+    Their slot ids follow the template slots', so a plan without attached
+    slots keeps every id it had.
+    """
+    attached: List[SlotSeg] = []
+    for index, (name, slot) in enumerate(slots_by_name.items()):
+        target = slot_segments_by_name.get(slot.attach_to)
+        if (
+            target is None
+            or target.fill is not FillMode.INLINE
+            or body_names.count(slot.attach_to) != 1
+        ):
+            raise ValueError(
+                f"prompt slot [{name}] attaches to [{slot.attach_to}], which is "
+                "not an INLINE SID placeholder used exactly once in the prompt body."
+            )
+        missing = [n for n in slot.feature_names if n not in features_by_name]
+        if missing:
+            raise ValueError(
+                f"prompt slot [{name}] names {missing}, which are not in "
+                "feature_configs."
+            )
+        members = [features_by_name[n] for n in slot.feature_names]
+        if not members or not all(m.is_sequence and m.has_embedding for m in members):
+            raise ValueError(
+                f"attached prompt slot [{name}] must list only embedded sequence "
+                f"features, got {list(slot.feature_names)}."
+            )
+        if not slot.HasField("projection"):
+            raise ValueError(f"attached prompt slot [{name}] requires projection.")
+        assert target.sid_space_index is not None
+        num_levels = sid_spaces[target.sid_space_index].num_levels
+        if target.width.kind is not WidthKind.UNBOUNDED:
+            assert target.width.num_positions is not None
+            max_items = target.width.num_positions // num_levels
+            too_long = [
+                m.name
+                for m in members
+                if not m.sequence_length or m.sequence_length > max_items
+            ]
+            if too_long:
+                raise ValueError(
+                    f"attached prompt slot [{name}] members {too_long} need a "
+                    f"sequence_length <= {max_items}, one element per SID item of "
+                    f"[{slot.attach_to}]."
+                )
+        attached.append(
+            SlotSeg(
+                slot_id=first_slot_id + index,
+                name=name,
+                feature_names=tuple(slot.feature_names),
+                group_type=FeatureGroupType.JAGGED_SEQUENCE,
+                output_key=".sequence",
+                fill=FillMode.PROJECTED,
+                width=_slot_width(members, FeatureGroupType.JAGGED_SEQUENCE),
+                sid_space_index=target.sid_space_index,
+                attach_to=slot.attach_to,
+            )
+        )
+    return tuple(attached)
 
 
 def _build_projection_plan(

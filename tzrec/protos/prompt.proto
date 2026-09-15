@@ -47,6 +47,11 @@ message PromptSlot {
     // Weight-sharing key across slots. Derived groups dedupe automatically;
     // modules share only on request.
     optional string projection_name = 4;
+    // Name of a body INLINE SID slot. The slot then lists only sequence
+    // features with one element per SID item, never appears in the template,
+    // requires projection, and adds its zero-initialized projection onto every
+    // SID token of the matching item instead of taking positions.
+    optional string attach_to = 5;
 }
 
 // An optional body plus a final bare Linear to the LM hidden size. The final
