@@ -139,7 +139,77 @@ of the step cannot be optimised — only reduced, by fewer tokens, fewer paramet
 With 60% saturated and attention at 7%, even an infinitely fast attention kernel caps out
 at a 7% step improvement.
 
-## 6. Where the remaining headroom is
+## 6. How to reduce the GEMM time
+
+GEMM runs at about 90% of peak (section 5), so the only lever is fewer FLOPs. FLOPs are
+linear in token count, and the MLP carries most of them:
+
+| component                       | share of linear FLOPs |
+| ------------------------------- | --------------------: |
+| MLP (gate/up/down, 896x4864x3)  |             **87.7%** |
+| attention projections (QKV + O) |                 12.3% |
+
+MLP width is fixed by the Qwen2.5-0.5B backbone, so the practical levers are token count
+and numeric precision.
+
+### 6.1 Prompt length — measured -15.5%
+
+The static prompt is 71 tokens (58 before the history slot, 13 after), identical in every
+row of every step of a 184,200-step run.
+
+|                    |  mean row |          step |       peak |
+| ------------------ | --------: | ------------: | ---------: |
+| current JHK prompt | 422.9 tok |     233.38 ms | 20,147 MiB |
+| prompt removed     | 351.9 tok | **197.19 ms** | 18,051 MiB |
+| delta              |    -16.8% |    **-15.5%** |     -10.4% |
+
+Step time tracks token count almost exactly (-16.8% tokens gives -15.5% time), which is
+GEMM dominance restated. This is a config-string change and is about 6x larger than the
+FA3 gain. It changes the task, so it needs an HR check before adoption; trimming the
+instruction to roughly 10 tokens keeps most of the win with less semantic change.
+
+### 6.2 Batch size — measured up to +13.2% throughput
+
+FA2 leaves 76 GB of the 96 GB card unused at batch 20.
+
+| batch |      step |       peak |                throughput |
+| ----: | --------: | ---------: | ------------------------: |
+|    20 | 233.77 ms | 20,147 MiB |              36,181 tok/s |
+|    40 | 403.09 ms | 31,275 MiB |      38,959 tok/s (+7.7%) |
+|    60 | 644.85 ms | 47,397 MiB |     40,530 tok/s (+12.0%) |
+|    80 | 747.16 ms | 54,232 MiB | **40,944 tok/s (+13.2%)** |
+
+Most of the gain lands by batch 40-60. This does not reduce GEMM time per token; it
+amortises the length-invariant optimizer and improves GEMM shapes. It also changes the
+global batch (20 x 32 GPUs = 640), so either accept that, or hold the global batch and run
+fewer GPUs — batch 60 on 11 GPUs is about the same 640, which is a cost saving rather than
+a speed win.
+
+### 6.3 FP8 — the only lever that halves GEMM
+
+H20 FP8 tensor cores are about 296 TFLOP/s, 2x BF16. With GEMM at 60% of the step and
+already at 90% of BF16 peak, FP8 is the largest theoretical lever: up to about 30% off the
+step. It is also the most work — torchao `float8` or TransformerEngine, plus numerical
+validation that deserves care, given FP32 masters were chosen deliberately to avoid
+bf16-ULP underflow in Adam's small updates.
+
+### 6.4 Shared-prefix compute — about 13%, keeps the prompt
+
+The 58 tokens before the history slot produce identical hidden states in every row, because
+causal attention prevents them from seeing the history. They are currently computed once
+per row. Computing them once per batch and letting every row attend to that shared KV would
+remove 19 x 58 = 1,102 of 8,460 tokens, about 13%. Same magnitude as trimming the prompt,
+but it preserves the prompt's semantics; the cost is implementing it inside the packed
+varlen layout. Worth it only if the HR check says the prompt has to stay.
+
+### 6.5 What does not help
+
+- **Better attention kernels.** 7% of the step, already collected by FA2.
+- **`torch.compile`.** It targets the cast/copy and elementwise buckets, not GEMM FLOPs.
+- **Gradient checkpointing.** It *adds* GEMM time by recomputing. With 76 GB spare there is
+  no reason to pay it.
+
+## 7. Where the remaining headroom is
 
 1. **`cast/copy`, 14.1% — twice attention.** These are the autocast bf16 \<-> fp32
    conversions caused by `lm_parameter_dtype: FP32` under BF16 mixed precision. The proto
@@ -152,7 +222,7 @@ at a 7% step improvement.
    at every length) because it scales with parameter count, not tokens.
 1. **Attention, 7%.** Already collected by FA2. FA3 adds 2.5%.
 
-## 7. Recommendation
+## 8. Recommendation
 
 - **Adopt FA2.** 1.92x and -36% peak memory at production batch 20, with a pinned wheel
   already in `requirements/cu129.txt`.
@@ -162,8 +232,10 @@ at a 7% step improvement.
   later is a one-line config change.
 - **Revisit FA3 if sequences grow.** Its advantage doubles from 743 to 2048 tokens.
 - **Next target is not attention.** It is the 14% cast/copy bucket.
+- **For GEMM itself, see section 6.** The prompt-length arm is measured at -15.5% and
+  costs nothing but an HR check; FP8 is the only lever that halves it.
 
-## 8. Reproduce
+## 9. Reproduce
 
 ```bash
 FD=<dir containing the flash_attn 2 wheel>
@@ -176,7 +248,7 @@ PYTHONPATH=.:$FD python -m tzrec.tools.genrec_attn_kernel_bench \
     --sequence-length 3000 --max-length 4096 --hist-scale 2.95
 ```
 
-## 9. Caveats
+## 10. Caveats
 
 - **Sequences above 897 tokens are manufactured.** Real JHK data maxes at 897. The 1022 and
   2048 points repeat each row's own real SID codes (`--hist-scale`), so the codes and the
