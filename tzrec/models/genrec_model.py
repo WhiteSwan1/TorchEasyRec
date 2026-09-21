@@ -56,6 +56,7 @@ _PARAM_DTYPE: Dict[int, torch.dtype] = {
 _ATTN_KERNEL: Dict[int, str] = {
     GenRecModelConfig.SDPA: "sdpa",
     GenRecModelConfig.FLASH_ATTENTION_2: "flash_attention_2",
+    GenRecModelConfig.FLASH_ATTENTION_3: "flash_attention_3",
 }
 
 _REQUIRED_LM_ATTRS: Tuple[str, ...] = (

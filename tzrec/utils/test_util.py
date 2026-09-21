@@ -68,6 +68,10 @@ flash_attn_unavailable: Tuple[bool, str] = (
     importlib.util.find_spec("flash_attn") is None,
     "flash_attn wheel is not installed (required for GenRec packed attention)",
 )
+flash_attn_3_unavailable: Tuple[bool, str] = (
+    importlib.util.find_spec("flash_attn_interface") is None,
+    "flash_attn_3 is not installed (required for GenRec packed attention on Hopper)",
+)
 
 
 def get_compare_tolerance(

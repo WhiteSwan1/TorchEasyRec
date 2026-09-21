@@ -39,6 +39,14 @@ from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos.model_pb2 import ModelConfig
 from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 
+# kernels that read cu_seq_lens; every other kernel is handed left-padded rows
+_PACKED_KERNELS = frozenset(
+    {
+        GenRecModelConfig.FLASH_ATTENTION_2,
+        GenRecModelConfig.FLASH_ATTENTION_3,
+    }
+)
+
 
 class GenRecCausalLMModel(BaseGenRecModel):
     """An HF causal LM driven by a compiled prompt.
@@ -173,7 +181,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
                 SDPBackend.MATH,
             ]
         ):
-            if self._attn_kernel == GenRecModelConfig.FLASH_ATTENTION_2:
+            if self._attn_kernel in _PACKED_KERNELS:
                 logits = self._packed_logits(embeds, batch, keep)
             else:
                 logits = self._padded_logits(embeds, batch, suffix)

@@ -31,6 +31,7 @@ from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
 from tzrec.utils.test_util import (
     create_genrec_test_model,
     create_genrec_test_prompt,
+    flash_attn_3_unavailable,
     flash_attn_unavailable,
     make_test_dir,
     mark_ci_scope,
@@ -364,6 +365,17 @@ class FlashAttentionRowIsolationTest(_RowIsolationCase, unittest.TestCase):
     device = torch.device("cuda")
     attn_kernel = GenRecModelConfig.FLASH_ATTENTION_2
     # the flash kernel takes fp16/bf16 only, and this arm carries no autocast
+    lm_parameter_dtype = GenRecModelConfig.BF16
+
+
+@mark_ci_scope("gpu")
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_3_unavailable)
+class FlashAttention3RowIsolationTest(_RowIsolationCase, unittest.TestCase):
+    """The same packing through the Hopper kernel, which reads cu_seq_lens too."""
+
+    device = torch.device("cuda")
+    attn_kernel = GenRecModelConfig.FLASH_ATTENTION_3
     lm_parameter_dtype = GenRecModelConfig.BF16
 
 

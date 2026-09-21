@@ -25,11 +25,13 @@ message GenRecModelConfig {
     // bf16 compute comes from mixed_precision, not from this.
     optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
 
-    // FLASH_ATTENTION_2 is what training should use; it needs the flash_attn
-    // wheel and a GPU. SDPA runs anywhere.
+    // The FLASH_ATTENTION_* kernels are what training should use: both take the
+    // packed varlen layout, so neither pays for padding. _2 needs the flash_attn
+    // wheel; _3 needs flash_attn_3 and Hopper or newer. SDPA runs anywhere.
     enum AttnKernel {
         SDPA = 0;
         FLASH_ATTENTION_2 = 1;
+        FLASH_ATTENTION_3 = 2;
     }
     optional AttnKernel attn_kernel = 6 [default = SDPA];
 }
