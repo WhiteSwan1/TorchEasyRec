@@ -93,9 +93,12 @@ def _build_model(
     lm_config.common.lm_parameter_dtype = GenRecModelConfig.ParamDtype.Value(args.dtype)
     lm_config.common.attn_kernel = attn_kernel
 
-    model = _create_model(
-        model_config, features, [args.label_field], compiled_prompt=compiled_prompt
-    )
+    # same draw for every kernel, so the reported losses are comparable
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(args.seed)
+        model = _create_model(
+            model_config, features, [args.label_field], compiled_prompt=compiled_prompt
+        )
     return model.to(device), compiled_prompt
 
 
