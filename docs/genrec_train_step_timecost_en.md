@@ -9,22 +9,22 @@ At the **real JHK sequence length, attention is 7.0% of the training step** — 
 The 12.4% figure is the 2048-token stress point, not production. After PR #663 packs the
 forward, the step is dominated by the linear layers (60%), and attention is a small slice.
 
-| what | at real JHK length (max 743) | at 2048 |
-| --- | ---: | ---: |
-| attention share of step (FA2) | **7.0%** | **12.4%** |
-| FA3 gain over FA2, end to end | **+2.5%** | **+5.0%** |
-| FA2 gain over SDPA, end to end | **1.92x** | **2.55x** |
+| what                           | at real JHK length (max 743) |   at 2048 |
+| ------------------------------ | ---------------------------: | --------: |
+| attention share of step (FA2)  |                     **7.0%** | **12.4%** |
+| FA3 gain over FA2, end to end  |                    **+2.5%** | **+5.0%** |
+| FA2 gain over SDPA, end to end |                    **1.92x** | **2.55x** |
 
 ## Setup
 
-| | |
-| --- | --- |
-| GPU | 1x NVIDIA H20 96GB (SM 9.0), driver 580.95.05 |
-| Stack | torch 2.13.0+cu129, transformers 5.17.0, FA2 2.8.3.post1, FA3 3.0.0 (built from `hopper/`) |
-| Model | `GenRecCausalLMModel` over Qwen2.5-0.5B: hidden 896, 24 layers, 14 Q heads / 2 KV heads (GQA 7:1), head_dim 64, intermediate 4864, vocab resized to 152,448 |
-| Config | JHK: codebook 256x256x256, `max_length` 1024, `batch_size` 20, `lm_parameter_dtype: FP32` + BF16 autocast |
-| Data | `jhk_top300_nan_repro_20260827/samples/full/*.parquet`, real `item_list_with_sid` / `single_label` |
-| Optimizer | `torch.optim.AdamW` unfused (see Caveats) |
+|           |                                                                                                                                                             |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GPU       | 1x NVIDIA H20 96GB (SM 9.0), driver 580.95.05                                                                                                               |
+| Stack     | torch 2.13.0+cu129, transformers 5.17.0, FA2 2.8.3.post1, FA3 3.0.0 (built from `hopper/`)                                                                  |
+| Model     | `GenRecCausalLMModel` over Qwen2.5-0.5B: hidden 896, 24 layers, 14 Q heads / 2 KV heads (GQA 7:1), head_dim 64, intermediate 4864, vocab resized to 152,448 |
+| Config    | JHK: codebook 256x256x256, `max_length` 1024, `batch_size` 20, `lm_parameter_dtype: FP32` + BF16 autocast                                                   |
+| Data      | `jhk_top300_nan_repro_20260827/samples/full/*.parquet`, real `item_list_with_sid` / `single_label`                                                          |
+| Optimizer | `torch.optim.AdamW` unfused (see Caveats)                                                                                                                   |
 
 Assembled length = 71 static prompt tokens + history codes + 3 label codes.
 
@@ -32,37 +32,37 @@ Assembled length = 71 static prompt tokens + history codes + 3 label codes.
 
 ### Batch sweep, real JHK length
 
-| batch | pad waste | SDPA | FA2 | FA3 | SDPA peak | FA2 peak | FA3 peak |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10 | 53.4% | 213.21 ms | 103.42 | **101.71** | 18,107.5 MiB | 11,918.4 | 11,918.4 |
-| 20 | 43.1% | 448.84 ms | 233.39 | **227.71** | 31,515.2 MiB | 20,147.2 | 20,147.2 |
-| 40 | 50.0% | 920.43 ms | 402.75 | **393.29** | 58,939.5 MiB | 31,274.2 | 31,274.1 |
+| batch | pad waste |      SDPA |    FA2 |        FA3 |    SDPA peak | FA2 peak | FA3 peak |
+| ----: | --------: | --------: | -----: | ---------: | -----------: | -------: | -------: |
+|    10 |     53.4% | 213.21 ms | 103.42 | **101.71** | 18,107.5 MiB | 11,918.4 | 11,918.4 |
+|    20 |     43.1% | 448.84 ms | 233.39 | **227.71** | 31,515.2 MiB | 20,147.2 | 20,147.2 |
+|    40 |     50.0% | 920.43 ms | 402.75 | **393.29** | 58,939.5 MiB | 31,274.2 | 31,274.1 |
 
 FA2 vs SDPA: 2.06x / 1.92x / 2.29x. FA3 vs FA2: +1.68% / +2.49% / +2.41%.
 **FA3 saves no memory at all** — identical to FA2 to within 0.1 MiB.
 
 ### Length sweep, batch 20
 
-| max_len | mean_len | pad waste | SDPA | FA2 | FA3 | FA3 vs FA2 |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 743 (real) | 423 | 43.1% | 449.16 ms | 233.84 | 228.22 | **+2.46%** |
-| 1022 | 568 | 44.4% | 634.47 ms | 303.40 | 294.91 | **+2.88%** |
-| 2048 | 1102 | 46.2% | 1486.69 ms | 582.43 | 554.94 | **+4.95%** |
+|    max_len | mean_len | pad waste |       SDPA |    FA2 |    FA3 | FA3 vs FA2 |
+| ---------: | -------: | --------: | ---------: | -----: | -----: | ---------: |
+| 743 (real) |      423 |     43.1% |  449.16 ms | 233.84 | 228.22 | **+2.46%** |
+|       1022 |      568 |     44.4% |  634.47 ms | 303.40 | 294.91 | **+2.88%** |
+|       2048 |     1102 |     46.2% | 1486.69 ms | 582.43 | 554.94 | **+4.95%** |
 
 Peak memory: SDPA 31.5 / 40.9 / **76.8 GB** (close to OOM on a 96 GB card),
 FA2 and FA3 both 20.1 / 24.7 / **41.1 GB**.
 
 ## 2. Stage breakdown (FA2, batch 20)
 
-| stage | at 743 | share | at 2048 | share |
-| --- | ---: | ---: | ---: | ---: |
-| forward total | 73.51 ms | 31.2% | 187.91 ms | 32.1% |
-| &nbsp;&nbsp;`build_input` (embedding group + prompt projection) | 0.11 ms | 0.0% | 0.16 ms | 0.0% |
-| &nbsp;&nbsp;backbone forward | 72.64 ms | 30.8% | 186.69 ms | 31.9% |
-| &nbsp;&nbsp;gather / labels / pad | 0.76 ms | 0.3% | 1.07 ms | 0.2% |
-| backward | 147.45 ms | **62.5%** | 381.85 ms | **65.3%** |
-| optimizer | 14.97 ms | 6.3% | 15.30 ms | 2.6% |
-| **TOTAL** | **235.93 ms** | | **585.06 ms** | |
+| stage                                                 |        at 743 |     share |       at 2048 |     share |
+| ----------------------------------------------------- | ------------: | --------: | ------------: | --------: |
+| forward total                                         |      73.51 ms |     31.2% |     187.91 ms |     32.1% |
+| ├ `build_input` (embedding group + prompt projection) |       0.11 ms |      0.0% |       0.16 ms |      0.0% |
+| ├ backbone forward                                    |      72.64 ms |     30.8% |     186.69 ms |     31.9% |
+| └ gather / labels / pad                               |       0.76 ms |      0.3% |       1.07 ms |      0.2% |
+| backward                                              |     147.45 ms | **62.5%** |     381.85 ms | **65.3%** |
+| optimizer                                             |      14.97 ms |      6.3% |      15.30 ms |      2.6% |
+| **TOTAL**                                             | **235.93 ms** |           | **585.06 ms** |           |
 
 Two things to read off this:
 
@@ -76,28 +76,28 @@ Two things to read off this:
 
 ### At real JHK length (max_len 743, batch 20)
 
-| bucket | SDPA | FA2 | FA3 |
-| --- | ---: | ---: | ---: |
-| gemm (linear) | 233.74 ms (52.8%) | **136.58 (60.1%)** | 136.67 (61.6%) |
-| cast/copy | 61.15 ms (13.8%) | **32.06 (14.1%)** | 32.27 (14.5%) |
-| elementwise | 41.91 ms (9.5%) | **23.75 (10.4%)** | 23.13 (10.4%) |
-| **attention** | **82.14 ms (18.5%)** | **15.91 (7.0%)** | **10.78 (4.9%)** |
-| optimizer | 13.43 ms (3.0%) | 13.43 (5.9%) | 13.42 (6.0%) |
-| norm/act | 7.85 ms (1.8%) | 3.75 (1.6%) | 3.75 (1.7%) |
-| other | 2.42 ms | 1.72 | 1.73 |
-| softmax / CE | 0.18 ms | 0.17 | 0.18 |
-| embedding | 0.05 ms | 0.06 | 0.06 |
+| bucket        |                 SDPA |                FA2 |              FA3 |
+| ------------- | -------------------: | -----------------: | ---------------: |
+| gemm (linear) |    233.74 ms (52.8%) | **136.58 (60.1%)** |   136.67 (61.6%) |
+| cast/copy     |     61.15 ms (13.8%) |  **32.06 (14.1%)** |    32.27 (14.5%) |
+| elementwise   |      41.91 ms (9.5%) |  **23.75 (10.4%)** |    23.13 (10.4%) |
+| **attention** | **82.14 ms (18.5%)** |   **15.91 (7.0%)** | **10.78 (4.9%)** |
+| optimizer     |      13.43 ms (3.0%) |       13.43 (5.9%) |     13.42 (6.0%) |
+| norm/act      |       7.85 ms (1.8%) |        3.75 (1.6%) |      3.75 (1.7%) |
+| other         |              2.42 ms |               1.72 |             1.73 |
+| softmax / CE  |              0.18 ms |               0.17 |             0.18 |
+| embedding     |              0.05 ms |               0.06 |             0.06 |
 
 ### At 2048
 
-| bucket | SDPA | FA2 | FA3 |
-| --- | ---: | ---: | ---: |
-| gemm (linear) | 630.15 ms (42.4%) | 344.38 (59.6%) | 344.56 (62.6%) |
+| bucket        |                  SDPA |               FA2 |              FA3 |
+| ------------- | --------------------: | ----------------: | ---------------: |
+| gemm (linear) |     630.15 ms (42.4%) |    344.38 (59.6%) |   344.56 (62.6%) |
 | **attention** | **547.46 ms (36.9%)** | **71.95 (12.4%)** | **45.89 (8.3%)** |
-| cast/copy | 159.95 ms (10.8%) | 76.37 (13.2%) | 76.23 (13.9%) |
-| elementwise | 107.26 ms (7.2%) | 58.80 (10.2%) | 57.26 (10.4%) |
-| norm/act | 21.60 ms (1.5%) | 9.60 (1.7%) | 9.60 (1.7%) |
-| optimizer | 13.42 ms (0.9%) | 13.45 (2.3%) | 13.44 (2.4%) |
+| cast/copy     |     159.95 ms (10.8%) |     76.37 (13.2%) |    76.23 (13.9%) |
+| elementwise   |      107.26 ms (7.2%) |     58.80 (10.2%) |    57.26 (10.4%) |
+| norm/act      |       21.60 ms (1.5%) |       9.60 (1.7%) |      9.60 (1.7%) |
+| optimizer     |       13.42 ms (0.9%) |      13.45 (2.3%) |     13.44 (2.4%) |
 
 **FA3 changes exactly one row.** Every other bucket matches FA2 to within 0.2 ms.
 
@@ -105,11 +105,11 @@ Two things to read off this:
 
 FA2 vs FA3 attention kernel time, batch 20, max_len 743:
 
-| | FA2 | FA3 | speedup |
-| --- | ---: | ---: | ---: |
-| forward | 4.425 ms | 2.649 ms | **1.67x** |
+|          |       FA2 |      FA3 |   speedup |
+| -------- | --------: | -------: | --------: |
+| forward  |  4.425 ms | 2.649 ms | **1.67x** |
 | backward | 11.504 ms | 8.133 ms | **1.41x** |
-| total | 15.93 ms | 10.78 ms | **1.48x** |
+| total    |  15.93 ms | 10.78 ms | **1.48x** |
 
 Backward is **72% of attention time**, and that is where FA3 gains least. At 2048 the
 attention speedup improves to 1.57x (71.95 -> 45.89 ms).
@@ -141,16 +141,16 @@ at a 7% step improvement.
 
 ## 6. Where the remaining headroom is
 
-1. **`cast/copy`, 14.1% — twice attention.** These are the autocast bf16 <-> fp32
+1. **`cast/copy`, 14.1% — twice attention.** These are the autocast bf16 \<-> fp32
    conversions caused by `lm_parameter_dtype: FP32` under BF16 mixed precision. The proto
    comment records FP32 as deliberate (it avoids bf16-ULP underflow of Adam's small
    updates), so this is a real accuracy trade — but 14% of every step is dtype conversion.
    An accuracy-vs-throughput test of BF16 parameters is the single largest available win.
-2. **`elementwise`, 10.4%.** RoPE, residual adds, masking. A fusion pass or
+1. **`elementwise`, 10.4%.** RoPE, residual adds, masking. A fusion pass or
    `torch.compile` on the decoder block targets this.
-3. **`optimizer`, 6.3% at 743 but 2.6% at 2048.** It is length-invariant (13.4 ms of CUDA
+1. **`optimizer`, 6.3% at 743 but 2.6% at 2048.** It is length-invariant (13.4 ms of CUDA
    at every length) because it scales with parameter count, not tokens.
-4. **Attention, 7%.** Already collected by FA2. FA3 adds 2.5%.
+1. **Attention, 7%.** Already collected by FA2. FA3 adds 2.5%.
 
 ## 7. Recommendation
 
