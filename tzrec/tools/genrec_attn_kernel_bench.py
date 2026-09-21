@@ -161,10 +161,29 @@ def _read_rows(
         table.num_rows, size=batch_size, replace=False
     )
     table = table.take(index)
-    return (
-        table.column(args.hist_feature).to_pylist(),
-        table.column(args.label_field).to_pylist(),
-    )
+    hist_rows = table.column(args.hist_feature).to_pylist()
+    if args.hist_scale != 1.0:
+        hist_rows = [_scale_row(row, args.hist_scale) for row in hist_rows]
+    return hist_rows, table.column(args.label_field).to_pylist()
+
+
+def _scale_row(row: List[int], scale: float) -> List[int]:
+    """Lengthen one history by repeating its own codes.
+
+    Sequence length is a property of the dataset, so sweeping past what the
+    samples carry means manufacturing it. Repeating a row keeps the codes and
+    the relative raggedness of the batch real and moves only the length.
+
+    Args:
+        row: the row's offset SID codes.
+        scale: multiplier on the row's length.
+
+    Returns:
+        List[int]: the lengthened row, still a whole number of SID tuples.
+    """
+    target = max(3, int(round(len(row) * scale)) // 3 * 3)
+    repeats = -(-target // max(1, len(row)))
+    return (row * repeats)[:target]
 
 
 def _time_steps(
@@ -297,6 +316,12 @@ def main() -> None:
     parser.add_argument("--codebook", default="256,256,256")
     parser.add_argument("--vocab-pad-to-multiple-of", type=int, default=128)
     parser.add_argument("--sequence-length", type=int, default=900)
+    parser.add_argument(
+        "--hist-scale",
+        type=float,
+        default=1.0,
+        help="lengthen each history by repeating its own codes, to sweep length",
+    )
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--beam-widths", default="50,50,50")
     parser.add_argument("--num-return-sequences", type=int, default=50)
