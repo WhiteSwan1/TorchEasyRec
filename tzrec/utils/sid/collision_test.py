@@ -21,10 +21,10 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     KnnCollisionResolver,
     PriorOccupancy,
-    RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
+    generate_random_candidate_last_codes,
     prepare_collision_plan,
     sid_bucket_keys,
     sid_offset_codes,
@@ -107,8 +107,6 @@ class CollisionTest(unittest.TestCase):
     def test_resolvers_reject_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             KnnCollisionResolver(progress_interval=0)
-        with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
-            RandomCollisionResolver(num_candidates=1, progress_interval=0)
 
     def test_golden_candidate_resolution(self) -> None:
         item_ids = np.arange(10, dtype=np.int64)
@@ -261,80 +259,16 @@ class CollisionTest(unittest.TestCase):
 
     def test_random_candidate_golden_draws(self) -> None:
         item_ids = np.asarray([0, 1], dtype=np.int64)
-        actual = RandomCollisionResolver(
-            num_candidates=3
-        )._generate_candidate_last_codes(item_ids, last_size=4)
-        capped = RandomCollisionResolver(
-            num_candidates=10
-        )._generate_candidate_last_codes(item_ids, last_size=4)
+        actual = generate_random_candidate_last_codes(item_ids, 4, 3)
+        capped = generate_random_candidate_last_codes(item_ids, 4, 10)
 
         expected = [[1, 2, 0], [2, 0, 2]]
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(capped, expected)
 
-    def test_random_resolution_golden(self) -> None:
-        plan = _plan((4,), 1, [0, 1, 2], [[0], [0], [3]])
-
-        result = RandomCollisionResolver(num_candidates=3).resolve(plan)
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0, 2, 3])
-        np.testing.assert_array_equal(result.slot_indices, [1, 1, 1])
-        np.testing.assert_array_equal(result.unresolved_rows, [])
-        np.testing.assert_array_equal(result.final_bucket_keys, [0, 2, 3])
-        np.testing.assert_array_equal(result.final_bucket_counts, [1, 1, 1])
-        self.assertEqual(result.stats.raw_collision_buckets, 1)
-        self.assertEqual(result.stats.final_collision_buckets, 0)
-        self.assertEqual(result.stats.relocated_count, 1)
-
-    def test_random_rejects_external_candidates(self) -> None:
-        plan = _plan((2,), 1, [0], [[0]])
-
-        with self.assertRaisesRegex(ValueError, "does not accept candidate_codes"):
-            RandomCollisionResolver(num_candidates=1).resolve(
-                plan, np.empty((0, 1), dtype=np.int64)
-            )
-
-    def test_random_no_overflow_supports_single_code_space(self) -> None:
-        plan = _plan((1,), 1, [0], [[0]])
-
-        result = RandomCollisionResolver(num_candidates=1).resolve(
-            plan, collect_grouping=False
-        )
-
-        np.testing.assert_array_equal(result.resolved_last_codes, [0])
-        np.testing.assert_array_equal(result.final_bucket_keys, [])
-        self.assertFalse(result.grouping_collected)
-
-    def test_random_candidate_exhaustion_keeps_original(self) -> None:
-        plan = _plan((2,), 1, [0, 1], [[0], [0]])
-
-        # The overflow item's single deterministic draw is its origin code.
-        resolver = RandomCollisionResolver(num_candidates=1)
-        grouped = resolver.resolve(plan)
-        rate_only = resolver.resolve(plan, collect_grouping=False)
-
-        np.testing.assert_array_equal(grouped.resolved_last_codes, [0, 0])
-        np.testing.assert_array_equal(grouped.unresolved_rows, [1])
-        self.assertEqual(grouped.stats.final_collision_buckets, 1)
-        self.assertEqual(grouped.stats.max_final_bucket_size, 2)
-        _assert_same_assignments(self, rate_only, grouped)
-        self.assertFalse(rate_only.grouping_collected)
-
-    @parameterized.expand(
-        [("zero", 0), ("negative", -1)],
-        name_func=parameterized_name_func,
-    )
-    def test_random_rejects_invalid_num_candidates(
-        self, _case_name, num_candidates
-    ) -> None:
-        with self.assertRaisesRegex(ValueError, "num_candidates must be >= 1"):
-            RandomCollisionResolver(num_candidates=num_candidates)
-
     def test_random_rejects_single_code_space(self) -> None:
-        one_code_plan = _plan((1,), 1, [0, 1], [[0], [0]])
-
         with self.assertRaisesRegex(ValueError, "last_size >= 2"):
-            RandomCollisionResolver(num_candidates=1).resolve(one_code_plan)
+            generate_random_candidate_last_codes(np.asarray([1]), 1, 1)
 
     @parameterized.expand(
         [
@@ -427,7 +361,7 @@ class CollisionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "int64"):
             CollisionResolutionConfig((2**32, 2**32), 1)
 
-    def test_band_key_near_int64_limit(self) -> None:
+    def test_prefix_key_near_int64_limit(self) -> None:
         layer_size = 3_037_000_499
         plan = _plan(
             (layer_size, layer_size),
@@ -438,7 +372,7 @@ class CollisionTest(unittest.TestCase):
 
         np.testing.assert_array_equal(plan.bucket_keys, [layer_size**2 - 1])
 
-    def test_grouping_includes_untouched_bands(self) -> None:
+    def test_grouping_includes_untouched_prefixes(self) -> None:
         plan = _plan(
             (3, 4), 2, [0, 1, 2, 3, 4], [[0, 0], [0, 0], [0, 0], [1, 0], [2, 1]]
         )
@@ -446,9 +380,9 @@ class CollisionTest(unittest.TestCase):
 
         result = KnnCollisionResolver().resolve(plan, candidates)
 
-        # Bands 1 (key 4) and 2 (key 9) hold no overflow row; they must still
+        # Prefixes 1 (key 4) and 2 (key 9) hold no overflow row; they must still
         # appear in the grouping output with their original counts, and the
-        # relocation must add band-0 key 1.
+        # relocation must add prefix-0 key 1.
         np.testing.assert_array_equal(result.final_bucket_keys, [0, 1, 4, 9])
         np.testing.assert_array_equal(result.final_bucket_counts, [2, 1, 1, 1])
         self.assertEqual(result.stats.relocated_count, 1)
@@ -459,7 +393,7 @@ class CollisionTest(unittest.TestCase):
         )
         self.assertEqual(rate_only.stats, result.stats)
 
-    def test_three_layer_sparse_band_relocation(self) -> None:
+    def test_three_layer_sparse_prefix_relocation(self) -> None:
         plan = _plan(
             (2, 3, 4),
             2,
@@ -487,7 +421,7 @@ class CollisionTest(unittest.TestCase):
 
     def test_rate_only_matches_grouping_with_unplaceable(self) -> None:
         # One unplaceable overflow (its only candidate equals the origin) keeps
-        # bucket (0, 0) over capacity, alongside an untouched band (1, 0). The
+        # bucket (0, 0) over capacity, alongside an untouched prefix (1, 0). The
         # rate-only branch must report the same collision stats as the grouping
         # branch -- those numbers are exactly what --rate_only exists to compute.
         plan = _plan((2, 2), 1, [0, 1, 2], [[0, 0], [0, 0], [1, 0]])
@@ -561,13 +495,13 @@ class PriorOccupancyTest(unittest.TestCase):
             prior.counts_for(np.asarray([9, 0, 5, 100, 2])), [2, 0, 4, 0, 1]
         )
 
-    def test_restrict_to_bands_keeps_only_requested_bands(self) -> None:
-        # last_size 4 -> band 0 spans keys 0..3, band 2 spans keys 8..11.
+    def test_restrict_to_prefixes_keeps_only_requested_prefixes(self) -> None:
+        # last_size 4 -> prefix 0 spans keys 0..3, prefix 2 spans keys 8..11.
         prior = _prior([0, 3, 5, 9, 11, 12], [1, 2, 3, 4, 5, 6])
-        restricted = prior.restrict_to_bands(np.asarray([2, 0]), 4)
+        restricted = prior.restrict_to_prefixes(np.asarray([2, 0]), 4)
         np.testing.assert_array_equal(restricted.bucket_keys, [0, 3, 9, 11])
         np.testing.assert_array_equal(restricted.bucket_counts, [1, 2, 4, 5])
-        self.assertTrue(prior.restrict_to_bands(np.asarray([7]), 4).is_empty)
+        self.assertTrue(prior.restrict_to_prefixes(np.asarray([7]), 4).is_empty)
 
 
 class AppendPlanTest(unittest.TestCase):
@@ -608,8 +542,8 @@ class AppendPlanTest(unittest.TestCase):
         self.assertEqual(result.stats.unresolved_count, 1)
         self.assertEqual(int(result.slot_indices[0]), 4)
 
-    def test_relocation_sees_prior_only_buckets_in_the_band(self) -> None:
-        # Key 0 is full, and key 1 -- in the same band but holding no new row --
+    def test_relocation_sees_prior_only_buckets_in_the_prefix(self) -> None:
+        # Key 0 is full, and key 1 -- in the same prefix but holding no new row --
         # is already full too. The only free candidate is key 2.
         plan = _plan((1, 4), 1, [10], [[0, 0]], prior=_prior([0, 1], [1, 1]))
         result = KnnCollisionResolver().resolve(

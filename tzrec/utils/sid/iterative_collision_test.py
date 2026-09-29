@@ -10,10 +10,12 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 import numpy as np
 from parameterized import parameterized
 
+from tzrec.utils.sid import iterative_collision
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
     KnnCollisionResolver,
@@ -51,7 +53,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.unresolved_rows, [])
         np.testing.assert_array_equal(result.final_bucket_counts, [1, 1])
 
-    def test_multi_round_arbitration_fills_item_vacancy(self) -> None:
+    def test_arbitration_prefers_earlier_candidate_positions(self) -> None:
         plan = _plan(
             (5,),
             1,
@@ -74,6 +76,42 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(iterative.stats.unresolved_count, 0)
         self.assertEqual(first_fit.stats.relocated_count, 1)
         self.assertEqual(first_fit.stats.unresolved_count, 1)
+
+    @parameterized.expand(
+        [("int64", np.int64), ("uint64", np.uint64)],
+        name_func=parameterized_name_func,
+    )
+    def test_origin_cap_limits_same_origin_proposals(self, _name, dtype) -> None:
+        plan = _plan((4,), 1, [0, 10, 20, 30], [[1], [1], [1], [1]])
+        np.testing.assert_array_equal(plan.overflow_rows, [0, 1, 2])
+        candidates = np.asarray([[1, 0], [3, 1], [0, 2]], dtype=dtype)
+
+        result = IterativeCollisionResolver().resolve(plan, candidates)
+
+        # Row 2 may not propose at position 0 behind row 1, so code 0 stays
+        # free for row 0, whose only other candidate is its origin.
+        np.testing.assert_array_equal(result.resolved_last_codes, [0, 3, 2, 1])
+        self.assertEqual(result.stats.unresolved_count, 0)
+
+    def test_uncommitted_acceptance_reopens_next_round(self) -> None:
+        plan = _plan((3,), 1, [0, 10, 20], [[0], [0], [0]])
+        np.testing.assert_array_equal(plan.overflow_rows, [1, 2])
+        candidates = np.asarray([[2, 1], [0, 1]], dtype=np.int64)
+
+        result = IterativeCollisionResolver().resolve(plan, candidates)
+
+        np.testing.assert_array_equal(result.resolved_last_codes, [0, 2, 1])
+        self.assertEqual(result.stats.unresolved_count, 0)
+
+    def test_slots_follow_round_then_candidate_position(self) -> None:
+        plan = _plan((3,), 2, [0, 10, 20, 30, 40, 50], [[0], [1], [0], [0], [0], [0]])
+        np.testing.assert_array_equal(plan.overflow_rows, [0, 4, 2])
+        candidates = np.asarray([[1, 1], [1, 2], [2, 1]], dtype=np.int64)
+
+        result = IterativeCollisionResolver().resolve(plan, candidates)
+
+        np.testing.assert_array_equal(result.resolved_last_codes, [1, 1, 2, 0, 2, 0])
+        np.testing.assert_array_equal(result.slot_indices, [2, 1, 2, 2, 1, 1])
 
     @parameterized.expand(
         [("top100", 100), ("top200", 200)],
@@ -127,7 +165,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
     def test_assignments_are_deterministic_under_input_reordering(
         self, _case_name, item_ids
     ) -> None:
-        codes = np.zeros((item_ids.size, 1), dtype=np.int64)
+        codes = (np.arange(item_ids.size, dtype=np.int64) % 3)[:, None]
 
         def assignments(order):
             ordered_ids = item_ids[order]
@@ -191,7 +229,7 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         self.assertEqual(int(result.slot_indices[0]), 4)
         np.testing.assert_array_equal(result.final_bucket_counts, [4, 1])
 
-    def test_append_multi_band_preserves_prior_only_destinations(self) -> None:
+    def test_append_multi_prefix_preserves_prior_only_destinations(self) -> None:
         plan = _plan(
             (2, 4),
             1,
@@ -223,6 +261,96 @@ class IterativeCollisionResolverTest(unittest.TestCase):
         np.testing.assert_array_equal(result.final_bucket_keys, [])
         np.testing.assert_array_equal(result.final_bucket_counts, [])
         self.assertEqual(result.stats.relocated_count, 1)
+
+    @parameterized.expand(
+        [
+            ("one_prefix_per_batch", 1, 1),
+            ("prefix_budget_binds", 16, 1 << 24),
+            ("row_budget_binds", 1 << 25, 8),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_prefix_batching_matches_single_batch(
+        self, _name, occupancy_cells, proposal_cells
+    ) -> None:
+        rng = np.random.default_rng(2026)
+        for trial in range(40):
+            layer_sizes = (rng.integers(1, 6), 8)
+            item_count = rng.integers(1, 200)
+            codes = np.stack(
+                [rng.integers(0, size, item_count) for size in layer_sizes], axis=1
+            )
+            plan = _plan(layer_sizes, rng.integers(1, 3), np.arange(item_count), codes)
+            candidates = rng.integers(0, 8, (plan.overflow_rows.size, 4))
+
+            batched = IterativeCollisionResolver().resolve(plan, candidates)
+            with (
+                mock.patch.object(
+                    iterative_collision, "_OCCUPANCY_CELLS", occupancy_cells
+                ),
+                mock.patch.object(
+                    iterative_collision, "_PROPOSAL_CELLS", proposal_cells
+                ),
+            ):
+                split = IterativeCollisionResolver().resolve(plan, candidates)
+
+            with self.subTest(trial=trial):
+                np.testing.assert_array_equal(
+                    split.resolved_last_codes, batched.resolved_last_codes
+                )
+                np.testing.assert_array_equal(split.slot_indices, batched.slot_indices)
+                np.testing.assert_array_equal(
+                    split.final_bucket_counts, batched.final_bucket_counts
+                )
+                self.assertEqual(split.stats, batched.stats)
+
+    def test_random_plans_keep_placement_invariants(self) -> None:
+        rng = np.random.default_rng(7)
+        for trial in range(100):
+            last_size = rng.integers(2, 9)
+            layer_sizes = (rng.integers(1, 4), last_size)
+            capacity = rng.integers(1, 3)
+            item_count = rng.integers(1, 60)
+            codes = np.stack(
+                [rng.integers(0, size, item_count) for size in layer_sizes], axis=1
+            )
+            plan = _plan(layer_sizes, capacity, np.arange(item_count), codes)
+            candidates = rng.integers(
+                0, last_size, (plan.overflow_rows.size, rng.integers(1, 5))
+            )
+
+            result = IterativeCollisionResolver().resolve(plan, candidates)
+
+            sids = codes.copy()
+            sids[:, -1] = result.resolved_last_codes
+            buckets, bucket_of_row, counts = np.unique(
+                sids, axis=0, return_inverse=True, return_counts=True
+            )
+            bucket_of_row = bucket_of_row.reshape(-1)
+            final_count = dict(zip(map(tuple, buckets.tolist()), counts.tolist()))
+            is_unresolved = np.zeros(item_count, dtype=bool)
+            is_unresolved[result.unresolved_rows] = True
+            with self.subTest(trial=trial):
+                for row, candidate_row in zip(
+                    plan.overflow_rows.tolist(), candidates.tolist()
+                ):
+                    origin = int(codes[row, -1])
+                    code = int(result.resolved_last_codes[row])
+                    if is_unresolved[row]:
+                        self.assertEqual(code, origin)
+                        for candidate in candidate_row:
+                            key = (*codes[row, :-1].tolist(), candidate)
+                            self.assertGreaterEqual(final_count.get(key, 0), capacity)
+                    else:
+                        self.assertNotEqual(code, origin)
+                        self.assertIn(code, candidate_row)
+                for bucket in range(buckets.shape[0]):
+                    slots = np.sort(result.slot_indices[bucket_of_row == bucket])
+                    np.testing.assert_array_equal(slots, np.arange(1, slots.size + 1))
+                    unresolved_here = np.count_nonzero(
+                        is_unresolved[bucket_of_row == bucket]
+                    )
+                    self.assertLessEqual(counts[bucket] - unresolved_here, capacity)
 
     def test_requires_candidates_for_overflow(self) -> None:
         plan = _plan((2,), 1, [10, 11], [[0], [0]])

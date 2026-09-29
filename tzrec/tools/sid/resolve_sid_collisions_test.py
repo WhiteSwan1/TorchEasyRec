@@ -26,7 +26,13 @@ from tzrec.tools.sid.resolve_sid_collisions import (
     ResolveSidCollisionsConfig,
 )
 from tzrec.utils.sid import bundle
-from tzrec.utils.sid.collision import stable_order_hash
+from tzrec.utils.sid.collision import (
+    CollisionResolutionConfig,
+    generate_random_candidate_last_codes,
+    prepare_collision_plan,
+    stable_order_hash,
+)
+from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 _PART_FILE = "part-0.parquet"
@@ -269,7 +275,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 f"non-dense index set for {codebook}",
             )
 
-    def test_candidate_reassigns_within_band(self) -> None:
+    def test_candidate_reassigns_within_prefix(self) -> None:
         stats, out = self._resolve(
             list(range(5)),
             [[0, 0]] * 5,
@@ -284,24 +290,27 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
 
-    def test_iterative_candidate_preserves_bundle_contract(self) -> None:
+    @parameterized.expand(
+        [("first_fit", "first_fit", 1, 1), ("iterative", "iterative", 2, 0)],
+        name_func=parameterized_name_func,
+    )
+    def test_placement_policy_selects_arbitration(
+        self, _name, placement_policy, expected_relocated, expected_unresolved
+    ) -> None:
         stats, out = self._resolve(
-            list(range(5)),
-            [[0]] * 5,
-            [[[1], [2], [3], [4]]] * 5,
+            [10, 11, 20, 21, 30],
+            [[0], [0], [1], [1], [2]],
+            [[[2], [3], [4]]] * 2 + [[[3], [2], [2]]] * 2 + [[[0], [0], [0]]],
             layer_sizes=(5,),
             max_items_per_codebook=1,
-            placement_policy="iterative",
+            placement_policy=placement_policy,
         )
 
-        self.assertEqual(stats.relocated_count, 4)
-        self.assertEqual(stats.unresolved_count, 0)
-        item_map = self._item_to_sid(out)
-        self.assertEqual(len(item_map["item_id"]), 5)
-        self.assertEqual(item_map["offset_codebook"], item_map["codebook"])
+        self.assertEqual(stats.relocated_count, expected_relocated)
+        self.assertEqual(stats.unresolved_count, expected_unresolved)
         self._assert_item_to_sid_matches_sid_to_items(out)
 
-    def test_three_layer_candidate_reassigns_within_band(self) -> None:
+    def test_three_layer_candidate_reassigns_within_prefix(self) -> None:
         stats, out = self._resolve(
             [0, 1, 2],
             [[0, 0, 0]] * 3,
@@ -462,7 +471,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ).to_pydict()
         self.assertEqual(resolved["codebook"], [[7, 2], [7, 10], [12, 1]])
 
-    def test_random_reassigns_within_band(self) -> None:
+    def test_random_reassigns_within_prefix(self) -> None:
         stats, out = self._resolve(
             list(range(5)), [[0, 0]] * 5, max_items_per_codebook=2, strategy="random"
         )
@@ -475,18 +484,37 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_iterative_random_sources_candidates_without_candidate_column(
         self,
     ) -> None:
+        item_ids = list(range(5))
+        codes = [[0]] * 5
+        plan = prepare_collision_plan(
+            np.asarray(item_ids),
+            np.asarray(codes, dtype=np.int64),
+            CollisionResolutionConfig((4,), 1),
+        )
+        expected = IterativeCollisionResolver().resolve(
+            plan,
+            generate_random_candidate_last_codes(plan.overflow_item_ids, 4, 2),
+        )
+
         stats, out = self._resolve(
-            list(range(5)),
-            [[0]] * 5,
-            layer_sizes=(16,),
+            item_ids,
+            codes,
+            layer_sizes=(4,),
             max_items_per_codebook=1,
             strategy="random",
             placement_policy="iterative",
-            random_num_candidates=15,
+            random_num_candidates=2,
         )
 
-        self.assertEqual(stats.relocated_count, 4)
-        self.assertEqual(stats.unresolved_count, 0)
+        self.assertEqual(stats, expected.stats)
+        item_map = self._item_to_sid(out)
+        self.assertEqual(
+            dict(zip(item_map["item_id"], item_map["codebook"])),
+            {
+                item_id: [int(code)]
+                for item_id, code in zip(item_ids, expected.resolved_last_codes)
+            },
+        )
         self._assert_item_to_sid_matches_sid_to_items(out)
 
     def test_single_layer_sid(self) -> None:
@@ -685,7 +713,16 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(resolved["codebook"], [[0, 0], [0, 1]])
         self.assertEqual(resolved["itemids"], [[0], [1]])
 
-    def test_parser_allows_rate_only_without_outputs(self) -> None:
+    @parameterized.expand(
+        [
+            ("default", [], "first_fit"),
+            ("iterative", ["--placement_policy", "iterative"], "iterative"),
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_parser_allows_rate_only_without_outputs(
+        self, _name, extra_args, expected_placement_policy
+    ) -> None:
         args = resolve_sid_collisions.build_parser().parse_args(
             [
                 "--input_path",
@@ -695,6 +732,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 "--max_items_per_codebook",
                 "2",
                 "--rate_only",
+                *extra_args,
             ]
         )
 
@@ -704,26 +742,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertIsNone(config.item_to_sid_root)
         self.assertIsNone(config.generation)
         self.assertEqual(config.progress_interval, 1_000_000)
-        self.assertEqual(config.placement_policy, "first_fit")
-
-    def test_parser_accepts_iterative_placement_policy(self) -> None:
-        args = resolve_sid_collisions.build_parser().parse_args(
-            [
-                "--input_path",
-                "input",
-                "--codebook",
-                "8,8",
-                "--max_items_per_codebook",
-                "2",
-                "--placement_policy",
-                "iterative",
-                "--rate_only",
-            ]
-        )
-
-        config = ResolveSidCollisionsConfig.from_namespace(args)
-
-        self.assertEqual(config.placement_policy, "iterative")
+        self.assertEqual(config.placement_policy, expected_placement_policy)
 
     def test_rejects_invalid_placement_policy(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported placement_policy"):
@@ -732,6 +751,16 @@ class ResolveSidCollisionsTest(unittest.TestCase):
     def test_rejects_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             self._runner("input", "map", progress_interval=0)
+
+    @parameterized.expand(
+        [("zero", 0), ("negative", -1)],
+        name_func=parameterized_name_func,
+    )
+    def test_rejects_invalid_random_num_candidates(
+        self, _case_name, random_num_candidates
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "random_num_candidates must be >= 1"):
+            self._runner("input", "map", random_num_candidates=random_num_candidates)
 
     def test_serving_set_stays_parquet_under_an_odps_writer_type(self) -> None:
         class OdpsWriter:
@@ -1120,7 +1149,13 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self._assert_dense_indices(out, "v2")
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 
-    def test_iterative_append_preserves_over_capacity_published_bucket(self) -> None:
+    @parameterized.expand(
+        [("first_fit", "first_fit"), ("iterative", "iterative")],
+        name_func=parameterized_name_func,
+    )
+    def test_append_preserves_over_capacity_published_bucket(
+        self, _name, placement_policy
+    ) -> None:
         out = os.path.join(self.test_dir, "out")
         self._seed_state(
             out,
@@ -1140,21 +1175,13 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[[0, 1], [0, 2]], [[0, 1], [0, 2]]],
         )
 
-        stats = self._append(inp, out, placement_policy="iterative")
+        stats = self._append(inp, out, placement_policy=placement_policy)
 
         self.assertEqual(stats.relocated_count, 2)
         merged = self._item_to_sid_rows(out, "v2")
         for item_id, row in published.items():
             self.assertEqual(merged[item_id], row)
-        groups = {
-            tuple(codebook): itemids
-            for codebook, itemids in zip(
-                self._sid_to_items(out, "v2")["codebook"],
-                self._sid_to_items(out, "v2")["itemids"],
-            )
-        }
-        self.assertEqual(groups[(0, 0)], [0, 1, 2])
-        self.assertEqual(len(groups[(0, 1)]), 2)
+        self.assertEqual({merged[10][1], merged[11][1]}, {(0, 1)})
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 
     def test_append_continues_slot_numbering(self) -> None:
@@ -1280,8 +1307,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different generations"):
             self._append(self._prepare_single(20), out, previous="v1", generation="v3")
 
-    def test_append_rejects_state_truncated_outside_touched_bands(self) -> None:
-        # Band 5 is untouched, so only the totals catch its missing bucket.
+    def test_append_rejects_state_truncated_outside_touched_prefixes(self) -> None:
+        # Prefix 5 is untouched, so only the totals catch its missing bucket.
         out = os.path.join(self.test_dir, "out")
         self._seed_state(
             out,

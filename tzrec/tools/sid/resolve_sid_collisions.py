@@ -34,7 +34,9 @@ item's origin, so an origin draw or a duplicate draw is not replaced.
 Candidate sourcing and placement are independent. ``--strategy`` selects
 model-provided or deterministic random candidates; ``--placement_policy``
 selects greedy ``first_fit`` placement or synchronous ``iterative`` proposal
-and arbitration rounds. The default remains ``first_fit``.
+and arbitration rounds, defaulting to ``first_fit``. ``iterative`` gives
+each contested bucket to the item that ranks it earliest, so it favors
+candidate proximity and can leave more items unresolved than ``first_fit``.
 
 Both item_to_sid and sid_to_items carry an ``offset_codebook`` column
 alongside ``codebook``: the same SID with each layer shifted into one
@@ -54,7 +56,7 @@ Example::
     python -m tzrec.tools.sid.resolve_sid_collisions \
         --input_path 'sid_predict_output/*.parquet' \
         --codebook 256,256,256 --max_items_per_codebook 5 \
-        --strategy candidate --placement_policy iterative \
+        --strategy candidate \
         --output_path sid_collision \
         --generation v1
 
@@ -120,16 +122,15 @@ from tzrec.utils.sid.collision import (
     CollisionResolver,
     KnnCollisionResolver,
     PriorOccupancy,
-    RandomCollisionResolver,
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
     generate_random_candidate_last_codes,
     lookup_sorted,
     prepare_collision_plan,
-    sid_band_ids,
     sid_bucket_keys,
     sid_offset_codes,
+    sid_prefix_ids,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
 
@@ -213,11 +214,11 @@ class ResolveSidCollisionsConfig:
     layer_sizes: Tuple[int, ...]
     max_items_per_codebook: int
     strategy: str
+    placement_policy: str
     random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
     from_generation: Optional[str] = None
-    placement_policy: str = "first_fit"
 
     def __post_init__(self) -> None:
         if self.batch_size < 1:
@@ -353,11 +354,6 @@ class CollisionResolutionRunner:
             self._resolver = IterativeCollisionResolver(
                 progress_interval=self._config.progress_interval
             )
-        elif self._config.strategy == "random":
-            self._resolver = RandomCollisionResolver(
-                self._config.random_num_candidates,
-                progress_interval=self._config.progress_interval,
-            )
         else:
             self._resolver = KnnCollisionResolver(
                 progress_interval=self._config.progress_interval
@@ -390,7 +386,7 @@ class CollisionResolutionRunner:
                 candidate_last_codes = self._load_candidate_last_codes(
                     plan.overflow_item_ids
                 )
-            elif self._config.placement_policy == "iterative":
+            else:
                 candidate_last_codes = generate_random_candidate_last_codes(
                     plan.overflow_item_ids,
                     plan.config.layer_sizes[-1],
@@ -675,13 +671,13 @@ class CollisionResolutionRunner:
         layer_sizes = self._config.layer_sizes
         prior, published_items = self._load_prior_occupancy(
             self._bundle.prior_sid_to_items_path,
-            sid_band_ids(codes, layer_sizes),
+            sid_prefix_ids(codes, layer_sizes),
             item_ids,
         )
         self._check_existing_item_to_sid_size(published_items)
         logger.info(
             "append mode: %d new items onto %d published items; %d published "
-            "buckets loaded from the bands this run touches, generation %s",
+            "buckets loaded from the prefixes this run touches, generation %s",
             item_ids.shape[0],
             published_items,
             prior.bucket_keys.shape[0],
@@ -733,11 +729,11 @@ class CollisionResolutionRunner:
             )
 
     def _load_prior_occupancy(
-        self, path: str, band_ids: np.ndarray, item_ids: np.ndarray
+        self, path: str, prefix_ids: np.ndarray, item_ids: np.ndarray
     ) -> Tuple[PriorOccupancy, int]:
-        """Read touched-band occupancy and item count from published sid_to_items."""
+        """Read touched-prefix occupancy and item count from published sid_to_items."""
         layer_sizes = self._config.layer_sizes
-        wanted_bands = np.unique(band_ids)
+        wanted_prefixes = np.unique(prefix_ids)
         new_item_ids = self._item_id_array(item_ids)
 
         key_chunks: List[np.ndarray] = []
@@ -772,7 +768,7 @@ class CollisionResolutionRunner:
                         flat_ids.filter(published).slice(0, 10).to_pylist()
                     )
 
-            _, keep = lookup_sorted(wanted_bands, keys // layer_sizes[-1])
+            _, keep = lookup_sorted(wanted_prefixes, keys // layer_sizes[-1])
             if np.any(keep):
                 key_chunks.append(keys[keep])
                 count_chunks.append(lengths[keep])
@@ -1278,7 +1274,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the SID collision-resolution command-line parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Resolve SID codebook collisions within each band on a best-effort "
+            "Resolve SID codebook collisions within each SID prefix on a best-effort "
             "basis; finite candidate sets may leave over-capacity buckets."
         )
     )

@@ -22,14 +22,19 @@ from tzrec.utils.sid.collision import (
     CollisionResolutionResult,
     CollisionResolutionStats,
     CollisionResolver,
+    concat_ranges,
     lookup_sorted,
     stable_order_hash,
 )
 
+_OCCUPANCY_CELLS = 1 << 25
+_PROPOSAL_CELLS = 1 << 24
+_INT64_MAX = np.iinfo(np.int64).max
+
 
 @dataclass(frozen=True)
-class _BandResolution:
-    """Assignments and final occupancy for one independently resolved band."""
+class _BatchResolution:
+    """Assignments and final occupancy for one batch of whole prefixes."""
 
     resolved_last_codes: np.ndarray
     slot_indices: np.ndarray
@@ -58,17 +63,32 @@ def _ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
 
 
 class IterativeCollisionResolver(CollisionResolver):
-    """Resolve overflow with deterministic SQL-inspired batch arbitration.
+    """Resolve overflow with deterministic synchronous batch arbitration.
 
-    Each SID prefix band is independent. In every round, non-full targets
-    receive proposals ordered by candidate priority and stable item identity.
-    A target accepts up to its remaining capacity, then each item commits only
-    its best accepted proposal. Vacancies from that per-item arbitration become
-    available in the next round.
+    Each SID prefix is independent. In every round, each unplaced
+    overflow row proposes to its candidates that still have room, except that
+    within one origin bucket only the first ``capacity`` rows (in stable item
+    order) with room at a candidate position propose at that position, which
+    bounds the proposals of large same-origin groups whose candidate lists are
+    near-identical. A target accepts up to its remaining capacity, ordered by
+    candidate position then stable item order, and each row commits only its
+    earliest-position accepted proposal. Slots accepted for a row that
+    committed elsewhere reopen in the next round. A row left with no candidate
+    that has room keeps its origin SID over capacity.
+
+    Acceptance favors candidate proximity: a bucket goes to the row that ranks
+    it earlier even when that row has other options, so this policy can leave
+    more rows unresolved than first-fit placement. Within a bucket, relocated
+    rows are numbered after its initial occupancy by round, candidate position
+    and stable item order.
 
     Published append-state items participate only through their occupancy. They
     are never proposal rows, so they cannot be moved, and an already
     over-capacity published bucket retains its complete count.
+
+    Prefixes are resolved in batches that share dense occupancy and run their
+    rounds together; a prefix that stops proposing never changes again, so the
+    result is the same as resolving each prefix alone.
     """
 
     def resolve(
@@ -91,13 +111,6 @@ class IterativeCollisionResolver(CollisionResolver):
         Raises:
             ValueError: If candidates are absent while overflow rows exist.
         """
-        if candidate_codes is None:
-            if plan.overflow_rows.size:
-                raise ValueError(
-                    "candidate_codes are required when the collision plan has "
-                    "overflow rows."
-                )
-            candidate_codes = np.empty((0, 0), dtype=np.int64)
         candidates = self._validate_candidate_last_codes(plan, candidate_codes)
         if plan.overflow_rows.size == 0:
             return self._build_no_overflow_result(plan, collect_grouping)
@@ -107,52 +120,57 @@ class IterativeCollisionResolver(CollisionResolver):
         combined_counts = prior_counts + plan.bucket_counts
         initial_counts = np.maximum(prior_counts, np.minimum(combined_counts, capacity))
         last_size = plan.config.layer_sizes[-1]
-        overflow_band_ids = np.unique(plan.overflow_bucket_key_prefixes // last_size)
-        _, in_overflow_band = lookup_sorted(
-            overflow_band_ids, plan.bucket_keys // last_size
-        )
 
         resolved_last_codes = plan.original_last_codes.copy()
         slot_indices = plan.initial_slot_indices.copy()
         unresolved_parts = []
-        final_band_counts: dict[int, int] = {}
-        order_hashes = stable_order_hash(plan.overflow_item_ids)
-        prefixes = plan.overflow_bucket_key_prefixes
-        band_starts = _run_starts(prefixes)
-        band_stops = np.append(band_starts[1:], prefixes.shape[0])
+        touched_key_parts = []
+        touched_count_parts = []
+        prefix_starts = _run_starts(plan.overflow_bucket_key_prefixes)
+        _, in_overflow_prefix = lookup_sorted(
+            plan.overflow_bucket_key_prefixes[prefix_starts] // last_size,
+            plan.bucket_keys // last_size,
+        )
+        prefix_stops = np.append(prefix_starts[1:], plan.overflow_rows.shape[0])
+        prefix_count = prefix_starts.shape[0]
+        batch_prefixes = max(1, _OCCUPANCY_CELLS // last_size)
+        batch_rows = max(1, _PROPOSAL_CELLS // max(1, candidates.shape[1]))
+        occupancy = np.zeros(
+            min(batch_prefixes, prefix_count) * last_size, dtype=np.int64
+        )
         progress = ProgressLogger(
             "Resolving collision overflow",
             start_n=0,
             miniters=self._progress_interval,
         )
 
-        for band_start, band_stop in zip(band_starts, band_stops):
-            start = int(band_start)
-            stop = int(band_stop)
-            band = self._resolve_band(
+        first_prefix = 0
+        while first_prefix < prefix_count:
+            start = int(prefix_starts[first_prefix])
+            end_prefix = int(
+                np.searchsorted(prefix_stops, start + batch_rows, side="right")
+            )
+            end_prefix = min(
+                max(end_prefix, first_prefix + 1), first_prefix + batch_prefixes
+            )
+            stop = int(prefix_stops[end_prefix - 1])
+            batch = self._resolve_batch(
                 plan,
                 initial_counts,
-                plan.overflow_rows[start:stop],
-                order_hashes[start:stop],
-                prefixes[start:stop],
-                plan.overflow_origin_last_codes[start:stop],
+                occupancy,
+                slice(start, stop),
                 candidates[start:stop],
             )
             rows = plan.overflow_rows[start:stop]
-            resolved_last_codes[rows] = band.resolved_last_codes
-            slot_indices[rows] = band.slot_indices
-            if band.unresolved_rows.size:
-                unresolved_parts.append(band.unresolved_rows)
-            final_band_counts.update(
-                zip(band.bucket_keys.tolist(), band.bucket_counts.tolist())
-            )
+            resolved_last_codes[rows] = batch.resolved_last_codes
+            slot_indices[rows] = batch.slot_indices
+            unresolved_parts.append(batch.unresolved_rows)
+            touched_key_parts.append(batch.bucket_keys)
+            touched_count_parts.append(batch.bucket_counts)
             progress.log(stop)
+            first_prefix = end_prefix
 
-        unresolved_rows = (
-            np.concatenate(unresolved_parts)
-            if unresolved_parts
-            else np.empty(0, dtype=np.int64)
-        )
+        unresolved_rows = np.concatenate(unresolved_parts)
         (
             final_bucket_keys,
             final_bucket_counts,
@@ -161,16 +179,17 @@ class IterativeCollisionResolver(CollisionResolver):
         ) = self._summarize_final_buckets(
             plan,
             initial_counts,
-            in_overflow_band,
-            final_band_counts,
+            in_overflow_prefix,
+            np.concatenate(touched_key_parts),
+            np.concatenate(touched_count_parts),
             collect_grouping,
         )
         stats = CollisionResolutionStats(
             total_items=plan.item_count,
             raw_collision_buckets=int((combined_counts > capacity).sum()),
             final_collision_buckets=final_collision_buckets,
-            relocated_count=int(plan.overflow_rows.size - unresolved_rows.size),
-            unresolved_count=int(unresolved_rows.size),
+            relocated_count=plan.overflow_rows.size - unresolved_rows.size,
+            unresolved_count=unresolved_rows.size,
             max_final_bucket_size=max_final_bucket_size,
         )
         return CollisionResolutionResult(
@@ -183,168 +202,157 @@ class IterativeCollisionResolver(CollisionResolver):
             stats=stats,
         )
 
-    def _resolve_band(
+    def _resolve_batch(
         self,
         plan: CollisionPlan,
         initial_counts: np.ndarray,
-        overflow_rows: np.ndarray,
-        item_ties: np.ndarray,
-        prefixes: np.ndarray,
-        origin_last_codes: np.ndarray,
+        occupancy: np.ndarray,
+        span: slice,
         candidates: np.ndarray,
-    ) -> _BandResolution:
-        """Resolve one nonempty prefix band through multi-round arbitration."""
+    ) -> _BatchResolution:
+        """Resolve a contiguous run of whole prefixes through shared rounds.
+
+        Buckets are addressed by a batch-local key, ``prefix position * last_size
+        + last code``, into ``occupancy``, which must be all zero on entry and
+        is zeroed again on return.
+
+        Args:
+            plan: Grouping and append-aware occupancy plan.
+            initial_counts: Capped per-bucket counts aligned with
+                ``plan.bucket_keys``.
+            occupancy: Reusable dense occupancy buffer of at least ``last_size``
+                cells per prefix in ``span``.
+            span: Slice of the overflow-aligned plan arrays covering whole
+                prefixes.
+            candidates: Int64 candidate last codes of the rows in ``span``.
+
+        Returns:
+            Per-row assignments in ``span`` order and the batch's final
+            occupancy keyed by global bucket key.
+
+        Raises:
+            ValueError: If the batch is too large to pack arbitration keys.
+        """
         capacity = plan.config.capacity
         last_size = plan.config.layer_sizes[-1]
-        prefix = int(prefixes[0])
-        occupancy = np.zeros(last_size, dtype=np.int64)
+        overflow_rows = plan.overflow_rows[span]
+        row_count = overflow_rows.shape[0]
+        prefix_starts = _run_starts(plan.overflow_bucket_key_prefixes[span])
+        prefix_count = prefix_starts.shape[0]
+        candidate_count = candidates.shape[1]
+        prefix_first_keys = plan.overflow_bucket_key_prefixes[span][prefix_starts]
+        prefix_positions = np.arange(prefix_count, dtype=np.int64)
+        key_bases = np.repeat(
+            prefix_positions * last_size, np.diff(np.append(prefix_starts, row_count))
+        )
+        origin_keys = key_bases + plan.overflow_origin_last_codes[span]
+        if prefix_count * last_size * candidate_count * row_count > _INT64_MAX:
+            raise ValueError(
+                f"{row_count} overflow rows with {candidate_count} candidates in "
+                "one prefix batch are too many to pack arbitration keys."
+            )
 
-        prior_start = int(np.searchsorted(plan.prior.bucket_keys, prefix))
-        prior_stop = int(np.searchsorted(plan.prior.bucket_keys, prefix + last_size))
-        prior_keys = plan.prior.bucket_keys[prior_start:prior_stop]
-        occupancy[prior_keys - prefix] = plan.prior.bucket_counts[
-            prior_start:prior_stop
-        ]
+        seeded_parts = []
+        for bucket_keys, bucket_counts in (
+            (plan.prior.bucket_keys, plan.prior.bucket_counts),
+            (plan.bucket_keys, initial_counts),
+        ):
+            starts = np.searchsorted(bucket_keys, prefix_first_keys)
+            lengths = (
+                np.searchsorted(bucket_keys, prefix_first_keys + last_size) - starts
+            )
+            selected = concat_ranges(starts, lengths)
+            owners = np.repeat(prefix_positions, lengths)
+            keys = (
+                owners * last_size + bucket_keys[selected] - prefix_first_keys[owners]
+            )
+            occupancy[keys] = bucket_counts[selected]
+            seeded_parts.append(keys)
 
-        bucket_start = int(np.searchsorted(plan.bucket_keys, prefix))
-        bucket_stop = int(np.searchsorted(plan.bucket_keys, prefix + last_size))
-        current_keys = plan.bucket_keys[bucket_start:bucket_stop]
-        occupancy[current_keys - prefix] = initial_counts[bucket_start:bucket_stop]
-        initial_occupancy = occupancy.copy()
+        item_ranks = np.empty(row_count, dtype=np.int64)
+        item_ranks[
+            np.lexsort((overflow_rows, stable_order_hash(plan.overflow_item_ids[span])))
+        ] = np.arange(row_count)
 
-        item_count = overflow_rows.shape[0]
-        item_positions = np.arange(item_count, dtype=np.int64)
-        proposal_order = np.lexsort((overflow_rows, item_ties, origin_last_codes))
-        assigned = np.zeros(item_count, dtype=bool)
-        resolved = origin_last_codes.copy()
-        assignment_rounds = np.zeros(item_count, dtype=np.int64)
-        assignment_priorities = np.full(item_count, -1, dtype=np.int64)
-        round_index = 0
-
+        resolved_keys = origin_keys.copy()
+        assigned = np.zeros(row_count, dtype=bool)
+        slot_indices = np.empty(row_count, dtype=np.int64)
+        pending = np.arange(row_count, dtype=np.int64)
+        targets = candidates + key_bases[:, None]
         while True:
-            round_index += 1
-            active = proposal_order[~assigned[proposal_order]]
-            proposal_item_parts = []
-            proposal_priority_parts = []
-            proposal_target_parts = []
-            if active.size:
-                origin_starts = _run_starts(origin_last_codes[active])
-                origin_lengths = np.diff(np.append(origin_starts, active.size))
-                for priority in range(candidates.shape[1]):
-                    targets = candidates[active, priority]
-                    valid = occupancy[targets] < capacity
-                    valid_counts = np.cumsum(valid, dtype=np.int64)
-                    origin_offsets = np.repeat(
-                        valid_counts[origin_starts] - valid[origin_starts],
-                        origin_lengths,
-                    )
-                    keep = valid & (valid_counts - origin_offsets <= capacity)
-                    if not np.any(keep):
-                        continue
-                    proposal_item_parts.append(active[keep])
-                    proposal_priority_parts.append(
-                        np.full(int(keep.sum()), priority, dtype=np.int64)
-                    )
-                    proposal_target_parts.append(targets[keep])
-
-            if not proposal_item_parts:
+            has_room = occupancy[targets] < capacity
+            # Occupancy only grows, so a row without room anywhere is final.
+            reachable = has_room.any(axis=1)
+            if not reachable.all():
+                pending = pending[reachable]
+                targets = targets[reachable]
+                has_room = has_room[reachable]
+            if pending.size == 0:
                 break
 
-            proposal_items = np.concatenate(proposal_item_parts)
-            proposal_priorities = np.concatenate(proposal_priority_parts)
-            proposal_targets = np.concatenate(proposal_target_parts)
-            target_order = np.lexsort(
-                (
-                    overflow_rows[proposal_items],
-                    item_ties[proposal_items],
-                    proposal_priorities,
-                    proposal_targets,
-                )
+            origin_starts = _run_starts(origin_keys[pending])
+            origin_lengths = np.diff(np.append(origin_starts, pending.shape[0]))
+            room_ranks = np.cumsum(has_room, axis=0, dtype=np.int32)
+            room_ranks -= np.repeat(
+                room_ranks[origin_starts] - has_room[origin_starts],
+                origin_lengths,
+                axis=0,
+            )
+            proposals = np.flatnonzero(has_room & (room_ranks <= capacity))
+            proposal_rows, proposal_positions = np.divmod(proposals, candidate_count)
+            proposal_items = pending[proposal_rows]
+            proposal_targets = targets.ravel()[proposals]
+
+            target_order = np.argsort(
+                (proposal_targets * candidate_count + proposal_positions) * row_count
+                + item_ranks[proposal_items]
             )
             ordered_targets = proposal_targets[target_order]
-            accepted = target_order[
-                _ranks_within_runs(ordered_targets)
-                < capacity - occupancy[ordered_targets]
+            accepted = np.zeros(proposal_items.shape[0], dtype=bool)
+            accepted[
+                target_order[
+                    _ranks_within_runs(ordered_targets)
+                    < capacity - occupancy[ordered_targets]
+                ]
+            ] = True
+            # Proposals are row-major, so a row's first accepted one is its best.
+            accepted_proposals = np.flatnonzero(accepted)
+            winners = accepted_proposals[
+                _run_starts(proposal_items[accepted_proposals])
             ]
-            accepted_items = proposal_items[accepted]
-            accepted_priorities = proposal_priorities[accepted]
-            accepted_targets = proposal_targets[accepted]
-            if accepted_items.size == 0:
-                break
+            won = np.zeros(proposal_items.shape[0], dtype=bool)
+            won[winners] = True
+            winners = target_order[won[target_order]]
+            winner_items = proposal_items[winners]
+            winner_targets = proposal_targets[winners]
 
-            item_order = np.lexsort(
-                (
-                    accepted_targets,
-                    overflow_rows[accepted_items],
-                    item_ties[accepted_items],
-                    accepted_priorities,
-                    accepted_items,
-                )
+            slot_indices[winner_items] = (
+                occupancy[winner_targets] + _ranks_within_runs(winner_targets) + 1
             )
-            ordered_items = accepted_items[item_order]
-            first_accept = np.empty(item_order.size, dtype=bool)
-            first_accept[0] = True
-            first_accept[1:] = ordered_items[1:] != ordered_items[:-1]
-            winners = item_order[first_accept]
-            winner_items = accepted_items[winners]
-            winner_priorities = accepted_priorities[winners]
-            winner_targets = accepted_targets[winners]
-            if winner_items.size == 0:
-                break
-
-            occupancy += np.bincount(winner_targets, minlength=last_size).astype(
-                np.int64, copy=False
-            )
+            np.add.at(occupancy, winner_targets, 1)
             assigned[winner_items] = True
-            resolved[winner_items] = winner_targets
-            assignment_rounds[winner_items] = round_index
-            assignment_priorities[winner_items] = winner_priorities
+            resolved_keys[winner_items] = winner_targets
+            still_pending = ~assigned[pending]
+            pending = pending[still_pending]
+            targets = targets[still_pending]
 
-        slot_indices = np.empty(item_count, dtype=np.int64)
-        relocated_items = item_positions[assigned]
-        if relocated_items.size:
-            relocated_order = np.lexsort(
-                (
-                    overflow_rows[relocated_items],
-                    item_ties[relocated_items],
-                    assignment_priorities[relocated_items],
-                    assignment_rounds[relocated_items],
-                    resolved[relocated_items],
-                )
-            )
-            ordered_relocated = relocated_items[relocated_order]
-            ordered_targets = resolved[ordered_relocated]
-            slot_indices[ordered_relocated] = (
-                initial_occupancy[ordered_targets]
-                + _ranks_within_runs(ordered_targets)
-                + 1
-            )
+        unresolved = ~assigned
+        unresolved_keys = origin_keys[unresolved]
+        slot_indices[unresolved] = (
+            occupancy[unresolved_keys] + _ranks_within_runs(unresolved_keys) + 1
+        )
+        np.add.at(occupancy, unresolved_keys, 1)
 
-        unresolved_items = item_positions[~assigned]
-        if unresolved_items.size:
-            unresolved_order = np.lexsort(
-                (
-                    overflow_rows[unresolved_items],
-                    item_ties[unresolved_items],
-                    origin_last_codes[unresolved_items],
-                )
-            )
-            ordered_unresolved = unresolved_items[unresolved_order]
-            ordered_origins = origin_last_codes[ordered_unresolved]
-            slot_indices[ordered_unresolved] = (
-                initial_occupancy[ordered_origins]
-                + _ranks_within_runs(ordered_origins)
-                + 1
-            )
-            occupancy += np.bincount(ordered_origins, minlength=last_size).astype(
-                np.int64, copy=False
-            )
-
-        occupied = np.flatnonzero(occupancy)
-        return _BandResolution(
-            resolved_last_codes=resolved,
+        touched_keys = np.unique(np.concatenate((*seeded_parts, resolved_keys)))
+        touched_counts = occupancy[touched_keys]
+        occupancy[touched_keys] = 0
+        occupied = touched_counts > 0
+        touched_keys = touched_keys[occupied]
+        owners = touched_keys // last_size
+        return _BatchResolution(
+            resolved_last_codes=resolved_keys - key_bases,
             slot_indices=slot_indices,
-            unresolved_rows=overflow_rows[~assigned],
-            bucket_keys=prefix + occupied,
-            bucket_counts=occupancy[occupied],
+            unresolved_rows=overflow_rows[unresolved],
+            bucket_keys=prefix_first_keys[owners] + touched_keys - owners * last_size,
+            bucket_counts=touched_counts[occupied],
         )
