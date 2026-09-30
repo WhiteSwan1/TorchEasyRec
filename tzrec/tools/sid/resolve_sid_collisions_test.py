@@ -409,14 +409,32 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             self._run(inp, out, max_items_per_codebook=2)
 
     def test_multi_process_launch_rejected(self) -> None:
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, list(range(3)), [[0, 0]] * 3, [[[0, 1]]] * 3)
         with (
             mock.patch.dict(os.environ, {"WORLD_SIZE": "2"}),
             self.assertRaisesRegex(RuntimeError, "single-process"),
         ):
-            self._run(inp, out)
+            self._runner("input", "map")
+
+    def test_missing_input_rejected_before_reading(self) -> None:
+        with self.assertRaisesRegex(ValueError, "hold no files"):
+            self._runner(
+                os.path.join(self.test_dir, "absent.parquet"),
+                os.path.join(self.test_dir, "out"),
+            )
+
+    def test_append_rejects_a_different_codebook(self) -> None:
+        out = self._seed_state(
+            os.path.join(self.test_dir, "out"),
+            [(0, [0, 0], [0, 0], 1)],
+            [([0, 0], [0])],
+        )
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        _parquet(inp, [10], [[0, 0]])
+
+        with self.assertRaisesRegex(ValueError, "differs from"):
+            self._runner(
+                inp, out, generation="v2", from_generation="v1", layer_sizes=(8, 16)
+            )
 
     def test_candidates_align_across_batches(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
@@ -634,9 +652,9 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         progress_by_description = {}
 
-        def make_progress(description, **_kwargs):
+        def make_progress(description, **kwargs):
             progress = mock.Mock()
-            progress_by_description.setdefault(description, []).append(progress)
+            progress_by_description[description] = (kwargs, progress)
             return progress
 
         with (
@@ -656,26 +674,19 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 max_items_per_codebook=2,
             )
 
-        expected_progress = [
-            mock.call(4, suffix="4 samples processed"),
-            mock.call(8, suffix="8 samples processed"),
-        ]
-        self.assertEqual(
-            progress_by_description["Reading SID input"][0].log.call_args_list,
-            expected_progress,
-        )
-        candidate_calls = progress_by_description["Scanning candidate input"][
-            0
-        ].log.call_args_list
-        self.assertEqual(candidate_calls, expected_progress)
         for description in (
+            "Reading SID input",
+            "Scanning candidate input",
             "Writing resolved item_to_sid",
             "Writing resolved sid_to_items",
         ):
-            self.assertEqual(
-                progress_by_description[description][0].log.call_args_list,
-                expected_progress,
-            )
+            kwargs, progress = progress_by_description[description]
+            with self.subTest(description=description):
+                self.assertEqual(kwargs["miniters"], 3)
+                self.assertEqual(
+                    progress.log.call_args_list,
+                    [mock.call(2), mock.call(4), mock.call(6), mock.call(8)],
+                )
 
     @parameterized.expand(
         [

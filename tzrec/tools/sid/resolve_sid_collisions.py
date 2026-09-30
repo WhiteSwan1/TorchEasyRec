@@ -355,14 +355,14 @@ class CollisionResolutionRunner:
         self._resolved_writer_type: Optional[str] = None
         self._item_id_type: Optional[pa.DataType] = None
         self._bundle = Bundle(config.layout)
-
-    def run(self) -> CollisionResolutionStats:
-        """Read, resolve collisions, and publish the resulting generation."""
         _require_single_process()
         self._check_input_locations()
         self._bundle.check_prior_compatible(
-            list(self._config.layer_sizes), self._config.max_items_per_codebook
+            list(config.layer_sizes), config.max_items_per_codebook
         )
+
+    def run(self) -> CollisionResolutionStats:
+        """Read, resolve collisions, and publish the resulting generation."""
         item_ids, codes = self._load_codes()
         if codes.shape[1] != len(self._config.layer_sizes):
             raise ValueError(
@@ -464,21 +464,14 @@ class CollisionResolutionRunner:
                 f"columns {missing} are missing from {path!r}; it is not an "
                 "artifact this tool published."
             )
-        progress = ProgressLogger(description, start_n=0)
+        progress = ProgressLogger(
+            description, start_n=0, miniters=self._config.progress_interval
+        )
         scanned = 0
-        last_progress_count = 0
         for batch in reader.to_batches():
             yield batch
             scanned += len(batch[fields[0]])
-            if self._progress_interval_reached(scanned, last_progress_count):
-                progress.log(scanned, suffix=f"{scanned} samples processed")
-                last_progress_count = scanned
-
-    def _progress_interval_reached(
-        self, processed: int, last_progress_count: int
-    ) -> bool:
-        """Return whether enough samples passed since the last progress update."""
-        return processed - last_progress_count >= self._config.progress_interval
+            progress.log(scanned)
 
     @staticmethod
     def _codes_matrix(values: pa.Array) -> np.ndarray:
@@ -536,28 +529,26 @@ class CollisionResolutionRunner:
         self._resolved_writer_type = self._config.item_to_sid_writer_type or (
             reader.__class__.__name__.replace("Reader", "Writer")
         )
-        progress = ProgressLogger("Reading SID input", start_n=0)
+        progress = ProgressLogger(
+            "Reading SID input", start_n=0, miniters=self._config.progress_interval
+        )
         read_rows = 0
-        last_progress_count = 0
-        id_chunks: List[np.ndarray] = []
-        code_chunks: List[np.ndarray] = []
+        id_batches: List[np.ndarray] = []
+        code_batches: List[np.ndarray] = []
         for batch in reader.to_batches():
             item_ids = batch[self._config.item_id_field]
             self._validate_item_ids(item_ids)
-            id_chunks.append(item_ids.to_numpy(zero_copy_only=False))
-            code_chunks.append(self._codes_matrix(batch[self._config.code_field]))
-            batch_rows = len(item_ids)
-            read_rows += batch_rows
-            if self._progress_interval_reached(read_rows, last_progress_count):
-                progress.log(read_rows, suffix=f"{read_rows} samples processed")
-                last_progress_count = read_rows
+            id_batches.append(item_ids.to_numpy(zero_copy_only=False))
+            code_batches.append(self._codes_matrix(batch[self._config.code_field]))
+            read_rows += len(item_ids)
+            progress.log(read_rows)
 
-        if not id_chunks:
+        if not id_batches:
             raise ValueError("SID input is empty.")
-        item_id_array = np.concatenate(id_chunks)
-        del id_chunks
-        code_matrix = np.concatenate(code_chunks, axis=0)
-        del code_chunks
+        item_id_array = np.concatenate(id_batches)
+        del id_batches
+        code_matrix = np.concatenate(code_batches, axis=0)
+        del code_batches
         if code_matrix.shape[1] < 1:
             raise ValueError("SID codes must have at least one layer.")
         return item_id_array, code_matrix
@@ -598,22 +589,19 @@ class CollisionResolutionRunner:
         field = self._config.candidate_codes_field
         reader = self._make_reader([self._config.item_id_field, field])
         scanned_items = 0
-        last_progress_count = 0
-        progress = ProgressLogger("Scanning candidate input", start_n=0)
+        progress = ProgressLogger(
+            "Scanning candidate input",
+            start_n=0,
+            miniters=self._config.progress_interval,
+        )
         for batch in reader.to_batches():
             if field not in batch:
                 raise ValueError(
                     f"candidate_codes field {field!r} is missing from an input batch."
                 )
             batch_ids = batch[self._config.item_id_field].to_numpy(zero_copy_only=False)
-            batch_items = batch_ids.shape[0]
-            scanned_items += batch_items
-            if self._progress_interval_reached(scanned_items, last_progress_count):
-                progress.log(
-                    scanned_items,
-                    suffix=f"{scanned_items} samples processed",
-                )
-                last_progress_count = scanned_items
+            scanned_items += batch_ids.shape[0]
+            progress.log(scanned_items)
             source_rows, target_rows = item_id_lookup.match(batch_ids)
             if source_rows.size == 0:
                 continue
@@ -723,8 +711,8 @@ class CollisionResolutionRunner:
         wanted_prefixes = np.unique(prefix_ids)
         new_item_ids = self._item_id_array(item_ids)
 
-        key_chunks: List[np.ndarray] = []
-        count_chunks: List[np.ndarray] = []
+        key_batches: List[np.ndarray] = []
+        count_batches: List[np.ndarray] = []
         overlapping: List[object] = []
         overlap_count = 0
         published_items = 0
@@ -757,8 +745,8 @@ class CollisionResolutionRunner:
 
             _, keep = lookup_sorted(wanted_prefixes, keys // layer_sizes[-1])
             if np.any(keep):
-                key_chunks.append(keys[keep])
-                count_chunks.append(lengths[keep])
+                key_batches.append(keys[keep])
+                count_batches.append(lengths[keep])
 
         if overlap_count:
             preview = ",".join(str(value) for value in overlapping[:10])
@@ -767,10 +755,10 @@ class CollisionResolutionRunner:
                 "cannot hold two SIDs. Remove them from the append batch. First "
                 f"offending IDs: {preview}."
             )
-        if not key_chunks:
+        if not key_batches:
             return PriorOccupancy.empty(), published_items
         return (
-            PriorOccupancy(np.concatenate(key_chunks), np.concatenate(count_chunks)),
+            PriorOccupancy(np.concatenate(key_batches), np.concatenate(count_batches)),
             published_items,
         )
 
@@ -845,7 +833,6 @@ class CollisionResolutionRunner:
         item_ids: np.ndarray,
         origin_codes: np.ndarray,
         result: CollisionResolutionResult,
-        progress: ProgressLogger,
         written: int,
     ) -> int:
         """Write this run's own item rows in chunks, without a full code copy.
@@ -858,7 +845,11 @@ class CollisionResolutionRunner:
         """
         is_csv = self._resolved_writer_type == "CsvWriter"
         output_count = item_ids.shape[0]
-        last_progress_count = written
+        progress = ProgressLogger(
+            "Writing resolved item_to_sid",
+            start_n=written,
+            miniters=self._config.progress_interval,
+        )
         write_chunk = _ITEM_TO_SID_WRITE_ROWS
         if not is_csv:
             write_chunk = min(
@@ -880,9 +871,7 @@ class CollisionResolutionRunner:
             for writer in writers:
                 writer.write(columns)
             written += end - start
-            if self._progress_interval_reached(written, last_progress_count):
-                progress.log(written, suffix=f"{written} samples processed")
-                last_progress_count = written
+            progress.log(written)
         return output_count
 
     def _stream_existing_item_to_sid_rows(self, writer: BaseWriter) -> int:
@@ -940,7 +929,6 @@ class CollisionResolutionRunner:
             item_ids,
             origin_codes,
             result,
-            ProgressLogger("Writing resolved item_to_sid", start_n=0),
             copied,
         )
         for item_writer in writers:
@@ -1125,7 +1113,6 @@ class CollisionResolutionRunner:
             ValueError: If one bucket exceeds Arrow list offset capacity.
         """
         output_path = self._bundle.sid_to_items_path
-        progress_description = "Writing resolved sid_to_items"
         group_count = grouping.counts.shape[0]
         written = 0
         if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
@@ -1133,8 +1120,11 @@ class CollisionResolutionRunner:
 
         offsets = grouping.offsets
         writer = self._make_writer(output_path, "ParquetWriter")
-        progress = ProgressLogger(progress_description, start_n=0)
-        last_progress_count = 0
+        progress = ProgressLogger(
+            "Writing resolved sid_to_items",
+            start_n=0,
+            miniters=self._config.progress_interval,
+        )
         max_codebook_rows = _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
         for group_start, group_end, child_start, child_end in _group_chunk_bounds(
             offsets, 0, group_count, max_codebook_rows
@@ -1150,12 +1140,7 @@ class CollisionResolutionRunner:
                 local_offsets,
                 self._item_id_array(item_ids[rows]),
             )
-            if self._progress_interval_reached(child_end, last_progress_count):
-                progress.log(
-                    child_end,
-                    suffix=f"{child_end} samples processed",
-                )
-                last_progress_count = child_end
+            progress.log(child_end)
         writer.close()
         self._bundle.record_sid_to_items(written)
 
