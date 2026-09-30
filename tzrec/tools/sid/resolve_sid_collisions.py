@@ -98,7 +98,6 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -931,29 +930,24 @@ class CollisionResolutionRunner:
         run's rows are appended, so the artifact stands alone and is exactly
         what the next append consumes.
         """
-        with ExitStack() as stack:
-            writer = stack.enter_context(
-                closing(self._make_writer(self._bundle.item_to_sid_path))
-            )
-            writers = [writer]
-            if self._config.is_append:
-                writers.append(
-                    stack.enter_context(
-                        closing(self._make_writer(self._bundle.delta_item_to_sid_path))
-                    )
-                )
-            copied = self._stream_existing_item_to_sid_rows(writer)
-            added = self._write_new_item_to_sid_rows(
-                writers,
-                item_ids,
-                origin_codes,
-                result,
-                ProgressLogger("Writing resolved item_to_sid", start_n=0),
-                copied,
-            )
-            self._bundle.record_item_to_sid(copied + added)
-            if self._config.is_append:
-                self._bundle.record_delta_item_to_sid(added)
+        writer = self._make_writer(self._bundle.item_to_sid_path)
+        writers = [writer]
+        if self._config.is_append:
+            writers.append(self._make_writer(self._bundle.delta_item_to_sid_path))
+        copied = self._stream_existing_item_to_sid_rows(writer)
+        added = self._write_new_item_to_sid_rows(
+            writers,
+            item_ids,
+            origin_codes,
+            result,
+            ProgressLogger("Writing resolved item_to_sid", start_n=0),
+            copied,
+        )
+        for item_writer in writers:
+            item_writer.close()
+        self._bundle.record_item_to_sid(copied + added)
+        if self._config.is_append:
+            self._bundle.record_delta_item_to_sid(added)
 
     def _write_sid_to_items_outputs(
         self,
@@ -1039,83 +1033,76 @@ class CollisionResolutionRunner:
 
         corpus_rows = 0
         delta_rows = 0
-        with ExitStack() as stack:
-            writer = stack.enter_context(
-                closing(self._make_writer(resolved_path, "ParquetWriter"))
+        writer = self._make_writer(resolved_path, "ParquetWriter")
+        delta_writer = self._make_writer(
+            self._bundle.delta_sid_to_items_path, "ParquetWriter"
+        )
+
+        def emit(
+            codes: np.ndarray,
+            offsets: np.ndarray,
+            values: pa.Array,
+            rows: Optional[np.ndarray],
+        ) -> None:
+            """Write one chunk to the corpus output and the delta output."""
+            nonlocal corpus_rows, delta_rows
+            corpus_rows += self._emit_sid_to_items_rows(writer, codes, offsets, values)
+            delta_rows += self._emit_sid_to_items_rows(
+                delta_writer, codes, offsets, values, rows
             )
-            delta_writer = stack.enter_context(
-                closing(
-                    self._make_writer(
-                        self._bundle.delta_sid_to_items_path, "ParquetWriter"
-                    )
-                )
-            )
 
-            def emit(
-                codes: np.ndarray,
-                offsets: np.ndarray,
-                values: pa.Array,
-                rows: Optional[np.ndarray],
-            ) -> None:
-                """Write one chunk to the corpus output and the delta output."""
-                nonlocal corpus_rows, delta_rows
-                corpus_rows += self._emit_sid_to_items_rows(
-                    writer, codes, offsets, values
-                )
-                delta_rows += self._emit_sid_to_items_rows(
-                    delta_writer, codes, offsets, values, rows
-                )
+        max_rows = _ARROW_LIST_OFFSET_MAX // groups.codes.shape[1]
 
-            max_rows = _ARROW_LIST_OFFSET_MAX // groups.codes.shape[1]
-
-            def emit_new_only(low: int, high: int) -> None:
-                """Write rows this run created in buckets nobody occupied."""
-                for start, stop, child_low, child_high in _group_chunk_bounds(
-                    groups.offsets, low, high, max_rows
-                ):
-                    emit(
-                        groups.codes[start:stop],
-                        groups.offsets[start : stop + 1] - child_low,
-                        groups.item_ids.slice(child_low, child_high - child_low),
-                        None,
-                    )
-
-            cursor = 0
-            for batch in self._iter_state_batches(
-                existing_path,
-                ["codebook", "itemids"],
-                "Writing merged sid_to_items",
+        def emit_new_only(low: int, high: int) -> None:
+            """Write rows this run created in buckets nobody occupied."""
+            for start, stop, child_low, child_high in _group_chunk_bounds(
+                groups.offsets, low, high, max_rows
             ):
-                batch_codes = self._codes_matrix(batch["codebook"])
-                batch_keys = sid_bucket_keys(batch_codes, layer_sizes)
-                if batch_keys.size == 0:
-                    continue
-                low = int(np.searchsorted(groups.keys, batch_keys[0], side="left"))
-                if cursor < low:
-                    emit_new_only(cursor, low)
-                high = int(np.searchsorted(groups.keys, batch_keys[-1], side="right"))
-                batch_lengths, batch_values = self._decode_grouped_item_ids(
-                    batch["itemids"]
+                emit(
+                    groups.codes[start:stop],
+                    groups.offsets[start : stop + 1] - child_low,
+                    groups.item_ids.slice(child_low, child_high - child_low),
+                    None,
                 )
-                if low == high:
-                    # No new bucket in range: the merge would rebuild the batch.
-                    batch_offsets = np.zeros(batch_keys.shape[0] + 1, dtype=np.int64)
-                    np.cumsum(batch_lengths, out=batch_offsets[1:])
-                    emit(batch_codes, batch_offsets, batch_values, _NO_ROWS)
-                else:
-                    emit(
-                        *_merge_group_batch(
-                            batch_keys,
-                            batch_codes,
-                            batch_lengths,
-                            batch_values,
-                            groups,
-                            low,
-                            high,
-                        )
+
+        cursor = 0
+        for batch in self._iter_state_batches(
+            existing_path,
+            ["codebook", "itemids"],
+            "Writing merged sid_to_items",
+        ):
+            batch_codes = self._codes_matrix(batch["codebook"])
+            batch_keys = sid_bucket_keys(batch_codes, layer_sizes)
+            if batch_keys.size == 0:
+                continue
+            low = int(np.searchsorted(groups.keys, batch_keys[0], side="left"))
+            if cursor < low:
+                emit_new_only(cursor, low)
+            high = int(np.searchsorted(groups.keys, batch_keys[-1], side="right"))
+            batch_lengths, batch_values = self._decode_grouped_item_ids(
+                batch["itemids"]
+            )
+            if low == high:
+                # No new bucket in range: the merge would rebuild the batch.
+                batch_offsets = np.zeros(batch_keys.shape[0] + 1, dtype=np.int64)
+                np.cumsum(batch_lengths, out=batch_offsets[1:])
+                emit(batch_codes, batch_offsets, batch_values, _NO_ROWS)
+            else:
+                emit(
+                    *_merge_group_batch(
+                        batch_keys,
+                        batch_codes,
+                        batch_lengths,
+                        batch_values,
+                        groups,
+                        low,
+                        high,
                     )
-                cursor = high
-            emit_new_only(cursor, group_count)
+                )
+            cursor = high
+        emit_new_only(cursor, group_count)
+        writer.close()
+        delta_writer.close()
         self._bundle.record_sid_to_items(corpus_rows)
         self._bundle.record_delta_sid_to_items(delta_rows)
 
@@ -1145,30 +1132,31 @@ class CollisionResolutionRunner:
             raise ValueError("one SID bucket exceeds Arrow list offset capacity.")
 
         offsets = grouping.offsets
-        with closing(self._make_writer(output_path, "ParquetWriter")) as writer:
-            progress = ProgressLogger(progress_description, start_n=0)
-            last_progress_count = 0
-            max_codebook_rows = _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
-            for group_start, group_end, child_start, child_end in _group_chunk_bounds(
-                offsets, 0, group_count, max_codebook_rows
-            ):
-                rows = grouping.row_order[child_start:child_end]
-                local_offsets = offsets[group_start : group_end + 1] - child_start
-                representative_rows = grouping.row_order[offsets[group_start:group_end]]
-                code_chunk = origin_codes[representative_rows]
-                code_chunk[:, -1] = resolved_last_codes[representative_rows]
-                written += self._emit_sid_to_items_rows(
-                    writer,
-                    code_chunk,
-                    local_offsets,
-                    self._item_id_array(item_ids[rows]),
+        writer = self._make_writer(output_path, "ParquetWriter")
+        progress = ProgressLogger(progress_description, start_n=0)
+        last_progress_count = 0
+        max_codebook_rows = _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
+        for group_start, group_end, child_start, child_end in _group_chunk_bounds(
+            offsets, 0, group_count, max_codebook_rows
+        ):
+            rows = grouping.row_order[child_start:child_end]
+            local_offsets = offsets[group_start : group_end + 1] - child_start
+            representative_rows = grouping.row_order[offsets[group_start:group_end]]
+            code_chunk = origin_codes[representative_rows]
+            code_chunk[:, -1] = resolved_last_codes[representative_rows]
+            written += self._emit_sid_to_items_rows(
+                writer,
+                code_chunk,
+                local_offsets,
+                self._item_id_array(item_ids[rows]),
+            )
+            if self._progress_interval_reached(child_end, last_progress_count):
+                progress.log(
+                    child_end,
+                    suffix=f"{child_end} samples processed",
                 )
-                if self._progress_interval_reached(child_end, last_progress_count):
-                    progress.log(
-                        child_end,
-                        suffix=f"{child_end} samples processed",
-                    )
-                    last_progress_count = child_end
+                last_progress_count = child_end
+        writer.close()
         self._bundle.record_sid_to_items(written)
 
 

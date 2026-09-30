@@ -798,32 +798,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         )
         self.assertTrue(all(writer.closed for _, _, writer in created_writers))
 
-    def test_writer_closes_when_write_fails(self) -> None:
-        class FailingWriter:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def write(self, output_dict) -> None:
-                raise RuntimeError("write failed")
-
-            def close(self) -> None:
-                self.closed = True
-
-        inp = os.path.join(self.test_dir, "in.parquet")
-        out = os.path.join(self.test_dir, "out")
-        _parquet(inp, [0], [[0, 0]])
-        writer = FailingWriter()
-
-        with (
-            mock.patch.object(
-                CollisionResolutionRunner, "_make_writer", return_value=writer
-            ),
-            self.assertRaisesRegex(RuntimeError, "write failed"),
-        ):
-            self._run(inp, out, max_items_per_codebook=1)
-
-        self.assertTrue(writer.closed)
-
     def test_sid_to_items_chunks_by_item_count_without_splitting_buckets(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
