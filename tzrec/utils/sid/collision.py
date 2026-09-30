@@ -34,7 +34,7 @@ _ROW_CHUNK_SIZE = 1_000_000
 class CollisionResolutionConfig:
     """Configuration for within-prefix SID collision resolution.
 
-    Unplaceable overflow items always keep their original SID (over capacity),
+    Overflow items that cannot be placed within capacity stay over capacity,
     so every input item is preserved in the output.
 
     Args:
@@ -90,6 +90,25 @@ def lookup_sorted(
     found = positions < sorted_keys.shape[0]
     found[found] = sorted_keys[positions[found]] == keys[found]
     return positions, found
+
+
+def run_starts(ordered_values: np.ndarray) -> np.ndarray:
+    """Return start offsets of equal-value runs in a nonempty sorted array."""
+    return np.concatenate(
+        (
+            np.asarray([0], dtype=np.int64),
+            np.flatnonzero(ordered_values[1:] != ordered_values[:-1]) + 1,
+        )
+    )
+
+
+def ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
+    """Return zero-based ranks within equal-value runs in a sorted array."""
+    starts = run_starts(ordered_values)
+    ranks = np.arange(ordered_values.shape[0], dtype=np.int64)
+    return ranks - np.repeat(
+        starts, np.diff(np.append(starts, ordered_values.shape[0]))
+    )
 
 
 @dataclass(frozen=True)
@@ -583,39 +602,6 @@ class KnnCollisionResolver(CollisionResolver):
         return self._resolve_first_fit(
             plan, candidate_codes, collect_grouping=collect_grouping
         )
-
-
-def generate_random_candidate_last_codes(
-    item_ids: np.ndarray, last_size: int, num_candidates: int
-) -> np.ndarray:
-    """Generate deterministic full-space random candidate draws.
-
-    Sampling is with replacement and includes each item's original code
-    because that code is not an input to this function. Placement skips an
-    origin draw without replacing it.
-
-    Args:
-        item_ids: One-dimensional IDs for the overflow rows.
-        last_size: Cardinality of the last SID layer.
-        num_candidates: Positive number of raw random draws per row.
-
-    Returns:
-        An ``(len(item_ids), K)`` int64 matrix, where ``K`` is the smaller of
-        ``num_candidates`` and ``last_size - 1``.
-
-    Raises:
-        ValueError: If ``last_size`` is smaller than two.
-    """
-    if last_size < 2:
-        raise ValueError("random candidates require last_size >= 2.")
-    candidate_count = min(num_candidates, last_size - 1)
-    hashes = stable_order_hash(item_ids)
-    draw_indices = np.arange(candidate_count, dtype=np.uint64)
-    with np.errstate(over="ignore"):
-        mixed = _splitmix64(
-            hashes[:, None] + draw_indices[None, :] * np.uint64(_SPLITMIX_INCREMENT)
-        )
-    return (mixed % np.uint64(last_size)).astype(np.int64)
 
 
 def _splitmix64(values: np.ndarray) -> np.ndarray:

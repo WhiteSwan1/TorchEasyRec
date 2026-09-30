@@ -28,11 +28,10 @@ from tzrec.tools.sid.resolve_sid_collisions import (
 from tzrec.utils.sid import bundle
 from tzrec.utils.sid.collision import (
     CollisionResolutionConfig,
-    generate_random_candidate_last_codes,
     prepare_collision_plan,
     stable_order_hash,
 )
-from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 from tzrec.utils.test_util import make_test_dir, parameterized_name_func
 
 _PART_FILE = "part-0.parquet"
@@ -147,8 +146,6 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             layer_sizes=(8, 8),
             max_items_per_codebook=2,
             strategy="candidate",
-            placement_policy="first_fit",
-            random_num_candidates=64,
             rate_only=False,
             odps_data_quota_name="pay-as-you-go",
         )
@@ -291,11 +288,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
 
     @parameterized.expand(
-        [("first_fit", "first_fit", 1, 1), ("iterative", "iterative", 2, 0)],
+        [("candidate", "candidate", 1, 1), ("iterative", "iterative", 2, 0)],
         name_func=parameterized_name_func,
     )
-    def test_placement_policy_selects_arbitration(
-        self, _name, placement_policy, expected_relocated, expected_unresolved
+    def test_strategy_selects_candidate_arbitration(
+        self, _name, strategy, expected_relocated, expected_unresolved
     ) -> None:
         stats, out = self._resolve(
             [10, 11, 20, 21, 30],
@@ -303,7 +300,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[[2], [3], [4]]] * 2 + [[[3], [2], [2]]] * 2 + [[[0], [0], [0]]],
             layer_sizes=(5,),
             max_items_per_codebook=1,
-            placement_policy=placement_policy,
+            strategy=strategy,
         )
 
         self.assertEqual(stats.relocated_count, expected_relocated)
@@ -360,8 +357,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 0,
             ),
             (
-                "random_overflow",
-                "random",
+                "uniform_overflow",
+                "uniform",
                 [[0, 0]] * 3,
                 None,
                 2,
@@ -471,19 +468,20 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         ).to_pydict()
         self.assertEqual(resolved["codebook"], [[7, 2], [7, 10], [12, 1]])
 
-    def test_random_reassigns_within_prefix(self) -> None:
+    def test_uniform_spreads_overflow_within_prefix(self) -> None:
         stats, out = self._resolve(
-            list(range(5)), [[0, 0]] * 5, max_items_per_codebook=2, strategy="random"
+            list(range(5)), [[0, 0]] * 5, max_items_per_codebook=2, strategy="uniform"
         )
+
         self.assertEqual(stats.relocated_count, 3)
-        d = self._item_to_sid(out)
-        self.assertTrue(all(cb[0] == 0 for cb in d["codebook"]))
-        self.assertLessEqual(max(Counter(map(tuple, d["codebook"])).values()), 2)
+        self.assertEqual(stats.unresolved_count, 0)
+        counts = Counter(map(tuple, self._item_to_sid(out)["codebook"]))
+        self.assertTrue(all(prefix == 0 for prefix, _ in counts))
+        self.assertEqual(counts.pop((0, 0)), 2)
+        self.assertEqual(sorted(counts.values()), [1, 1, 1])
         self._assert_item_to_sid_matches_sid_to_items(out)
 
-    def test_iterative_random_sources_candidates_without_candidate_column(
-        self,
-    ) -> None:
+    def test_uniform_matches_core_resolver_in_a_full_prefix(self) -> None:
         item_ids = list(range(5))
         codes = [[0]] * 5
         plan = prepare_collision_plan(
@@ -491,19 +489,14 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             np.asarray(codes, dtype=np.int64),
             CollisionResolutionConfig((4,), 1),
         )
-        expected = IterativeCollisionResolver().resolve(
-            plan,
-            generate_random_candidate_last_codes(plan.overflow_item_ids, 4, 2),
-        )
+        expected = UniformCollisionResolver().resolve(plan)
 
         stats, out = self._resolve(
             item_ids,
             codes,
             layer_sizes=(4,),
             max_items_per_codebook=1,
-            strategy="random",
-            placement_policy="iterative",
-            random_num_candidates=2,
+            strategy="uniform",
         )
 
         self.assertEqual(stats, expected.stats)
@@ -515,6 +508,8 @@ class ResolveSidCollisionsTest(unittest.TestCase):
                 for item_id, code in zip(item_ids, expected.resolved_last_codes)
             },
         )
+        self.assertEqual(stats.unresolved_count, 1)
+        self.assertEqual(stats.max_final_bucket_size, 2)
         self._assert_item_to_sid_matches_sid_to_items(out)
 
     def test_single_layer_sid(self) -> None:
@@ -522,7 +517,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             list(range(4)),
             [[0]] * 4,
             max_items_per_codebook=1,
-            strategy="random",
+            strategy="uniform",
             layer_sizes=(16,),
         )
         self.assertEqual(stats.relocated_count, 3)
@@ -715,13 +710,14 @@ class ResolveSidCollisionsTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            ("default", [], "first_fit"),
-            ("iterative", ["--placement_policy", "iterative"], "iterative"),
+            ("default", [], "candidate"),
+            ("iterative", ["--strategy", "iterative"], "iterative"),
+            ("uniform", ["--strategy", "uniform"], "uniform"),
         ],
         name_func=parameterized_name_func,
     )
     def test_parser_allows_rate_only_without_outputs(
-        self, _name, extra_args, expected_placement_policy
+        self, _name, extra_args, expected_strategy
     ) -> None:
         args = resolve_sid_collisions.build_parser().parse_args(
             [
@@ -742,25 +738,15 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertIsNone(config.item_to_sid_root)
         self.assertIsNone(config.generation)
         self.assertEqual(config.progress_interval, 1_000_000)
-        self.assertEqual(config.placement_policy, expected_placement_policy)
-
-    def test_rejects_invalid_placement_policy(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unsupported placement_policy"):
-            self._runner("input", "map", placement_policy="unsupported")
+        self.assertEqual(config.strategy, expected_strategy)
 
     def test_rejects_invalid_progress_interval(self) -> None:
         with self.assertRaisesRegex(ValueError, "progress_interval must be >= 1"):
             self._runner("input", "map", progress_interval=0)
 
-    @parameterized.expand(
-        [("zero", 0), ("negative", -1)],
-        name_func=parameterized_name_func,
-    )
-    def test_rejects_invalid_random_num_candidates(
-        self, _case_name, random_num_candidates
-    ) -> None:
-        with self.assertRaisesRegex(ValueError, "random_num_candidates must be >= 1"):
-            self._runner("input", "map", random_num_candidates=random_num_candidates)
+    def test_rejects_unsupported_strategy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported strategy"):
+            self._runner("input", "map", strategy="random")
 
     def test_serving_set_stays_parquet_under_an_odps_writer_type(self) -> None:
         class OdpsWriter:
@@ -990,7 +976,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[10, 11], [20, 21], [10, 11], [10, 11]],
         )
 
-    def test_random_tolerates_duplicate_item_ids(self) -> None:
+    def test_uniform_tolerates_duplicate_item_ids(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")
         _parquet(
@@ -1003,8 +989,7 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         stats = self._run(
             inp,
             out,
-            strategy="random",
-            random_num_candidates=8,
+            strategy="uniform",
             max_items_per_codebook=1,
         )
 
@@ -1150,11 +1135,11 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 
     @parameterized.expand(
-        [("first_fit", "first_fit"), ("iterative", "iterative")],
+        [("candidate", "candidate"), ("iterative", "iterative")],
         name_func=parameterized_name_func,
     )
     def test_append_preserves_over_capacity_published_bucket(
-        self, _name, placement_policy
+        self, _name, strategy
     ) -> None:
         out = os.path.join(self.test_dir, "out")
         self._seed_state(
@@ -1175,13 +1160,40 @@ class ResolveSidCollisionsTest(unittest.TestCase):
             [[[0, 1], [0, 2]], [[0, 1], [0, 2]]],
         )
 
-        stats = self._append(inp, out, placement_policy=placement_policy)
+        stats = self._append(inp, out, strategy=strategy)
 
         self.assertEqual(stats.relocated_count, 2)
         merged = self._item_to_sid_rows(out, "v2")
         for item_id, row in published.items():
             self.assertEqual(merged[item_id], row)
         self.assertEqual({merged[10][1], merged[11][1]}, {(0, 1)})
+        self._assert_item_to_sid_matches_sid_to_items(out, "v2")
+
+    def test_uniform_append_spreads_new_rows_beside_published_bucket(self) -> None:
+        out = os.path.join(self.test_dir, "out")
+        self._seed_state(
+            out,
+            [
+                (0, [0, 0], [0, 0], 1),
+                (1, [0, 0], [0, 0], 2),
+                (2, [0, 0], [0, 0], 3),
+            ],
+            [([0, 0], [0, 1, 2])],
+        )
+        published = self._item_to_sid_rows(out, "v1")
+        inp = os.path.join(self.test_dir, "v2_in.parquet")
+        _parquet(inp, [10, 11], [[0, 0], [0, 0]])
+
+        stats = self._append(inp, out, strategy="uniform")
+
+        self.assertEqual(stats.relocated_count, 2)
+        merged = self._item_to_sid_rows(out, "v2")
+        for item_id, row in published.items():
+            self.assertEqual(merged[item_id], row)
+        new_sids = {merged[10][1], merged[11][1]}
+        self.assertEqual(len(new_sids), 2)
+        self.assertTrue(all(sid[0] == 0 and sid != (0, 0) for sid in new_sids))
+        self.assertEqual({merged[10][2], merged[11][2]}, {1})
         self._assert_item_to_sid_matches_sid_to_items(out, "v2")
 
     def test_append_continues_slot_numbering(self) -> None:

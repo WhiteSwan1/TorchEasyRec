@@ -24,7 +24,6 @@ from tzrec.utils.sid.collision import (
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
-    generate_random_candidate_last_codes,
     prepare_collision_plan,
     sid_bucket_keys,
     sid_offset_codes,
@@ -256,19 +255,6 @@ class CollisionTest(unittest.TestCase):
                 np.testing.assert_array_equal(grouping.counts, [])
                 np.testing.assert_array_equal(grouping.row_order, [])
                 np.testing.assert_array_equal(grouping.offsets, [0])
-
-    def test_random_candidate_golden_draws(self) -> None:
-        item_ids = np.asarray([0, 1], dtype=np.int64)
-        actual = generate_random_candidate_last_codes(item_ids, 4, 3)
-        capped = generate_random_candidate_last_codes(item_ids, 4, 10)
-
-        expected = [[1, 2, 0], [2, 0, 2]]
-        np.testing.assert_array_equal(actual, expected)
-        np.testing.assert_array_equal(capped, expected)
-
-    def test_random_rejects_single_code_space(self) -> None:
-        with self.assertRaisesRegex(ValueError, "last_size >= 2"):
-            generate_random_candidate_last_codes(np.asarray([1]), 1, 1)
 
     @parameterized.expand(
         [

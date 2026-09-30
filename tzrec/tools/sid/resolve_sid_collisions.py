@@ -18,25 +18,27 @@ independent items in collision accounting and outputs. When candidate-strategy
 overflow rows share an item ID, they reuse one candidate list matched for that
 ID. Duplicate data should still be fixed upstream.
 
-The runner retains the first capacity items in each SID bucket, attempts to
-relocate overflow items using fixed-width last-layer candidates, delegates
-placement to the pure NumPy core, and writes the ``item_to_sid`` and
-``sid_to_items`` artifacts through TorchEasyRec readers and writers. CSV encodes
-each SID/candidate column as comma-separated codes because Arrow's CSV writer
-cannot serialize list columns; ``candidate_codes`` is a flat ``topk * n_layers``
-run split by the ``--codebook`` length. ``sid_to_items`` is always parquet, so
-it keeps native list columns whatever ``--item_to_sid_writer_type`` says.
+The runner retains the first capacity items in each SID bucket, relocates
+overflow items within their SID prefix -- from fixed-width last-layer candidates
+or by the candidate-free uniform strategy -- through the pure NumPy core, and
+writes the ``item_to_sid`` and ``sid_to_items`` artifacts through TorchEasyRec
+readers and writers. CSV encodes each SID/candidate column as comma-separated
+codes because Arrow's CSV writer cannot serialize list columns;
+``candidate_codes`` is a flat ``topk * n_layers`` run split by the ``--codebook``
+length. ``sid_to_items`` is always parquet, so it keeps native list columns
+whatever ``--item_to_sid_writer_type`` says.
 
-The random strategy intentionally preserves the legacy deterministic baseline:
-it draws with replacement from the full last-layer space. Placement skips an
-item's origin, so an origin draw or a duplicate draw is not replaced.
-
-Candidate sourcing and placement are independent. ``--strategy`` selects
-model-provided or deterministic random candidates; ``--placement_policy``
-selects greedy ``first_fit`` placement or synchronous ``iterative`` proposal
-and arbitration rounds, defaulting to ``first_fit``. ``iterative`` gives
-each contested bucket to the item that ranks it earliest, so it favors
-candidate proximity and can leave more items unresolved than ``first_fit``.
+``--strategy`` selects how overflow items are placed. ``candidate`` (the
+default) moves each item greedily to its first model candidate with room.
+``iterative`` places the same candidates in synchronous proposal and
+arbitration rounds that give each contested bucket to the item ranking it
+earliest, so it favors candidate proximity and can leave more items unresolved
+than ``candidate``. ``uniform`` reads no candidates: the overflow items of each
+SID prefix take, in stable item order, the prefix's least-loaded last-layer
+codes, with ties broken by a per-prefix rotated code order, so a prefix with
+room leaves nothing over capacity. A prefix holding more items than it has room
+for keeps filling past capacity, which keeps its largest bucket as small as its
+published occupancy allows.
 
 Both item_to_sid and sid_to_items carry an ``offset_codebook`` column
 alongside ``codebook``: the same SID with each layer shifted into one
@@ -47,8 +49,9 @@ where it landed, not what the model predicted.
 
 It is a single-process tool -- launch it with ``python -m`` (no torchrun /
 process group). The input is a Semantic-ID table from ``tzrec.predict`` (an
-``item_id`` column, a ``codes`` ``list<int>`` column, and -- for the default
-``--strategy candidate`` -- a flat ``candidate_codes`` ``list<int>`` column
+``item_id`` column, a ``codes`` ``list<int>`` column, and -- for
+``--strategy candidate`` or ``iterative`` -- a flat ``candidate_codes``
+``list<int>`` column
 (``topk * n_layers`` codes per item)).
 
 Example::
@@ -125,7 +128,6 @@ from tzrec.utils.sid.collision import (
     build_original_item_grouping,
     build_resolved_item_grouping,
     concat_ranges,
-    generate_random_candidate_last_codes,
     lookup_sorted,
     prepare_collision_plan,
     sid_bucket_keys,
@@ -133,6 +135,7 @@ from tzrec.utils.sid.collision import (
     sid_prefix_ids,
 )
 from tzrec.utils.sid.iterative_collision import IterativeCollisionResolver
+from tzrec.utils.sid.uniform_collision import UniformCollisionResolver
 
 _ITEM_TO_SID_WRITE_ROWS = 1_000_000
 _SID_TO_ITEMS_WRITE_SIZE = 1_000_000
@@ -214,8 +217,6 @@ class ResolveSidCollisionsConfig:
     layer_sizes: Tuple[int, ...]
     max_items_per_codebook: int
     strategy: str
-    placement_policy: str
-    random_num_candidates: int
     rate_only: bool
     odps_data_quota_name: str
     from_generation: Optional[str] = None
@@ -227,16 +228,8 @@ class ResolveSidCollisionsConfig:
             raise ValueError(
                 f"progress_interval must be >= 1, got {self.progress_interval}."
             )
-        if self.random_num_candidates < 1:
-            raise ValueError(
-                f"random_num_candidates must be >= 1, got {self.random_num_candidates}."
-            )
-        if self.strategy not in {"candidate", "random"}:
+        if self.strategy not in {"candidate", "iterative", "uniform"}:
             raise ValueError(f"unsupported strategy: {self.strategy!r}.")
-        if self.placement_policy not in {"first_fit", "iterative"}:
-            raise ValueError(
-                f"unsupported placement_policy: {self.placement_policy!r}."
-            )
         if not self.rate_only and not self.generation:
             raise ValueError("generation is required unless rate_only is set.")
         if not self.output_path and (not self.rate_only or self.is_append):
@@ -316,8 +309,6 @@ class ResolveSidCollisionsConfig:
             layer_sizes=layer_sizes,
             max_items_per_codebook=args.max_items_per_codebook,
             strategy=args.strategy,
-            placement_policy=args.placement_policy,
-            random_num_candidates=args.random_num_candidates,
             rate_only=args.rate_only,
             odps_data_quota_name=args.odps_data_quota_name,
         )
@@ -350,7 +341,11 @@ class CollisionResolutionRunner:
     ) -> None:
         self._config = config
         self._resolver: CollisionResolver
-        if self._config.placement_policy == "iterative":
+        if self._config.strategy == "uniform":
+            self._resolver = UniformCollisionResolver(
+                progress_interval=self._config.progress_interval
+            )
+        elif self._config.strategy == "iterative":
             self._resolver = IterativeCollisionResolver(
                 progress_interval=self._config.progress_interval
             )
@@ -381,17 +376,10 @@ class CollisionResolutionRunner:
         )
         collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
         candidate_last_codes = None
-        if plan.overflow_rows.size:
-            if self._config.strategy == "candidate":
-                candidate_last_codes = self._load_candidate_last_codes(
-                    plan.overflow_item_ids
-                )
-            else:
-                candidate_last_codes = generate_random_candidate_last_codes(
-                    plan.overflow_item_ids,
-                    plan.config.layer_sizes[-1],
-                    self._config.random_num_candidates,
-                )
+        if plan.overflow_rows.size and self._config.strategy != "uniform":
+            candidate_last_codes = self._load_candidate_last_codes(
+                plan.overflow_item_ids
+            )
         result = self._resolver.resolve(
             plan,
             candidate_last_codes,
@@ -1275,7 +1263,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Resolve SID codebook collisions within each SID prefix on a best-effort "
-            "basis; finite candidate sets may leave over-capacity buckets."
+            "basis; finite candidate sets or a full prefix may leave over-capacity "
+            "buckets."
         )
     )
     parser.add_argument("--input_path", required=True)
@@ -1360,24 +1349,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_items_per_codebook", type=int, required=True)
     parser.add_argument(
         "--strategy",
-        choices=["candidate", "random"],
+        choices=["candidate", "iterative", "uniform"],
         default="candidate",
-        help="Use model candidates or deterministic legacy random draws.",
-    )
-    parser.add_argument(
-        "--placement_policy",
-        choices=["first_fit", "iterative"],
-        default="first_fit",
         help=(
-            "Place sourced candidates greedily or with deterministic multi-round "
-            "arbitration."
+            "Place overflow items greedily from model candidates (candidate), "
+            "from model candidates by deterministic multi-round arbitration "
+            "(iterative), or evenly over the least-loaded codes of their SID "
+            "prefix without candidates (uniform)."
         ),
-    )
-    parser.add_argument(
-        "--random_num_candidates",
-        type=int,
-        default=64,
-        help="Full-space random draws per overflow item for random strategy.",
     )
     parser.add_argument(
         "--rate_only",

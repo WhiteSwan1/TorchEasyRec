@@ -24,6 +24,8 @@ from tzrec.utils.sid.collision import (
     CollisionResolver,
     concat_ranges,
     lookup_sorted,
+    ranks_within_runs,
+    run_starts,
     stable_order_hash,
 )
 
@@ -41,25 +43,6 @@ class _BatchResolution:
     unresolved_rows: np.ndarray
     bucket_keys: np.ndarray
     bucket_counts: np.ndarray
-
-
-def _run_starts(ordered_values: np.ndarray) -> np.ndarray:
-    """Return start offsets of equal-value runs in a nonempty sorted array."""
-    return np.concatenate(
-        (
-            np.asarray([0], dtype=np.int64),
-            np.flatnonzero(ordered_values[1:] != ordered_values[:-1]) + 1,
-        )
-    )
-
-
-def _ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
-    """Return zero-based ranks within equal-value runs in a sorted array."""
-    starts = _run_starts(ordered_values)
-    ranks = np.arange(ordered_values.shape[0], dtype=np.int64)
-    return ranks - np.repeat(
-        starts, np.diff(np.append(starts, ordered_values.shape[0]))
-    )
 
 
 class IterativeCollisionResolver(CollisionResolver):
@@ -126,7 +109,7 @@ class IterativeCollisionResolver(CollisionResolver):
         unresolved_parts = []
         touched_key_parts = []
         touched_count_parts = []
-        prefix_starts = _run_starts(plan.overflow_bucket_key_prefixes)
+        prefix_starts = run_starts(plan.overflow_bucket_key_prefixes)
         _, in_overflow_prefix = lookup_sorted(
             plan.overflow_bucket_key_prefixes[prefix_starts] // last_size,
             plan.bucket_keys // last_size,
@@ -237,7 +220,7 @@ class IterativeCollisionResolver(CollisionResolver):
         last_size = plan.config.layer_sizes[-1]
         overflow_rows = plan.overflow_rows[span]
         row_count = overflow_rows.shape[0]
-        prefix_starts = _run_starts(plan.overflow_bucket_key_prefixes[span])
+        prefix_starts = run_starts(plan.overflow_bucket_key_prefixes[span])
         prefix_count = prefix_starts.shape[0]
         candidate_count = candidates.shape[1]
         prefix_first_keys = plan.overflow_bucket_key_prefixes[span][prefix_starts]
@@ -290,7 +273,7 @@ class IterativeCollisionResolver(CollisionResolver):
             if pending.size == 0:
                 break
 
-            origin_starts = _run_starts(origin_keys[pending])
+            origin_starts = run_starts(origin_keys[pending])
             origin_lengths = np.diff(np.append(origin_starts, pending.shape[0]))
             room_ranks = np.cumsum(has_room, axis=0, dtype=np.int32)
             room_ranks -= np.repeat(
@@ -311,15 +294,13 @@ class IterativeCollisionResolver(CollisionResolver):
             accepted = np.zeros(proposal_items.shape[0], dtype=bool)
             accepted[
                 target_order[
-                    _ranks_within_runs(ordered_targets)
+                    ranks_within_runs(ordered_targets)
                     < capacity - occupancy[ordered_targets]
                 ]
             ] = True
             # Proposals are row-major, so a row's first accepted one is its best.
             accepted_proposals = np.flatnonzero(accepted)
-            winners = accepted_proposals[
-                _run_starts(proposal_items[accepted_proposals])
-            ]
+            winners = accepted_proposals[run_starts(proposal_items[accepted_proposals])]
             won = np.zeros(proposal_items.shape[0], dtype=bool)
             won[winners] = True
             winners = target_order[won[target_order]]
@@ -327,7 +308,7 @@ class IterativeCollisionResolver(CollisionResolver):
             winner_targets = proposal_targets[winners]
 
             slot_indices[winner_items] = (
-                occupancy[winner_targets] + _ranks_within_runs(winner_targets) + 1
+                occupancy[winner_targets] + ranks_within_runs(winner_targets) + 1
             )
             np.add.at(occupancy, winner_targets, 1)
             assigned[winner_items] = True
@@ -339,7 +320,7 @@ class IterativeCollisionResolver(CollisionResolver):
         unresolved = ~assigned
         unresolved_keys = origin_keys[unresolved]
         slot_indices[unresolved] = (
-            occupancy[unresolved_keys] + _ranks_within_runs(unresolved_keys) + 1
+            occupancy[unresolved_keys] + ranks_within_runs(unresolved_keys) + 1
         )
         np.add.at(occupancy, unresolved_keys, 1)
 
