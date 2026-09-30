@@ -85,7 +85,6 @@ class UniformCollisionResolver(CollisionResolver):
         prefix_rows = np.diff(np.append(prefix_starts, overflow_count))
         prefix_keys = plan.overflow_bucket_key_prefixes[prefix_starts]
         prefix_ids = prefix_keys // last_size
-        prefix_count = prefix_starts.shape[0]
         _, in_overflow_prefix = lookup_sorted(prefix_ids, plan.bucket_keys // last_size)
 
         occupied_keys = plan.bucket_keys[in_overflow_prefix]
@@ -114,7 +113,9 @@ class UniformCollisionResolver(CollisionResolver):
             np.int64
         )
 
-        prefix_of_row = np.repeat(np.arange(prefix_count, dtype=np.int64), prefix_rows)
+        prefix_of_row = np.repeat(
+            np.arange(prefix_starts.shape[0], dtype=np.int64), prefix_rows
+        )
         ordered_rows = plan.overflow_rows[
             np.lexsort(
                 (
@@ -139,9 +140,12 @@ class UniformCollisionResolver(CollisionResolver):
             window_ends = np.cumsum(windows)
             first = 0
             while first < fast_prefixes.shape[0]:
-                start = int(window_ends[first] - windows[first])
                 end = int(
-                    np.searchsorted(window_ends, start + _WINDOW_CELLS, side="right")
+                    np.searchsorted(
+                        window_ends,
+                        int(window_ends[first] - windows[first]) + _WINDOW_CELLS,
+                        side="right",
+                    )
                 )
                 end = max(end, first + 1)
                 fast_key_parts.append(
@@ -210,14 +214,6 @@ class UniformCollisionResolver(CollisionResolver):
             ),
             collect_grouping,
         )
-        stats = CollisionResolutionStats(
-            total_items=plan.item_count,
-            raw_collision_buckets=int((combined_counts > capacity).sum()),
-            final_collision_buckets=final_collision_buckets,
-            relocated_count=overflow_count - unresolved_rows.shape[0],
-            unresolved_count=unresolved_rows.shape[0],
-            max_final_bucket_size=max_final_bucket_size,
-        )
         return CollisionResolutionResult(
             resolved_last_codes=resolved_last_codes,
             slot_indices=slot_indices,
@@ -225,7 +221,14 @@ class UniformCollisionResolver(CollisionResolver):
             final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
             grouping_collected=collect_grouping,
-            stats=stats,
+            stats=CollisionResolutionStats(
+                total_items=plan.item_count,
+                raw_collision_buckets=int((combined_counts > capacity).sum()),
+                final_collision_buckets=final_collision_buckets,
+                relocated_count=overflow_count - unresolved_rows.shape[0],
+                unresolved_count=unresolved_rows.shape[0],
+                max_final_bucket_size=max_final_bucket_size,
+            ),
         )
 
     @staticmethod
@@ -271,9 +274,14 @@ class UniformCollisionResolver(CollisionResolver):
         )
         codes %= last_size
         keys = prefix_keys[prefixes][owners] + codes
-        low = int(occupied_starts[prefixes[0]])
-        high = int(occupied_starts[prefixes[-1]] + occupied_lengths[prefixes[-1]])
-        _, taken = lookup_sorted(occupied_keys[low:high], keys)
+        _, taken = lookup_sorted(
+            occupied_keys[
+                int(occupied_starts[prefixes[0]]) : int(
+                    occupied_starts[prefixes[-1]] + occupied_lengths[prefixes[-1]]
+                )
+            ],
+            keys,
+        )
         free = np.flatnonzero(~taken)
         free_owners = owners[free]
         free = free[ranks_within_runs(free_owners) < prefix_rows[prefixes][free_owners]]
@@ -326,12 +334,15 @@ class UniformCollisionResolver(CollisionResolver):
         lengths = occupied_lengths[prefixes]
         selected = concat_ranges(occupied_starts[prefixes], lengths)
         owners = np.repeat(np.arange(group, dtype=np.int64), lengths)
-        positions = (
-            occupied_keys[selected]
-            - prefix_keys[prefixes][owners]
-            - rotations[prefixes][owners]
-        ) % last_size
-        loads[owners, positions] = occupied_counts[selected]
+        loads[
+            owners,
+            (
+                occupied_keys[selected]
+                - prefix_keys[prefixes][owners]
+                - rotations[prefixes][owners]
+            )
+            % last_size,
+        ] = occupied_counts[selected]
 
         rows = prefix_rows[prefixes]
         low = loads.min(axis=1)
@@ -348,15 +359,18 @@ class UniformCollisionResolver(CollisionResolver):
 
         below_cells = np.flatnonzero(below)
         below_counts = below.ravel()[below_cells]
-        level_cells = np.flatnonzero(at_level)
-        pair_cells = np.concatenate((np.repeat(below_cells, below_counts), level_cells))
         pair_levels = np.concatenate(
             (
                 concat_ranges(loads.ravel()[below_cells], below_counts),
                 np.repeat(level, at_level.sum(axis=1)),
             )
         )
-        pair_owners, pair_positions = np.divmod(pair_cells, last_size)
+        pair_owners, pair_positions = np.divmod(
+            np.concatenate(
+                (np.repeat(below_cells, below_counts), np.flatnonzero(at_level))
+            ),
+            last_size,
+        )
         order = np.lexsort((pair_positions, pair_levels, pair_owners))
         pair_owners = pair_owners[order]
         pair_codes = (

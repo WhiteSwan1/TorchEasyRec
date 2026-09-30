@@ -892,6 +892,14 @@ class ResolveSidCollisionsTest(unittest.TestCase):
         self.assertEqual(stats.unresolved_count, 0)
         self.assertFalse(os.path.exists(out))
 
+    def test_codes_layer_count_must_match_codebook(self) -> None:
+        inp = os.path.join(self.test_dir, "in.parquet")
+        out = os.path.join(self.test_dir, "out")
+        _parquet(inp, [0, 1], [[0, 0, 0], [0, 0, 1]])
+
+        with self.assertRaisesRegex(ValueError, "codes have 3 layers but --codebook"):
+            self._run(inp, out, layer_sizes=(8, 8))
+
     def test_empty_input_raises(self) -> None:
         inp = os.path.join(self.test_dir, "in.parquet")
         out = os.path.join(self.test_dir, "out")

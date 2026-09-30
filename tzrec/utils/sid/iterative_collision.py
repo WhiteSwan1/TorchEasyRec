@@ -167,14 +167,6 @@ class IterativeCollisionResolver(CollisionResolver):
             np.concatenate(touched_count_parts),
             collect_grouping,
         )
-        stats = CollisionResolutionStats(
-            total_items=plan.item_count,
-            raw_collision_buckets=int((combined_counts > capacity).sum()),
-            final_collision_buckets=final_collision_buckets,
-            relocated_count=plan.overflow_rows.size - unresolved_rows.size,
-            unresolved_count=unresolved_rows.size,
-            max_final_bucket_size=max_final_bucket_size,
-        )
         return CollisionResolutionResult(
             resolved_last_codes=resolved_last_codes,
             slot_indices=slot_indices,
@@ -182,7 +174,14 @@ class IterativeCollisionResolver(CollisionResolver):
             final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
             grouping_collected=collect_grouping,
-            stats=stats,
+            stats=CollisionResolutionStats(
+                total_items=plan.item_count,
+                raw_collision_buckets=int((combined_counts > capacity).sum()),
+                final_collision_buckets=final_collision_buckets,
+                relocated_count=plan.overflow_rows.size - unresolved_rows.size,
+                unresolved_count=unresolved_rows.size,
+                max_final_bucket_size=max_final_bucket_size,
+            ),
         )
 
     def _resolve_batch(
@@ -274,11 +273,10 @@ class IterativeCollisionResolver(CollisionResolver):
                 break
 
             origin_starts = run_starts(origin_keys[pending])
-            origin_lengths = np.diff(np.append(origin_starts, pending.shape[0]))
             room_ranks = np.cumsum(has_room, axis=0, dtype=np.int32)
             room_ranks -= np.repeat(
                 room_ranks[origin_starts] - has_room[origin_starts],
-                origin_lengths,
+                np.diff(np.append(origin_starts, pending.shape[0])),
                 axis=0,
             )
             proposals = np.flatnonzero(has_room & (room_ranks <= capacity))

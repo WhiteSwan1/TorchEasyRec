@@ -72,8 +72,7 @@ def concat_ranges(starts: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     steps = np.ones(total, dtype=np.int64)
     steps[0] = starts[0]
     if starts.shape[0] > 1:
-        boundaries = np.cumsum(lengths)[:-1]
-        steps[boundaries] = starts[1:] - (starts[:-1] + lengths[:-1]) + 1
+        steps[np.cumsum(lengths)[:-1]] = starts[1:] - (starts[:-1] + lengths[:-1]) + 1
     return np.cumsum(steps)
 
 
@@ -105,8 +104,7 @@ def run_starts(ordered_values: np.ndarray) -> np.ndarray:
 def ranks_within_runs(ordered_values: np.ndarray) -> np.ndarray:
     """Return zero-based ranks within equal-value runs in a sorted array."""
     starts = run_starts(ordered_values)
-    ranks = np.arange(ordered_values.shape[0], dtype=np.int64)
-    return ranks - np.repeat(
+    return np.arange(ordered_values.shape[0], dtype=np.int64) - np.repeat(
         starts, np.diff(np.append(starts, ordered_values.shape[0]))
     )
 
@@ -152,10 +150,11 @@ class PriorOccupancy:
         """
         prefixes = np.unique(np.asarray(prefix_ids, dtype=np.int64))
         starts = np.searchsorted(self.bucket_keys, prefixes * last_size, side="left")
-        stops = np.searchsorted(
-            self.bucket_keys, (prefixes + 1) * last_size, side="left"
+        selected = concat_ranges(
+            starts,
+            np.searchsorted(self.bucket_keys, (prefixes + 1) * last_size, side="left")
+            - starts,
         )
-        selected = concat_ranges(starts, stops - starts)
         return PriorOccupancy(self.bucket_keys[selected], self.bucket_counts[selected])
 
 
@@ -373,29 +372,27 @@ class CollisionResolver(ABC):
             A collision result that preserves the original assignments.
         """
         final_counts = plan.prior_bucket_counts + plan.bucket_counts
-        final_bucket_keys = (
-            plan.bucket_keys.copy() if collect_grouping else np.empty(0, dtype=np.int64)
-        )
-        final_bucket_counts = (
-            final_counts if collect_grouping else np.empty(0, dtype=np.int64)
-        )
-        max_final_bucket_size = int(final_counts.max()) if final_counts.size else 0
-        stats = CollisionResolutionStats(
-            total_items=plan.item_count,
-            raw_collision_buckets=0,
-            final_collision_buckets=0,
-            relocated_count=0,
-            unresolved_count=0,
-            max_final_bucket_size=max_final_bucket_size,
-        )
         return CollisionResolutionResult(
             resolved_last_codes=plan.original_last_codes,
             slot_indices=plan.initial_slot_indices,
             unresolved_rows=np.empty(0, dtype=np.int64),
-            final_bucket_keys=final_bucket_keys,
-            final_bucket_counts=final_bucket_counts,
+            final_bucket_keys=plan.bucket_keys.copy()
+            if collect_grouping
+            else np.empty(0, dtype=np.int64),
+            final_bucket_counts=final_counts
+            if collect_grouping
+            else np.empty(0, dtype=np.int64),
             grouping_collected=collect_grouping,
-            stats=stats,
+            stats=CollisionResolutionStats(
+                total_items=plan.item_count,
+                raw_collision_buckets=0,
+                final_collision_buckets=0,
+                relocated_count=0,
+                unresolved_count=0,
+                max_final_bucket_size=int(final_counts.max())
+                if final_counts.size
+                else 0,
+            ),
         )
 
     def _summarize_final_buckets(
@@ -423,23 +420,26 @@ class CollisionResolver(ABC):
             Final bucket keys, final bucket counts, number of over-capacity
             buckets, and maximum final bucket size.
         """
-        capacity = plan.config.capacity
         final_bucket_keys = np.empty(0, dtype=np.int64)
         final_bucket_counts = np.empty(0, dtype=np.int64)
         untouched_mask = ~in_overflow_prefix
         untouched_counts = initial_counts[untouched_mask]
-        collision_count = int((touched_counts > capacity).sum())
-        max_untouched = int(untouched_counts.max()) if untouched_counts.size else 0
-        max_touched = int(touched_counts.max()) if touched_counts.size else 0
-        max_bucket_size = max(max_untouched, max_touched)
         if collect_grouping:
-            untouched_keys = plan.bucket_keys[untouched_mask]
-            all_keys = np.concatenate((untouched_keys, touched_keys))
-            all_counts = np.concatenate((untouched_counts, touched_counts))
+            all_keys = np.concatenate((plan.bucket_keys[untouched_mask], touched_keys))
             occupancy_order = np.argsort(all_keys, kind="stable")
             final_bucket_keys = all_keys[occupancy_order]
-            final_bucket_counts = all_counts[occupancy_order]
-        return final_bucket_keys, final_bucket_counts, collision_count, max_bucket_size
+            final_bucket_counts = np.concatenate((untouched_counts, touched_counts))[
+                occupancy_order
+            ]
+        return (
+            final_bucket_keys,
+            final_bucket_counts,
+            int((touched_counts > plan.config.capacity).sum()),
+            max(
+                int(untouched_counts.max()) if untouched_counts.size else 0,
+                int(touched_counts.max()) if touched_counts.size else 0,
+            ),
+        )
 
     def _resolve_first_fit(
         self,
@@ -554,23 +554,21 @@ class CollisionResolver(ABC):
             np.fromiter(slot_counts.values(), dtype=np.int64, count=len(slot_counts)),
             collect_grouping,
         )
-        unresolved_array = np.asarray(unresolved_rows, dtype=np.int64)
-        stats = CollisionResolutionStats(
-            total_items=plan.item_count,
-            raw_collision_buckets=int((combined_counts > capacity).sum()),
-            final_collision_buckets=final_collision_buckets,
-            relocated_count=relocated_count,
-            unresolved_count=len(unresolved_rows),
-            max_final_bucket_size=max_final_bucket_size,
-        )
         return CollisionResolutionResult(
             resolved_last_codes=resolved_last_codes,
             slot_indices=slot_indices,
-            unresolved_rows=unresolved_array,
+            unresolved_rows=np.asarray(unresolved_rows, dtype=np.int64),
             final_bucket_keys=final_bucket_keys,
             final_bucket_counts=final_bucket_counts,
             grouping_collected=collect_grouping,
-            stats=stats,
+            stats=CollisionResolutionStats(
+                total_items=plan.item_count,
+                raw_collision_buckets=int((combined_counts > capacity).sum()),
+                final_collision_buckets=final_collision_buckets,
+                relocated_count=relocated_count,
+                unresolved_count=len(unresolved_rows),
+                max_final_bucket_size=max_final_bucket_size,
+            ),
         )
 
 
@@ -656,10 +654,9 @@ def sid_prefix_ids(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarra
 
 def sid_offset_codes(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
     """Shift each layer's codes into one contiguous vocabulary."""
-    starts = np.concatenate(
+    return np.asarray(codes) + np.concatenate(
         ([0], np.cumsum(np.asarray(layer_sizes[:-1], dtype=np.int64)))
     )
-    return np.asarray(codes) + starts
 
 
 def sid_bucket_keys(codes: np.ndarray, layer_sizes: tuple[int, ...]) -> np.ndarray:
@@ -687,7 +684,6 @@ def _within_bucket_rank(
         sorted_last_codes[1:] != sorted_last_codes[:-1]
     )
     first_sorted_rows = np.flatnonzero(is_first)
-    bucket_counts = np.diff(np.append(first_sorted_rows, row_count))
     del sorted_prefixes, sorted_last_codes, is_first
     bucket_ids = np.empty(row_count, dtype=np.int64)
     bucket_ranks = np.empty(row_count, dtype=np.int64)
@@ -697,18 +693,22 @@ def _within_bucket_rank(
         last_bucket = int(np.searchsorted(first_sorted_rows, end - 1, side="right") - 1)
         local_starts = first_sorted_rows[first_bucket : last_bucket + 1].copy()
         local_starts[0] = start
-        local_counts = np.diff(np.append(local_starts, end))
         sorted_bucket_ids = np.repeat(
             np.arange(first_bucket, last_bucket + 1, dtype=np.int64),
-            local_counts,
+            np.diff(np.append(local_starts, end)),
         )
         rows = sorted_rows[start:end]
         bucket_ids[rows] = sorted_bucket_ids
         bucket_ranks[rows] = (
             np.arange(start, end, dtype=np.int64) - first_sorted_rows[sorted_bucket_ids]
         )
-    representatives = sorted_rows[first_sorted_rows]
-    return bucket_ranks, bucket_ids, sorted_rows, representatives, bucket_counts
+    return (
+        bucket_ranks,
+        bucket_ids,
+        sorted_rows,
+        sorted_rows[first_sorted_rows],
+        np.diff(np.append(first_sorted_rows, row_count)),
+    )
 
 
 def prepare_collision_plan(
@@ -769,8 +769,9 @@ def prepare_collision_plan(
         )
 
     if not prior.is_empty:
-        key_space = math.prod(config.layer_sizes)
-        if int(prior.bucket_keys[0]) < 0 or int(prior.bucket_keys[-1]) >= key_space:
+        if int(prior.bucket_keys[0]) < 0 or int(prior.bucket_keys[-1]) >= math.prod(
+            config.layer_sizes
+        ):
             raise ValueError(
                 "prior bucket keys fall outside the key space of layer_sizes "
                 f"{config.layer_sizes}; check that --codebook matches the run "
@@ -779,14 +780,15 @@ def prepare_collision_plan(
 
     original_last_codes = codes[:, -1].astype(np.int64, copy=False)
     prefix_ids = sid_prefix_ids(codes, config.layer_sizes)
-    order_hashes = stable_order_hash(item_ids)
     (
         bucket_ranks,
         origin_bucket_indices,
         sorted_rows,
         representative_rows,
         bucket_counts,
-    ) = _within_bucket_rank(prefix_ids, original_last_codes, order_hashes)
+    ) = _within_bucket_rank(
+        prefix_ids, original_last_codes, stable_order_hash(item_ids)
+    )
 
     last_size = config.layer_sizes[-1]
     bucket_keys = (
@@ -798,7 +800,6 @@ def prepare_collision_plan(
         bucket_ranks += prior_bucket_counts[origin_bucket_indices]
     overflow_rows = sorted_rows[bucket_ranks[sorted_rows] >= config.capacity]
     bucket_ranks += 1
-    overflow_bucket_key_prefixes = prefix_ids[overflow_rows] * last_size
 
     return CollisionPlan(
         item_count=codes.shape[0],
@@ -809,7 +810,7 @@ def prepare_collision_plan(
         bucket_counts=bucket_counts,
         overflow_rows=overflow_rows,
         overflow_item_ids=item_ids[overflow_rows],
-        overflow_bucket_key_prefixes=overflow_bucket_key_prefixes,
+        overflow_bucket_key_prefixes=prefix_ids[overflow_rows] * last_size,
         overflow_origin_last_codes=original_last_codes[overflow_rows],
         config=config,
         prior=prior,
@@ -867,7 +868,6 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
     Returns:
         Sorted original SID keys, bucket counts, and grouped original row order.
     """
-    prior_bucket_counts = plan.prior_bucket_counts
 
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         for start in range(0, plan.item_count, _ROW_CHUNK_SIZE):
@@ -876,7 +876,8 @@ def build_original_item_grouping(plan: CollisionPlan) -> CodebookItemGrouping:
             yield (
                 np.arange(start, end, dtype=np.int64),
                 bucket_ids,
-                plan.initial_slot_indices[start:end] - prior_bucket_counts[bucket_ids],
+                plan.initial_slot_indices[start:end]
+                - plan.prior_bucket_counts[bucket_ids],
             )
 
     return _scatter_item_grouping(
@@ -916,7 +917,6 @@ def build_resolved_item_grouping(
     delta_counts = result.final_bucket_counts - final_prior_counts
     gained = delta_counts > 0
     sid_keys = result.final_bucket_keys[gained]
-    counts = delta_counts[gained]
     prior_counts = final_prior_counts[gained]
 
     def row_chunks() -> Iterable[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -935,4 +935,6 @@ def build_resolved_item_grouping(
                 result.slot_indices[chunk] - prior_counts[bucket_ids],
             )
 
-    return _scatter_item_grouping(sid_keys, counts, plan.item_count, row_chunks())
+    return _scatter_item_grouping(
+        sid_keys, delta_counts[gained], plan.item_count, row_chunks()
+    )

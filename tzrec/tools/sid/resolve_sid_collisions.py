@@ -176,13 +176,12 @@ class _ItemIdLookup:
         self._duplicate_requested_rows = self._sorted_to_requested[
             duplicate_sorted_rows
         ]
-        representative_sorted_rows = np.searchsorted(
-            self._sorted_ids,
-            self._sorted_ids[duplicate_sorted_rows],
-            side="left",
-        )
         self._representative_requested_rows = self._sorted_to_requested[
-            representative_sorted_rows
+            np.searchsorted(
+                self._sorted_ids,
+                self._sorted_ids[duplicate_sorted_rows],
+                side="left",
+            )
         ]
 
     def match(self, item_ids: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -364,16 +363,12 @@ class CollisionResolutionRunner:
     def run(self) -> CollisionResolutionStats:
         """Read, resolve collisions, and publish the resulting generation."""
         item_ids, codes = self._load_codes()
-        if codes.shape[1] != len(self._config.layer_sizes):
-            raise ValueError(
-                f"codes have {codes.shape[1]} layers but --codebook has "
-                f"{len(self._config.layer_sizes)}."
-            )
-        prior = self._load_prior_state(item_ids, codes)
         plan = prepare_collision_plan(
-            item_ids, codes, self._config.resolution_config, prior=prior
+            item_ids,
+            codes,
+            self._config.resolution_config,
+            prior=self._load_prior_state(item_ids, codes),
         )
-        collect_grouping = not self._config.rate_only and bool(plan.overflow_rows.size)
         candidate_last_codes = None
         if plan.overflow_rows.size and self._config.strategy != "uniform":
             candidate_last_codes = self._load_candidate_last_codes(
@@ -382,7 +377,8 @@ class CollisionResolutionRunner:
         result = self._resolver.resolve(
             plan,
             candidate_last_codes,
-            collect_grouping=collect_grouping,
+            collect_grouping=not self._config.rate_only
+            and bool(plan.overflow_rows.size),
         )
         del candidate_last_codes
 
@@ -484,8 +480,11 @@ class CollisionResolutionRunner:
                 .astype(np.int64, copy=False)
             )
         elif pa.types.is_integer(values.type):
-            array = values.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
-            return array.reshape(-1, 1)
+            return (
+                values.to_numpy(zero_copy_only=False)
+                .astype(np.int64, copy=False)
+                .reshape(-1, 1)
+            )
         else:
             parts = pc.split_pattern(values, ",")
             row_count = len(parts)
@@ -549,8 +548,11 @@ class CollisionResolutionRunner:
         del id_batches
         code_matrix = np.concatenate(code_batches, axis=0)
         del code_batches
-        if code_matrix.shape[1] < 1:
-            raise ValueError("SID codes must have at least one layer.")
+        if code_matrix.shape[1] != len(self._config.layer_sizes):
+            raise ValueError(
+                f"codes have {code_matrix.shape[1]} layers but --codebook has "
+                f"{len(self._config.layer_sizes)}."
+            )
         return item_id_array, code_matrix
 
     def _candidate_last_matrix(self, values: pa.Array) -> np.ndarray:
@@ -587,14 +589,15 @@ class CollisionResolutionRunner:
         candidates: Optional[np.ndarray] = None
         seen = np.zeros(item_count, dtype=bool)
         field = self._config.candidate_codes_field
-        reader = self._make_reader([self._config.item_id_field, field])
         scanned_items = 0
         progress = ProgressLogger(
             "Scanning candidate input",
             start_n=0,
             miniters=self._config.progress_interval,
         )
-        for batch in reader.to_batches():
+        for batch in self._make_reader(
+            [self._config.item_id_field, field]
+        ).to_batches():
             if field not in batch:
                 raise ValueError(
                     f"candidate_codes field {field!r} is missing from an input batch."
@@ -606,8 +609,9 @@ class CollisionResolutionRunner:
             if source_rows.size == 0:
                 continue
 
-            selected = pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
-            batch_candidates = self._candidate_last_matrix(selected)
+            batch_candidates = self._candidate_last_matrix(
+                pc.take(batch[field], pa.array(source_rows, type=pa.int64()))
+            )
             if candidates is None:
                 candidates = np.empty(
                     (item_count, batch_candidates.shape[1]), dtype=np.int64
@@ -636,24 +640,32 @@ class CollisionResolutionRunner:
         return candidates
 
     def _load_prior_state(
-        self, item_ids: np.ndarray, codes: np.ndarray
+        self, new_item_ids: np.ndarray, new_codes: np.ndarray
     ) -> PriorOccupancy:
-        """Load and verify published state, or return empty for a full resolve."""
+        """Load and verify published state, or return empty for a full resolve.
+
+        Args:
+            new_item_ids: IDs of the items this run places.
+            new_codes: Their SID matrix, shape ``(N, n_layers)``; only its prefixes
+                are used, to load the published buckets those items can touch.
+
+        Returns:
+            Occupancy of the published buckets in the touched prefixes.
+        """
         if not self._config.is_append:
             logger.info("full-resolve mode: no existing SID state supplied")
             return PriorOccupancy.empty()
 
-        layer_sizes = self._config.layer_sizes
         prior, published_items = self._load_prior_occupancy(
             self._bundle.prior_sid_to_items_path,
-            sid_prefix_ids(codes, layer_sizes),
-            item_ids,
+            sid_prefix_ids(new_codes, self._config.layer_sizes),
+            new_item_ids,
         )
         self._check_existing_item_to_sid_size(published_items)
         logger.info(
             "append mode: %d new items onto %d published items; %d published "
             "buckets loaded from the prefixes this run touches, generation %s",
-            item_ids.shape[0],
+            new_item_ids.shape[0],
             published_items,
             prior.bucket_keys.shape[0],
             self._config.from_generation,
@@ -666,15 +678,12 @@ class CollisionResolutionRunner:
             lists = values
         else:
             lists = pc.split_pattern(pc.cast(values, pa.string()), ",")
-        lengths = (
-            pc.list_value_length(lists)
-            .to_numpy(zero_copy_only=False)
-            .astype(np.int64, copy=False)
-        )
         flat = lists.flatten()
         if flat.type != self._item_id_type:
             flat = pc.cast(flat, self._item_id_type)
-        return lengths, flat
+        return pc.list_value_length(lists).to_numpy(zero_copy_only=False).astype(
+            np.int64, copy=False
+        ), flat
 
     def _offset_codes_column(self, codes: np.ndarray, is_csv: bool) -> pa.Array:
         """Encode an SID matrix shifted into one contiguous vocabulary."""
@@ -684,11 +693,11 @@ class CollisionResolutionRunner:
 
     def _align_codes_column(self, values: pa.Array, is_csv: bool) -> pa.Array:
         """Return an SID column in the encoding the destination writer needs."""
-        source_is_text = pa.types.is_string(values.type) or pa.types.is_large_string(
-            values.type
-        )
-        matches_writer = source_is_text if is_csv else _is_list_column(values)
-        if matches_writer:
+        if (
+            (pa.types.is_string(values.type) or pa.types.is_large_string(values.type))
+            if is_csv
+            else _is_list_column(values)
+        ):
             return values
         return self._codes_column(self._codes_matrix(values), is_csv)
 
@@ -709,7 +718,7 @@ class CollisionResolutionRunner:
         """Read touched-prefix occupancy and item count from published sid_to_items."""
         layer_sizes = self._config.layer_sizes
         wanted_prefixes = np.unique(prefix_ids)
-        new_item_ids = self._item_id_array(item_ids)
+        new_id_values = self._item_id_array(item_ids)
 
         key_batches: List[np.ndarray] = []
         count_batches: List[np.ndarray] = []
@@ -735,7 +744,7 @@ class CollisionResolutionRunner:
             lengths, flat_ids = self._decode_grouped_item_ids(batch["itemids"])
             published_items += int(lengths.sum())
             if len(flat_ids):
-                published = pc.is_in(flat_ids, value_set=new_item_ids)
+                published = pc.is_in(flat_ids, value_set=new_id_values)
                 batch_overlap = published.true_count
                 overlap_count += batch_overlap
                 if batch_overlap and len(overlapping) < 10:
@@ -882,12 +891,12 @@ class CollisionResolutionRunner:
         """
         if not self._config.is_append:
             return 0
-        path = self._bundle.prior_item_to_sid_path
         is_csv = self._resolved_writer_type == "CsvWriter"
-        fields = ["item_id", "origin_codebook", "codebook", "index"]
         written = 0
         for batch in self._iter_state_batches(
-            path, fields, "Copying published item_to_sid"
+            self._bundle.prior_item_to_sid_path,
+            ["item_id", "origin_codebook", "codebook", "index"],
+            "Copying published item_to_sid",
         ):
             item_id_column = batch["item_id"]
             self._check_state_item_id_type(item_id_column)
@@ -949,12 +958,11 @@ class CollisionResolutionRunner:
             grouping = build_resolved_item_grouping(plan, result)
         else:
             grouping = build_original_item_grouping(plan)
-        write = (
+        (
             self._write_merged_sid_to_items
             if self._config.is_append
             else self._write_sid_to_items
-        )
-        write(item_ids, origin_codes, grouping, result.resolved_last_codes)
+        )(item_ids, origin_codes, grouping, result.resolved_last_codes)
 
     def _emit_sid_to_items_rows(
         self,
@@ -1011,17 +1019,13 @@ class CollisionResolutionRunner:
         resolved_last_codes: np.ndarray,
     ) -> None:
         """Merge this run's buckets into the published sid_to_items, writing both."""
-        resolved_path = self._bundle.sid_to_items_path
-        existing_path = self._bundle.prior_sid_to_items_path
-        layer_sizes = self._config.layer_sizes
         groups = self._build_append_groups(
             item_ids, origin_codes, grouping, resolved_last_codes
         )
-        group_count = groups.keys.shape[0]
 
         corpus_rows = 0
         delta_rows = 0
-        writer = self._make_writer(resolved_path, "ParquetWriter")
+        writer = self._make_writer(self._bundle.sid_to_items_path, "ParquetWriter")
         delta_writer = self._make_writer(
             self._bundle.delta_sid_to_items_path, "ParquetWriter"
         )
@@ -1039,12 +1043,13 @@ class CollisionResolutionRunner:
                 delta_writer, codes, offsets, values, rows
             )
 
-        max_rows = _ARROW_LIST_OFFSET_MAX // groups.codes.shape[1]
-
         def emit_new_only(low: int, high: int) -> None:
             """Write rows this run created in buckets nobody occupied."""
             for start, stop, child_low, child_high in _group_chunk_bounds(
-                groups.offsets, low, high, max_rows
+                groups.offsets,
+                low,
+                high,
+                _ARROW_LIST_OFFSET_MAX // groups.codes.shape[1],
             ):
                 emit(
                     groups.codes[start:stop],
@@ -1055,12 +1060,12 @@ class CollisionResolutionRunner:
 
         cursor = 0
         for batch in self._iter_state_batches(
-            existing_path,
+            self._bundle.prior_sid_to_items_path,
             ["codebook", "itemids"],
             "Writing merged sid_to_items",
         ):
             batch_codes = self._codes_matrix(batch["codebook"])
-            batch_keys = sid_bucket_keys(batch_codes, layer_sizes)
+            batch_keys = sid_bucket_keys(batch_codes, self._config.layer_sizes)
             if batch_keys.size == 0:
                 continue
             low = int(np.searchsorted(groups.keys, batch_keys[0], side="left"))
@@ -1088,7 +1093,7 @@ class CollisionResolutionRunner:
                     )
                 )
             cursor = high
-        emit_new_only(cursor, group_count)
+        emit_new_only(cursor, groups.keys.shape[0])
         writer.close()
         delta_writer.close()
         self._bundle.record_sid_to_items(corpus_rows)
@@ -1112,33 +1117,33 @@ class CollisionResolutionRunner:
         Raises:
             ValueError: If one bucket exceeds Arrow list offset capacity.
         """
-        output_path = self._bundle.sid_to_items_path
-        group_count = grouping.counts.shape[0]
         written = 0
         if np.any(grouping.counts > _ARROW_LIST_OFFSET_MAX):
             raise ValueError("one SID bucket exceeds Arrow list offset capacity.")
 
         offsets = grouping.offsets
-        writer = self._make_writer(output_path, "ParquetWriter")
+        writer = self._make_writer(self._bundle.sid_to_items_path, "ParquetWriter")
         progress = ProgressLogger(
             "Writing resolved sid_to_items",
             start_n=0,
             miniters=self._config.progress_interval,
         )
-        max_codebook_rows = _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1]
         for group_start, group_end, child_start, child_end in _group_chunk_bounds(
-            offsets, 0, group_count, max_codebook_rows
+            offsets,
+            0,
+            grouping.counts.shape[0],
+            _ARROW_LIST_OFFSET_MAX // origin_codes.shape[1],
         ):
-            rows = grouping.row_order[child_start:child_end]
-            local_offsets = offsets[group_start : group_end + 1] - child_start
             representative_rows = grouping.row_order[offsets[group_start:group_end]]
             code_chunk = origin_codes[representative_rows]
             code_chunk[:, -1] = resolved_last_codes[representative_rows]
             written += self._emit_sid_to_items_rows(
                 writer,
                 code_chunk,
-                local_offsets,
-                self._item_id_array(item_ids[rows]),
+                offsets[group_start : group_end + 1] - child_start,
+                self._item_id_array(
+                    item_ids[grouping.row_order[child_start:child_end]]
+                ),
             )
             progress.log(child_end)
         writer.close()
@@ -1150,8 +1155,12 @@ def _group_chunk_bounds(
 ) -> Iterator[Tuple[int, int, int, int]]:
     """Split ``[low, high)`` groups into writable chunks and their child spans."""
     while low < high:
-        child_limit = int(offsets[low]) + _SID_TO_ITEMS_WRITE_SIZE
-        stop = int(np.searchsorted(offsets, child_limit, side="right") - 1)
+        stop = int(
+            np.searchsorted(
+                offsets, int(offsets[low]) + _SID_TO_ITEMS_WRITE_SIZE, side="right"
+            )
+            - 1
+        )
         stop = min(max(stop, low + 1), low + max_rows, high)
         yield low, stop, int(offsets[low]), int(offsets[stop])
         low = stop
@@ -1215,9 +1224,6 @@ def _merge_group_batch(
 
     child_low = int(groups.offsets[low])
     child_high = int(groups.offsets[high])
-    combined = pa.chunked_array(
-        [batch_values, groups.item_ids.slice(child_low, child_high - child_low)]
-    )
     # both sides are consumed in order, so each gather source is a plain arange
     batch_children = len(batch_values)
     gather = np.empty(int(offsets[-1]), dtype=np.int64)
@@ -1227,8 +1233,16 @@ def _merge_group_batch(
     gather[concat_ranges(offsets[:-1] + batch_part, new_part)] = np.arange(
         batch_children, batch_children + child_high - child_low, dtype=np.int64
     )
-    values = combined.take(pa.array(gather, type=pa.int64())).combine_chunks()
-    return codes, offsets, values, np.flatnonzero(has_new)
+    return (
+        codes,
+        offsets,
+        pa.chunked_array(
+            [batch_values, groups.item_ids.slice(child_low, child_high - child_low)]
+        )
+        .take(pa.array(gather, type=pa.int64()))
+        .combine_chunks(),
+        np.flatnonzero(has_new),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1342,8 +1356,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     """Run SID collision resolution from command-line arguments."""
-    config = ResolveSidCollisionsConfig.from_namespace(build_parser().parse_args())
-    CollisionResolutionRunner(config).run()
+    CollisionResolutionRunner(
+        ResolveSidCollisionsConfig.from_namespace(build_parser().parse_args())
+    ).run()
 
 
 if __name__ == "__main__":
