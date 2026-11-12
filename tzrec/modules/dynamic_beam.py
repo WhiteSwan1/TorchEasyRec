@@ -21,6 +21,26 @@ import torch
 from transformers import PreTrainedModel
 
 
+def build_sid_prefix_masks(
+    allowed_sids: torch.Tensor, bands: Sequence[Tuple[int, int]]
+) -> List[torch.Tensor]:
+    """Compile a dense SID-membership mask into per-level legal-prefix masks.
+
+    Args:
+        allowed_sids: flat boolean mask indexed by mixed-radix local SID codes.
+        bands: inclusive token-band bounds, one pair per SID level.
+
+    Returns:
+        A flat boolean mask per depth on the input device. A prefix is legal
+        exactly when at least one allowed complete SID extends it. Build once
+        with the catalog, then reuse the masks across decode calls.
+    """
+    masks = [allowed_sids]
+    for lo, hi in reversed(bands[1:]):
+        masks.append(masks[-1].reshape(-1, hi - lo + 1).any(dim=-1))
+    return list(reversed(masks))
+
+
 def capped_beam_widths(
     beam_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
@@ -57,6 +77,7 @@ def dynamic_beam_search(
     bands: Sequence[Tuple[int, int]],
     final_topk_per_prefix: bool = False,
     allowed_sids: Optional[torch.Tensor] = None,
+    allowed_prefixes: Optional[Sequence[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
 
@@ -70,6 +91,9 @@ def dynamic_beam_search(
             the surviving prefixes supply. The model derives it once at init.
         allowed_sids: optional flat boolean SID-membership mask, indexed by
             mixed-radix local codes. Invalid final candidates receive -inf.
+        allowed_prefixes: optional masks from ``build_sid_prefix_masks``.
+            Apply before TopK at every level, preserving the full-vocabulary
+            normalizer. Takes precedence over the final-only allowed_sids mask.
         final_topk_per_prefix: retain a local token TopK at the last level,
             then merge all retained candidates in cumulative-score order.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
@@ -103,7 +127,9 @@ def dynamic_beam_search(
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)
-    if allowed_sids is not None and num_levels == 1:
+    if allowed_prefixes is not None:
+        scores = scores.masked_fill(~allowed_prefixes[0].reshape(1, -1), float("-inf"))
+    elif allowed_sids is not None and num_levels == 1:
         scores = scores.masked_fill(~allowed_sids.reshape(1, -1), float("-inf"))
     beam_scores, band_idx = scores.topk(capped_widths[0], dim=-1)
     seq = (band_idx + bands[0][0]).reshape(-1, 1)
@@ -133,12 +159,17 @@ def dynamic_beam_search(
         band_size = band_hi - band_lo + 1
         scores = _band_logp(outputs.logits[:, -1, :], level)
         scores = scores + beam_scores[:, None]
-        if allowed_sids is not None and level + 1 == num_levels:
+        level_mask = None
+        if allowed_prefixes is not None:
+            level_mask = allowed_prefixes[level]
+        elif allowed_sids is not None and level + 1 == num_levels:
+            level_mask = allowed_sids
+        if level_mask is not None:
             prefix = seq[:, 0] - bands[0][0]
             for previous_level in range(1, level):
                 lo, hi = bands[previous_level]
                 prefix = prefix * (hi - lo + 1) + seq[:, previous_level] - lo
-            allowed = allowed_sids.view(-1, band_size)[prefix]
+            allowed = level_mask.reshape(-1, band_size)[prefix]
             scores = scores.masked_fill(~allowed, float("-inf"))
         if final_topk_per_prefix and level + 1 == num_levels:
             local_k = capped_widths[level] // width

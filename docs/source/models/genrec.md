@@ -169,6 +169,11 @@ model_config {
 设置为 `true` 后，前两层保持全局 beam 剪枝，最后一项表示每个存活前缀保留的末层 token 数；
 合并这些候选后按完整序列累计分数排序，再返回 `num_return_sequences` 条 SID。
 例如 `beam_widths: [20, 20, 20]` 对应最多 400 条末层候选，可以设置 `num_return_sequences: 200`。
+
+低层 `dynamic_beam_search` 接口支持目录前缀约束：调用端用同代合法 SID 的布尔表调用
+`build_sid_prefix_masks`，将返回值通过 `allowed_prefixes` 传入。每层取 TopK 前会过滤
+不能延伸到合法完整 SID 的前缀；分数仍按完整词表归一化，不对合法子集重新归一化。
+前缀表应在目录加载时构建并复用。该参数是 Python 解码接口的可选参数，不是模型配置字段。
 实际容量为上一层存活前缀数乘以末层 TopK 与合法 token 数的较小值，返回数量不能超过该容量。
 该数量仍是 SID 数，映射后的有效物品数需由调用方另行检查。
 

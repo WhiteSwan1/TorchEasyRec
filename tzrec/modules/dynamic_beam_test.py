@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Tuple
 import torch
 from parameterized import parameterized
 
-from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
+from tzrec.modules.dynamic_beam import (
+    build_sid_prefix_masks,
+    capped_beam_widths,
+    dynamic_beam_search,
+)
 from tzrec.utils.test_util import (
     create_tiny_causal_lm,
     flash_attn_unavailable,
@@ -35,6 +39,7 @@ def _decode(
     attention_mask=None,
     final_topk_per_prefix=False,
     allowed_sids=None,
+    allowed_prefixes=None,
 ):
     """Run the kernel over ``pairs`` of inclusive per-level (lo, hi) band edges.
 
@@ -52,6 +57,7 @@ def _decode(
         bands=pairs,
         final_topk_per_prefix=final_topk_per_prefix,
         allowed_sids=allowed_sids,
+        allowed_prefixes=allowed_prefixes,
     )
 
 
@@ -93,6 +99,78 @@ def _bruteforce_scores(lm, input_ids, attention_mask, pairs):
 
 
 class DynamicBeamSearchTest(unittest.TestCase):
+    def test_prefix_masks_match_catalog_trie(self) -> None:
+        pairs = [(20, 22), (5, 8), (25, 26)]
+        allowed = torch.zeros(3, 4, 2, dtype=torch.bool)
+        paths = [(0, 1, 0), (0, 3, 1), (2, 2, 1)]
+        for path in paths:
+            allowed[path] = True
+        masks = build_sid_prefix_masks(allowed.flatten(), pairs)
+        for depth, mask in enumerate(masks, start=1):
+            shape = allowed.shape[:depth]
+            actual = {tuple(row) for row in mask.reshape(shape).nonzero().tolist()}
+            self.assertEqual(actual, {path[:depth] for path in paths})
+
+    def test_prefix_constraint_prevents_early_pruning_of_only_legal_sid(self) -> None:
+        pairs = [(20, 22), (5, 7), (25, 27)]
+        lm = create_tiny_causal_lm(vocab_size=30)
+        ids = torch.tensor([[5, 6, 7, 8]])
+        unmasked = _decode(lm, ids, pairs, beam_widths=[1, 1, 1])[0]
+        legal = ((int(unmasked[0]) - 20 + 1) % 3, 1, 0)
+        allowed = torch.zeros(3, 3, 3, dtype=torch.bool)
+        allowed[legal] = True
+        only_final = _decode(
+            lm, ids, pairs, beam_widths=[1, 1, 1], allowed_sids=allowed.flatten()
+        )
+        self.assertNotEqual(int(only_final[0, 0]), legal[0] + 20)
+        constrained = _decode(
+            lm,
+            ids,
+            pairs,
+            beam_widths=[1, 1, 1],
+            allowed_prefixes=build_sid_prefix_masks(allowed.flatten(), pairs),
+        )
+        self.assertEqual(constrained.tolist(), [[legal[0] + 20, 6, 25]])
+
+    def test_prefix_constraint_preserves_full_vocab_score_order(self) -> None:
+        pairs = [(20, 21), (5, 7), (25, 26)]
+        lm = create_tiny_causal_lm(vocab_size=30)
+        ids = torch.tensor([[5, 6, 7, 8]])
+        allowed = torch.zeros(2, 3, 2, dtype=torch.bool)
+        paths = [(0, 0, 0), (0, 2, 1), (1, 1, 0), (1, 1, 1)]
+        for path in paths:
+            allowed[path] = True
+        ref = _bruteforce_scores(lm, ids, torch.ones_like(ids), pairs)
+        expected = [
+            tuple(local + lo for local, (lo, _) in zip(path, pairs)) for path in paths
+        ]
+        expected.sort(key=ref.__getitem__, reverse=True)
+        output = _decode(
+            lm,
+            ids,
+            pairs,
+            beam_widths=[2, 6, 2],
+            final_topk_per_prefix=True,
+            allowed_prefixes=build_sid_prefix_masks(allowed.flatten(), pairs),
+        )
+        self.assertEqual(
+            [tuple(row) for row in output[: len(paths)].tolist()], expected
+        )
+
+    def test_single_level_prefix_constraint(self) -> None:
+        pairs = [(20, 23)]
+        lm = create_tiny_causal_lm(vocab_size=30)
+        ids = torch.tensor([[5, 6, 7, 8]])
+        allowed = torch.tensor([False, False, True, False])
+        output = _decode(
+            lm,
+            ids,
+            pairs,
+            beam_widths=[1],
+            allowed_prefixes=build_sid_prefix_masks(allowed, pairs),
+        )
+        self.assertEqual(output.tolist(), [[22]])
+
     @parameterized.expand(
         [
             [[20, 20, 200]],
