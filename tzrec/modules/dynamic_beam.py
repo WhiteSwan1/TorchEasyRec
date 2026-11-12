@@ -19,6 +19,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedModel
+from transformers.cache_utils import Cache
 
 
 def build_sid_prefix_masks(
@@ -78,6 +79,7 @@ def dynamic_beam_search(
     final_topk_per_prefix: bool = False,
     allowed_sids: Optional[torch.Tensor] = None,
     allowed_prefixes: Optional[Sequence[torch.Tensor]] = None,
+    initial_cache: Optional[Cache] = None,
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
 
@@ -94,6 +96,8 @@ def dynamic_beam_search(
         allowed_prefixes: optional masks from ``build_sid_prefix_masks``.
             Apply before TopK at every level, preserving the full-vocabulary
             normalizer. Takes precedence over the final-only allowed_sids mask.
+        initial_cache: optional cache supplied to prefill, for specialized
+            inference storage that implements the same branching protocol.
         final_topk_per_prefix: retain a local token TopK at the last level,
             then merge all retained candidates in cumulative-score order.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
@@ -118,12 +122,16 @@ def dynamic_beam_search(
         return logits[:, band_lo : band_hi + 1].float() - log_z
 
     position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+    cache_kwargs = (
+        {"past_key_values": initial_cache} if initial_cache is not None else {}
+    )
     outputs = model(
         inputs_embeds=prompt_embeds,
         attention_mask=attention_mask,
         position_ids=position_ids,
         use_cache=True,
         logits_to_keep=1,
+        **cache_kwargs,
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)
