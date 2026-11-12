@@ -15,28 +15,35 @@ The caller owns the width schedule; this module only enforces what each level
 can supply.
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedModel
 
 
 def capped_beam_widths(
-    beam_widths: Sequence[int], bands: Sequence[Tuple[int, int]]
+    beam_widths: Sequence[int],
+    bands: Sequence[Tuple[int, int]],
+    final_topk_per_prefix: bool = False,
 ) -> List[int]:
     """Cap each requested width to the candidates its band and prefixes supply.
 
     Args:
         beam_widths: requested width per SID level.
         bands: inclusive ``(lo, hi)`` token-id edge per level.
+        final_topk_per_prefix: treat the last width as a per-parent token limit.
 
     Returns:
         The capped width per level.
     """
     capped: List[int] = []
     previous = 1
-    for requested, (band_lo, band_hi) in zip(beam_widths, bands):
-        capped.append(min(requested, previous * (band_hi - band_lo + 1)))
+    for level, (requested, (band_lo, band_hi)) in enumerate(zip(beam_widths, bands)):
+        band_size = band_hi - band_lo + 1
+        if final_topk_per_prefix and level + 1 == len(bands):
+            capped.append(previous * min(requested, band_size))
+        else:
+            capped.append(min(requested, previous * band_size))
         previous = capped[-1]
     return capped
 
@@ -48,6 +55,8 @@ def dynamic_beam_search(
     attention_mask: torch.Tensor,
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
+    final_topk_per_prefix: bool = False,
+    allowed_sids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Decode SID answers with a caller-supplied per-level beam width.
 
@@ -59,6 +68,10 @@ def dynamic_beam_search(
         attention_mask: prompt mask ``(B, P)``.
         capped_widths: width per SID level, already capped to what its band and
             the surviving prefixes supply. The model derives it once at init.
+        allowed_sids: optional flat boolean SID-membership mask, indexed by
+            mixed-radix local codes. Invalid final candidates receive -inf.
+        final_topk_per_prefix: retain a local token TopK at the last level,
+            then merge all retained candidates in cumulative-score order.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level. Host ints,
             because every use of them is a host-side slice bound.
 
@@ -90,6 +103,8 @@ def dynamic_beam_search(
     )
     cache = outputs.past_key_values
     scores = _band_logp(outputs.logits[:, -1, :], 0)
+    if allowed_sids is not None and num_levels == 1:
+        scores = scores.masked_fill(~allowed_sids.reshape(1, -1), float("-inf"))
     beam_scores, band_idx = scores.topk(capped_widths[0], dim=-1)
     seq = (band_idx + bands[0][0]).reshape(-1, 1)
     beam_scores = beam_scores.reshape(-1)
@@ -118,9 +133,26 @@ def dynamic_beam_search(
         band_size = band_hi - band_lo + 1
         scores = _band_logp(outputs.logits[:, -1, :], level)
         scores = scores + beam_scores[:, None]
-        beam_scores, flat_idx = scores.view(batch_size, width * band_size).topk(
-            capped_widths[level], dim=-1
-        )
+        if allowed_sids is not None and level + 1 == num_levels:
+            prefix = seq[:, 0] - bands[0][0]
+            for previous_level in range(1, level):
+                lo, hi = bands[previous_level]
+                prefix = prefix * (hi - lo + 1) + seq[:, previous_level] - lo
+            allowed = allowed_sids.view(-1, band_size)[prefix]
+            scores = scores.masked_fill(~allowed, float("-inf"))
+        if final_topk_per_prefix and level + 1 == num_levels:
+            local_k = capped_widths[level] // width
+            local_scores, local_idx = scores.topk(local_k, dim=-1)
+            beam_scores, merged_idx = local_scores.view(batch_size, -1).sort(
+                dim=-1, descending=True
+            )
+            flat_idx = merged_idx // local_k * band_size + local_idx.view(
+                batch_size, -1
+            ).gather(1, merged_idx)
+        else:
+            beam_scores, flat_idx = scores.view(batch_size, width * band_size).topk(
+                capped_widths[level], dim=-1
+            )
         next_token = band_lo + flat_idx % band_size
         parent = (flat_idx // band_size + row_starts[:, None] * width).reshape(-1)
         seq = torch.cat([seq[parent], next_token.reshape(-1, 1)], dim=1)

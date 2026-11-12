@@ -165,6 +165,13 @@ model_config {
 | `common.num_return_sequences` | 必填，返回的 SID 数量，至少为 `1`，不得超过最后一层实际可保留的 beam 数                                        |
 | `common.generated_sids_key`   | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
 
+`common.final_topk_per_prefix` 默认为 `false`，此时每层 `beam_widths` 都是全局保留数量。
+设置为 `true` 后，前两层保持全局 beam 剪枝，最后一项表示每个存活前缀保留的末层 token 数；
+合并这些候选后按完整序列累计分数排序，再返回 `num_return_sequences` 条 SID。
+例如 `beam_widths: [20, 20, 20]` 对应最多 400 条末层候选，可以设置 `num_return_sequences: 200`。
+实际容量为上一层存活前缀数乘以末层 TopK 与合法 token 数的较小值，返回数量不能超过该容量。
+该数量仍是 SID 数，映射后的有效物品数需由调用方另行检查。
+
 `hf_model_name_or_path` 指定模型 ID 时，所需配置和预训练权重会自动下载并缓存。
 
 示例使用 FP32 参数，并通过 `train_config.mixed_precision: "BF16"` 开启混合精度计算。使用 `flash_attention_2` 时，需要 NVIDIA GPU、与项目环境匹配的 FlashAttention 依赖，并将混合精度设置为 BF16 或 FP16。

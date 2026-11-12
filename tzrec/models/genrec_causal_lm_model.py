@@ -82,6 +82,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
         self._capped_widths, self._num_return_sequences = resolve_beam_config(
             common, self._bands
         )
+        self._final_topk_per_prefix = common.final_topk_per_prefix
 
     def predict(self, batch: Batch) -> Dict[str, torch.Tensor]:
         """Run teacher-forced loss or inference decode over the assembled stream.
@@ -227,6 +228,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             self._capped_widths,
             self._bands,
             self._num_return_sequences,
+            self._final_topk_per_prefix,
         )
 
 
@@ -260,7 +262,7 @@ def resolve_beam_config(
         raise ValueError(
             f"num_return_sequences must be >= 1, got {num_return_sequences}."
         )
-    capped_widths = capped_beam_widths(beam_widths, bands)
+    capped_widths = capped_beam_widths(beam_widths, bands, common.final_topk_per_prefix)
     if num_return_sequences > capped_widths[-1]:
         raise ValueError(
             f"num_return_sequences ({num_return_sequences}) must not exceed the "
@@ -304,6 +306,7 @@ def generate_codes(
     capped_widths: Sequence[int],
     bands: Sequence[Tuple[int, int]],
     num_return_sequences: int,
+    final_topk_per_prefix: bool = False,
 ) -> torch.Tensor:
     """Beam-search the SID answer of packed prompts.
 
@@ -315,12 +318,15 @@ def generate_codes(
         capped_widths: beam width per SID level, already capped.
         bands: inclusive ``(lo, hi)`` token-id edge per SID level.
         num_return_sequences: beams to return per row.
+        final_topk_per_prefix: use a per-parent token limit at the last level.
 
     Returns:
         ``(rows, num_return_sequences, num_levels)`` local codes, best first.
     """
     padded, mask = _left_pad(embeds, cu_seqlens, max_seqlen)
-    tokens = dynamic_beam_search(lm, padded, mask, capped_widths, bands)
+    tokens = dynamic_beam_search(
+        lm, padded, mask, capped_widths, bands, final_topk_per_prefix
+    )
     # a band starts at base_vocab_size + level_offset, so this undoes both shifts
     codes = tokens - tokens.new_tensor([lo for lo, _ in bands])
     codes = codes.view(padded.shape[0], -1, len(bands))

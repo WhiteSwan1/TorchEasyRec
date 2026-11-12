@@ -26,6 +26,10 @@ message GenRecModelConfig {
     optional ParamDtype lm_parameter_dtype = 5 [default = FP32];
 
     optional string attn_kernel = 6 [default = "sdpa"];
+
+    // Interpret the last beam width as TopK tokens per surviving prefix.
+    // num_return_sequences is bounded by their merged candidate capacity.
+    optional bool final_topk_per_prefix = 7 [default = false];
 }
 
 message GenRecCausalLMModel {
