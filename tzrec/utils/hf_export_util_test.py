@@ -16,13 +16,22 @@ import unittest
 from unittest import mock
 
 import torch
+from parameterized import parameterized
 from safetensors.torch import load_file
 from torch import nn
 
 from tzrec.prompt.types import ResolvedSidSpace
 from tzrec.utils.checkpoint_util import save_model
-from tzrec.utils.hf_export_util import dcp_to_hf, sid_space_config
-from tzrec.utils.test_util import create_tiny_causal_lm, make_test_dir
+from tzrec.utils.hf_export_util import (
+    convert_qwen_mcore_state,
+    dcp_to_hf,
+    sid_space_config,
+)
+from tzrec.utils.test_util import (
+    create_tiny_causal_lm,
+    make_test_dir,
+    parameterized_name_func,
+)
 
 
 def _tied_lm():
@@ -71,6 +80,73 @@ class HfExportUtilTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_qwen3_norms_and_bias_free_projection_conversion(self) -> None:
+        lm = create_tiny_causal_lm(64, model_type="qwen3", tie_word_embeddings=True)
+        original = lm.state_dict()
+        packed = convert_qwen_mcore_state(original, lm.config, to_mcore=True)
+        self.assertIn("decoder.layers.0.self_attention.q_layernorm.weight", packed)
+        self.assertIn("decoder.layers.0.self_attention.k_layernorm.weight", packed)
+        self.assertNotIn("decoder.layers.0.self_attention.linear_qkv.bias", packed)
+        restored = convert_qwen_mcore_state(packed, lm.config, to_mcore=False)
+        self.assertEqual(set(original), set(restored))
+        for key in original:
+            torch.testing.assert_close(original[key], restored[key], atol=0, rtol=0)
+
+    def test_qwen_gqa_and_gated_mlp_conversion(self) -> None:
+        lm = _tied_lm()
+        original = lm.state_dict()
+        packed = convert_qwen_mcore_state(original, lm.config, to_mcore=True)
+        unpacked = convert_qwen_mcore_state(packed, lm.config, to_mcore=False)
+        self.assertEqual(set(unpacked), set(original))
+        for key in original:
+            torch.testing.assert_close(original[key], unpacked[key], atol=0, rtol=0)
+        groups, heads, dim = 2, 4, 8
+        x = torch.randn(3, lm.config.hidden_size)
+        mcore = "decoder.layers.0."
+        hf = "model.layers.0."
+        qkv = nn.functional.linear(
+            x,
+            packed[mcore + "self_attention.linear_qkv.weight"],
+            packed[mcore + "self_attention.linear_qkv.bias"],
+        ).reshape(3, groups, -1)
+        for actual, projection in zip(
+            qkv.split((heads // groups * dim, dim, dim), dim=-1), ("q", "k", "v")
+        ):
+            expected = nn.functional.linear(
+                x,
+                original[hf + f"self_attn.{projection}_proj.weight"],
+                original[hf + f"self_attn.{projection}_proj.bias"],
+            )
+            torch.testing.assert_close(actual.reshape(3, -1), expected)
+        gate, up = nn.functional.linear(
+            x, packed[mcore + "mlp.linear_fc1.weight"]
+        ).chunk(2, dim=-1)
+        actual = nn.functional.linear(
+            nn.functional.silu(gate) * up, packed[mcore + "mlp.linear_fc2.weight"]
+        )
+        torch.testing.assert_close(actual, lm.model.layers[0].mlp(x))
+
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    def test_mcore_dcp_export_without_mcore_dependency(self, model_type) -> None:
+        from torch.distributed.checkpoint import save
+        from transformers import AutoModelForCausalLM
+
+        lm = create_tiny_causal_lm(64, model_type=model_type, tie_word_embeddings=True)
+        packed = convert_qwen_mcore_state(lm.state_dict(), lm.config, to_mcore=True)
+        checkpoint = os.path.join(self.test_dir, "mcore.ckpt")
+        save(
+            {"model.lm." + key: value for key, value in packed.items()},
+            checkpoint_id=os.path.join(checkpoint, "model"),
+        )
+        out_dir = os.path.join(self.test_dir, "mcore_hf")
+        dcp_to_hf(checkpoint, out_dir, lm.config)
+        lm.config.save_pretrained(out_dir)
+        restored = AutoModelForCausalLM.from_pretrained(out_dir)
+        for key, expected in lm.state_dict().items():
+            torch.testing.assert_close(
+                restored.state_dict()[key], expected, atol=0, rtol=0
+            )
 
     def _save_ckpt(self, wrapped):
         ckpt_dir = os.path.join(self.test_dir, "model.ckpt-1")

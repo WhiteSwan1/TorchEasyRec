@@ -15,7 +15,7 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, Tuple
 
 import torch
 from safetensors.torch import save_file
@@ -27,6 +27,89 @@ from tzrec.utils.filesystem_util import url_to_fs
 
 SERVING_ARCH = "GenRecForCausalLM"
 SERVING_MODEL_TYPE = "genrec"
+
+
+def convert_qwen_mcore_state(
+    state: Dict[str, torch.Tensor],
+    config: PretrainedConfig,
+    to_mcore: bool,
+) -> Dict[str, torch.Tensor]:
+    """Convert unsharded dense Qwen2/2.5/3 weights between HF and MCore.
+
+    Args:
+        state: backbone state without the GenRec model prefix.
+        config: HF architecture, including the resized vocabulary.
+        to_mcore: pack HF projections when true, unpack them when false.
+
+    Returns:
+        Converted weights; Transformer Engine runtime extra state is excluded.
+    """
+    mapping: Dict[str, Tuple[str, ...]] = {
+        "embedding.word_embeddings.weight": ("model.embed_tokens.weight",),
+        "output_layer.weight": ("lm_head.weight",),
+        "decoder.final_layernorm.weight": ("model.norm.weight",),
+    }
+    for layer in range(config.num_hidden_layers):
+        mcore = f"decoder.layers.{layer}."
+        hf = f"model.layers.{layer}."
+        for mcore_key, hf_key in (
+            ("input_layernorm.weight", "input_layernorm.weight"),
+            ("pre_mlp_layernorm.weight", "post_attention_layernorm.weight"),
+            ("self_attention.linear_proj.weight", "self_attn.o_proj.weight"),
+            ("mlp.linear_fc2.weight", "mlp.down_proj.weight"),
+        ):
+            mapping[mcore + mcore_key] = (hf + hf_key,)
+        if config.model_type == "qwen3":
+            for component in ("q", "k"):
+                mapping[mcore + f"self_attention.{component}_layernorm.weight"] = (
+                    hf + f"self_attn.{component}_norm.weight",
+                )
+        suffixes = (
+            ("weight", "bias")
+            if getattr(config, "attention_bias", config.model_type == "qwen2")
+            else ("weight",)
+        )
+        for suffix in suffixes:
+            mapping[mcore + "self_attention.linear_qkv." + suffix] = tuple(
+                hf + f"self_attn.{projection}_proj.{suffix}"
+                for projection in ("q", "k", "v")
+            )
+        mapping[mcore + "mlp.linear_fc1.weight"] = (
+            hf + "mlp.gate_proj.weight",
+            hf + "mlp.up_proj.weight",
+        )
+
+    groups = config.num_key_value_heads
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    query_width = config.num_attention_heads // groups * head_dim
+    result = {}
+    for mcore_key, hf_keys in mapping.items():
+        if to_mcore:
+            tensors = [state[key] for key in hf_keys]
+            if len(tensors) == 3:
+                trailing = tensors[0].shape[1:]
+                tensors = [tensor.reshape(groups, -1, *trailing) for tensor in tensors]
+                result[mcore_key] = torch.cat(tensors, dim=1).reshape(-1, *trailing)
+            elif len(tensors) == 2:
+                result[mcore_key] = torch.cat(tensors, dim=0)
+            else:
+                result[mcore_key] = tensors[0]
+        else:
+            tensor = state[mcore_key]
+            if len(hf_keys) == 3:
+                trailing = tensor.shape[1:]
+                pieces = tensor.reshape(groups, -1, *trailing).split(
+                    (query_width, head_dim, head_dim), dim=1
+                )
+                tensors = [piece.reshape(-1, *trailing) for piece in pieces]
+            elif len(hf_keys) == 2:
+                tensors = tensor.chunk(2, dim=0)
+            else:
+                tensors = [tensor]
+            result.update(zip(hf_keys, tensors))
+    return result
 
 
 def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
@@ -57,13 +140,24 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
     target_shapes = {k: tuple(v.shape) for k, v in empty.state_dict().items()}
     target_keys: Set[str] = set(target_shapes)
     tied_keys: Set[str] = set(getattr(empty, "_tied_weights_keys", None) or [])
-    del empty
 
     # the mapping is decided on names alone, so the load below reads the
     # backbone and not the sparse tables beside it
     reader = _storage_setup(None, model_ckpt_path, reader=True)
     metadata = reader.read_metadata().state_dict_metadata
     ckpt_keys: Set[str] = set(metadata)
+    is_mcore = any(
+        key.endswith("lm.embedding.word_embeddings.weight") for key in ckpt_keys
+    )
+    if is_mcore:
+        target_shapes = {
+            key: tuple(value.shape)
+            for key, value in convert_qwen_mcore_state(
+                empty.state_dict(), config, to_mcore=True
+            ).items()
+        }
+        target_keys = set(target_shapes)
+    del empty
 
     def _derive_by_suffix() -> Optional[Dict[str, str]]:
         """Each target key is a unique suffix of exactly one DCP key; None if not."""
@@ -106,6 +200,8 @@ def dcp_to_hf(ckpt_dir: str, out_dir: str, config: PretrainedConfig) -> None:
         set(key_map.values()), checkpoint_id=model_ckpt_path
     )
     mapped = {tk: raw_state[ck] for tk, ck in key_map.items()}
+    if is_mcore:
+        mapped = convert_qwen_mcore_state(mapped, config, to_mcore=False)
 
     # from_pretrained re-ties them.
     if getattr(config, "tie_word_embeddings", False):

@@ -74,7 +74,7 @@ def _fx_wrapped_genrec_loss(
         Scalar cross entropy, averaging targets within each row first.
     """
     if "target_weights" not in predictions:
-        return model.lm.loss_function(
+        return model.causal_lm_loss(
             logits=predictions["logits"],
             labels=predictions["labels"],
             vocab_size=model.lm.config.vocab_size,
@@ -145,10 +145,6 @@ class BaseGenRecModel(BaseModel):
             cfg.common.lm_parameter_dtype,
             cfg.common.attn_kernel,
         )
-        # Every run replaces this initialization from pretrained or DCP weights.
-        self.lm.resize_token_embeddings(
-            compiled_prompt.sid_space.target_vocab_size, mean_resizing=False
-        )
         self.init_input()
 
     def init_input(self) -> None:
@@ -179,6 +175,21 @@ class BaseGenRecModel(BaseModel):
             torch_dtype=_PARAM_DTYPE[lm_parameter_dtype],
         )
         self._check_backbone_interfaces(hf_model_name_or_path)
+        self.lm.resize_token_embeddings(
+            self._prompt.sid_space.target_vocab_size, mean_resizing=False
+        )
+
+    def input_embeddings(self) -> nn.Module:
+        """Return the backbone's token embedding lookup."""
+        return self.lm.get_input_embeddings()
+
+    def causal_lm_loss(self, **kwargs: Any) -> torch.Tensor:
+        """Score a shifted text response using the backbone's loss function."""
+        return self.lm.loss_function(**kwargs)
+
+    def load_hf_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        """Load resized HF backbone weights at cold start."""
+        self.lm.load_state_dict(state)
 
     def _check_backbone_interfaces(self, hf_model_name_or_path: str) -> None:
         """Reject a backbone this model cannot drive.
@@ -247,7 +258,7 @@ class BaseGenRecModel(BaseModel):
             ``(total_tokens, hidden_size)``.
         """
         ids = batch.additional_infos[INPUT_IDS]
-        embeds = self.lm.get_input_embeddings()(ids)
+        embeds = self.input_embeddings()(ids)
         if not self._prompt.prompt_plan.projected_slots:
             return embeds
         projected = project_slots(
@@ -319,7 +330,7 @@ class BaseGenRecModel(BaseModel):
         pretrained.resize_token_embeddings(
             self._prompt.sid_space.target_vocab_size, mean_resizing=True
         )
-        self.lm.load_state_dict(pretrained.state_dict())
+        self.load_hf_state_dict(pretrained.state_dict())
         del pretrained
 
 

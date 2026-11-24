@@ -9,6 +9,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+import os
+import shutil
 import unittest
 from types import SimpleNamespace
 from typing import Optional, Sequence
@@ -33,7 +36,13 @@ from tzrec.prompt.assembler import (
     RESPONSE_LENGTHS,
     PromptAssembler,
 )
-from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import (
+    GenRecCausalLMModel as CausalLMConfig,
+)
+from tzrec.protos.models.genrec_model_pb2 import (
+    GenRecModelConfig,
+)
+from tzrec.utils.hf_export_util import convert_qwen_mcore_state
 from tzrec.utils.test_util import (
     GENREC_ANSWER_CODES,
     GENREC_HIST_CODES,
@@ -648,6 +657,165 @@ class LayoutInvarianceTest(unittest.TestCase):
                 "flash_attention_2",
                 torch.device("cuda"),
                 GenRecModelConfig.BF16,
+            )
+
+
+@unittest.skipIf(*nv_gpu_unavailable)
+@unittest.skipIf(*flash_attn_unavailable)
+@unittest.skipUnless(
+    importlib.util.find_spec("megatron") is not None
+    and importlib.util.find_spec("transformer_engine") is not None,
+    "MCore and Transformer Engine are required",
+)
+@mark_ci_scope("gpu")
+class MCoreCausalLMTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.test_dir = make_test_dir()
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                "nccl",
+                rank=0,
+                world_size=1,
+                init_method="file://"
+                + os.path.abspath(os.path.join(self.test_dir, "pg")),
+            )
+            self.addCleanup(torch.distributed.destroy_process_group)
+        self.addCleanup(shutil.rmtree, self.test_dir, True)
+
+    @parameterized.expand(
+        [
+            [multi_target, response, model_type, fused_rope, attn_kernel]
+            for model_type in ("qwen2", "qwen3")
+            for fused_rope in (False, True)
+            for attn_kernel in ("flash_attention_2", "flash_attention_3")
+            for multi_target, response in (
+                (False, "{{answer}}"),
+                (True, "{{answer}}"),
+                (False, "{{answer}} ."),
+            )
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_logits_loss_and_gradients_match_hf_fa2(
+        self, multi_target, response, model_type, fused_rope, attn_kernel
+    ) -> None:
+        if (
+            attn_kernel == "flash_attention_3"
+            and importlib.util.find_spec("flash_attn_3") is None
+        ):
+            self.skipTest("FlashAttention-3 is required")
+        hf, compiled = create_genrec_test_model(
+            self.test_dir,
+            response=response,
+            attn_kernel="flash_attention_2",
+            init_seed=0,
+            model_type=model_type,
+        )
+        mcore, _ = create_genrec_test_model(
+            self.test_dir,
+            response=response,
+            attn_kernel=attn_kernel,
+            lm_backend=CausalLMConfig.MEGATRON_CORE,
+            model_type=model_type,
+            mcore_fused_rope=fused_rope,
+        )
+        mcore.load_hf_state_dict(hf.lm.state_dict())
+        hf, mcore = hf.cuda().eval(), mcore.cuda().eval()
+        answers = [GENREC_ANSWER_CODES, _OTHERGENREC_ANSWER_CODES]
+        if multi_target:
+            answers[0] = GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES
+        batch = _packed_batch(compiled, _TWO_ROWS[0], answers).to(torch.device("cuda"))
+        results = []
+        for model in (hf, mcore):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                predictions = model.predict(batch)
+                loss = model.loss(predictions, batch)["ce_loss"]
+            loss.backward()
+            results.append((predictions, loss))
+        torch.testing.assert_close(
+            results[0][0]["logits"], results[1][0]["logits"], atol=8e-3, rtol=3e-2
+        )
+        torch.testing.assert_close(results[0][0]["labels"], results[1][0]["labels"])
+        torch.testing.assert_close(results[0][1], results[1][1], atol=3e-3, rtol=3e-3)
+        gradients = convert_qwen_mcore_state(
+            {
+                key: mcore.lm.get_parameter(key).grad
+                for key in mcore.lm.state_dict()
+                if not key.endswith("_extra_state")
+            },
+            mcore.lm.config,
+            to_mcore=False,
+        )
+        for key, parameter in hf.lm.named_parameters():
+            self.assertIsNotNone(gradients[key], key)
+            torch.testing.assert_close(
+                gradients[key], parameter.grad, atol=2e-3, rtol=5e-2, msg=key
+            )
+        reference = torch.cat([p.grad.flatten() for p in hf.lm.parameters()])
+        actual = torch.cat(
+            [gradients[k].flatten() for k, _ in hf.lm.named_parameters()]
+        )
+        self.assertLess(((actual - reference).norm() / reference.norm()).item(), 0.05)
+
+    @parameterized.expand(
+        [
+            [fused, kernel]
+            for fused in (False, True)
+            for kernel in ("flash_attention_2", "flash_attention_3")
+        ],
+        name_func=parameterized_name_func,
+    )
+    def test_sparse_projection_and_decoder_update_together(
+        self, fused_rope, attn_kernel
+    ) -> None:
+        if (
+            attn_kernel == "flash_attention_3"
+            and importlib.util.find_spec("flash_attn_3") is None
+        ):
+            self.skipTest("FlashAttention-3 is required")
+        from tzrec.models.genrec_model_test import _hist, _projected, _projected_batch
+        from tzrec.models.model import TrainWrapper
+        from tzrec.utils.state_dict_util import init_parameters
+
+        model, compiled = create_genrec_test_model(
+            self.test_dir,
+            feature_configs=[_hist(), _projected("prof", 8)],
+            prompt="History : {{hist}} . Predict {{prof}} :",
+            attn_kernel=attn_kernel,
+            lm_backend=CausalLMConfig.MEGATRON_CORE,
+            mcore_fused_rope=fused_rope,
+        )
+        init_parameters(model, torch.device("cpu"))
+        model.init_from_pretrained()
+        model = model.cuda().train()
+        torch.fx.symbolic_trace(TrainWrapper(model))
+        batch = _projected_batch(compiled).to(torch.device("cuda"))
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        before = {
+            key: value.detach().clone() for key, value in model.named_parameters()
+        }
+        for _ in range(2):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model.loss(model.predict(batch), batch)["ce_loss"] / 2
+            loss.backward()
+        optimizer.step()
+        for prefix in ("embedding_group.", "projections.", "lm.decoder."):
+            parameters = [
+                (key, value)
+                for key, value in model.named_parameters()
+                if key.startswith(prefix)
+            ]
+            self.assertTrue(parameters, prefix)
+            self.assertTrue(
+                any(
+                    value.grad is not None and value.grad.norm() > 0
+                    for _, value in parameters
+                ),
+                prefix,
+            )
+            self.assertTrue(
+                any(not torch.equal(value, before[key]) for key, value in parameters),
+                prefix,
             )
 
 

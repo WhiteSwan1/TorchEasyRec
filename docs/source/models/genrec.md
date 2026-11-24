@@ -171,17 +171,40 @@ answer = [1, 8194, 16387, 4, 8197, 16390]
 
 ### genrec_causal_lm_model
 
-| 参数                        | 说明                                                                                                           |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `hf_model_name_or_path`     | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                |
-| `common.lm_parameter_dtype` | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制 |
-| `common.attn_kernel`        | 可选，注意力计算方式，默认 `"sdpa"`，也可使用 `"flash_attention_2"`                                            |
-| `common.beam_widths`        | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量；候选不足时返回现有候选    |
-| `common.generated_sids_key` | 可选，预测输出列名，默认 `"generated_sids"`                                                                    |
+| 参数                        | 说明                                                                                                                  |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `hf_model_name_or_path`     | 可选，预训练骨干模型的 HuggingFace 模型 ID 或本地目录，默认 `Qwen/Qwen2.5-0.5B`                                       |
+| `lm_backend`                | 可选，默认 `HUGGING_FACE`；`MEGATRON_CORE` 使用 MCore 执行稠密 Qwen2.5/3 训练，稀疏特征及优化器仍由 TorchEasyRec 管理 |
+| `mcore_fused_rope`          | 可选，默认 `false`；在 MCore 后端中使用 FA2 的融合旋转位置编码，保留多目标共享前缀的位置语义                          |
+| `common.lm_parameter_dtype` | 可选，LM 参数精度，`FP32`、`BF16` 或 `FP16`，默认 `FP32`；计算的混合精度由 `train_config.mixed_precision` 控制        |
+| `common.attn_kernel`        | 可选，注意力计算方式，默认 `"sdpa"`；MCore 支持 `"flash_attention_2"` 和 `"flash_attention_3"`                        |
+| `common.beam_widths`        | 必填，长度等于码本层数，各项至少为 `1`；每层均为全局保留数，末层决定返回的 SID 数量；候选不足时返回现有候选           |
+| `common.generated_sids_key` | 可选，预测输出列名，默认 `"generated_sids"`                                                                           |
 
 `hf_model_name_or_path` 指定模型 ID 时，所需配置和预训练权重会自动下载并缓存。
 
 示例使用 FP32 参数，并通过 `train_config.mixed_precision: "BF16"` 开启混合精度计算。使用 `flash_attention_2` 时，需要 NVIDIA GPU、与项目环境匹配的 FlashAttention 依赖，并将混合精度设置为 BF16 或 FP16。
+
+使用 `MEGATRON_CORE` 时，还需在项目环境中提供匹配的 Megatron Core 和 Transformer Engine，并选择 FA2 或 FA3。FA3 还需提供与当前 Torch/CUDA 匹配的 `flash_attn_3`，模型的 `attention_dropout` 必须为 0；实际支持的 GPU 和 head dimension 由该扩展的构建决定。缺少扩展时会报错，不会自动回退到 FA2。
+
+在 `genrec_causal_lm_model` 中设置 `mcore_fused_rope: true` 可启用 FA2 提供的融合 RoPE，与 FA2/FA3 attention 均可组合；它保持模型参数和 checkpoint 权重布局不变。MCore 用于联合训练与损失评估，生成 SID 前需将权重导出为 Hugging Face 格式。`train_config.dense_optimizer` 继续控制稠密优化器，切换 attention 或融合 RoPE 不会切换优化器。
+
+MCore 接入复用 TorchRec 的稀疏参数管理和训练流水线，稀疏嵌入、投影及稠密骨干在同一计算图中联合更新。当前接入固定 TP/PP/CP 为 1，支持 dense Qwen2/2.5/3，不支持 sliding-window attention；更大模型的分片和流水线并行留待后续评估。Megatron Core、Transformer Engine 及 FlashAttention 均为外部依赖，本仓库不包含 Megatron-LM 或 opt 源码。
+
+在现有配置中修改以下字段即可启用 MCore；保留原有 prompt、特征和优化器配置：
+
+```protobuf
+genrec_causal_lm_model {
+  lm_backend: MEGATRON_CORE
+  mcore_fused_rope: true
+  common {
+    lm_parameter_dtype: FP32
+    attn_kernel: "flash_attention_2"
+  }
+}
+```
+
+上述为字段片段，合入原有 `model_config`，并设置 `train_config.mixed_precision: "BF16"`。验证 FA3 依赖可用后，可将 `attn_kernel` 改为 `"flash_attention_3"`。融合 RoPE 仍依赖 FA2 的 rotary 扩展，即使 attention 选择 FA3 也需保留该依赖。HF 和 MCore 均可通过现有 dense optimizer 的 Adam 配置启用 `fused`，无需使用 Megatron 优化器。训练 checkpoint 的骨干参数布局随后端变化，切换后端时应通过现有 `dcp_to_hf` 导出再加载；不应直接将另一后端的 optimizer 状态当作续训状态。
 
 模型自动计算交叉熵损失 `ce_loss`，并在评估时输出同名指标，无需额外声明 `model_config.losses` 或 `metrics`。召回的 HitRate、Recall 等指标需将预测 SID 映射为物品后，与真实物品另行计算。
 

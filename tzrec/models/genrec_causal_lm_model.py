@@ -9,13 +9,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Decoder-only forward and decode over an HF causal LM.
+"""Decoder-only training with HF or MCore, and decode over an HF causal LM.
 
 This subclass asks the backbone's own forward for a suffix window of logits, so
 a full (batch, length, vocab) tensor is never materialized, and it decodes by
 prefilling once and stepping a self-attention cache.
 
-``init_backbone`` checks the interfaces both paths need. A backbone whose
+The MCore branch reuses packed FlashAttention and supervised positions.
+For HF, ``init_backbone`` checks the interfaces both paths need. A backbone whose
 forward has no ``logits_to_keep``, or which returns a legacy tuple cache, is
 not supported; Qwen2.5/Qwen3 are what CI covers.
 """
@@ -25,12 +26,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import AttentionInterface
+from transformers import AttentionInterface, AutoConfig
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
 from tzrec.datasets.utils import Batch
 from tzrec.features.feature import BaseFeature
-from tzrec.models.genrec_model import BaseGenRecModel
+from tzrec.models.genrec_model import _PARAM_DTYPE, BaseGenRecModel
 from tzrec.modules.beam_cache import create_beam_cache
 from tzrec.modules.dynamic_beam import capped_beam_widths, dynamic_beam_search
 from tzrec.prompt.assembler import (
@@ -41,7 +42,12 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.types import CompiledPrompt, SlotSeg
 from tzrec.protos.model_pb2 import ModelConfig
-from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import (
+    GenRecCausalLMModel as CausalLMConfig,
+)
+from tzrec.protos.models.genrec_model_pb2 import (
+    GenRecModelConfig,
+)
 
 
 @dataclass
@@ -153,8 +159,120 @@ _PADDED_SDPA_ATTENTION = "genrec_padded_sdpa"
 AttentionInterface.register(_PADDED_SDPA_ATTENTION, _padded_sdpa_attention)
 
 
+class _MCoreFlashAttention(torch.nn.Module):
+    """Use packed FlashAttention inside an MCore attention layer.
+
+    Args:
+        config: MCore transformer configuration.
+        attn_kernel: FA2 or FA3 implementation for the packed attention core.
+        **kwargs: attention construction arguments supplied by MCore.
+    """
+
+    def __init__(
+        self, config: Any, attn_kernel: str = "flash_attention_2", **kwargs: Any
+    ) -> None:
+        super().__init__()
+        self.dropout = config.attention_dropout
+        self.attn_kernel = attn_kernel
+        if attn_kernel == "flash_attention_3" and self.dropout != 0:
+            raise ValueError("FlashAttention-3 requires attention_dropout=0.")
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Any,
+        *,
+        packed_seq_params: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Rotate unique tokens before gathering each target's prefix K/V.
+
+        Args:
+            query: packed queries, shaped (tokens, query heads, head dim).
+            key: unique packed keys with grouped KV heads.
+            value: unique packed values with grouped KV heads.
+            attention_mask: unused; the packed segments define visibility.
+            packed_seq_params: boundaries, rotary values and optional target layout.
+            **kwargs: unused MCore attention options.
+
+        Returns:
+            Attention output in the packed query order.
+        """
+        params = packed_seq_params
+        if getattr(params, "genrec_fused_rope_cos", None) is not None:
+            from flash_attn.layers.rotary import apply_rotary_emb
+
+            query = apply_rotary_emb(
+                query.unsqueeze(0),
+                params.genrec_fused_rope_cos,
+                params.genrec_fused_rope_sin,
+                inplace=False,
+            )[0]
+            key = apply_rotary_emb(
+                key.unsqueeze(0),
+                params.genrec_fused_rope_cos,
+                params.genrec_fused_rope_sin,
+                inplace=False,
+            )[0]
+        else:
+            from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+            query, key = apply_rotary_pos_emb(
+                query,
+                key,
+                params.genrec_cos,
+                params.genrec_sin,
+                unsqueeze_dim=1,
+            )
+        dropout = self.dropout if self.training else 0.0
+        if self.attn_kernel == "flash_attention_3":
+            from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
+
+            layout = params.genrec_layout
+            if layout is not None:
+                key = key.index_select(0, layout.kv_indices)
+                value = value.index_select(0, layout.kv_indices)
+            return flash_attn_varlen_func(
+                query.to(value.dtype),
+                key.to(value.dtype),
+                value,
+                cu_seqlens_q=params.cu_seqlens_q,
+                cu_seqlens_k=params.cu_seqlens_kv,
+                max_seqlen_q=params.max_seqlen_q,
+                max_seqlen_k=params.max_seqlen_kv,
+                causal=True,
+                num_splits=1,
+            )
+        from flash_attn import flash_attn_varlen_func
+
+        if params.genrec_layout is not None:
+            output, _ = _shared_prefix_attention(
+                self,
+                query.transpose(0, 1).unsqueeze(0),
+                key.transpose(0, 1).unsqueeze(0),
+                value.transpose(0, 1).unsqueeze(0),
+                None,
+                dropout=dropout,
+                multi_target_layout=params.genrec_layout,
+            )
+            return output[0]
+        return flash_attn_varlen_func(
+            query.to(value.dtype),
+            key.to(value.dtype),
+            value,
+            cu_seqlens_q=params.cu_seqlens_q,
+            cu_seqlens_k=params.cu_seqlens_kv,
+            max_seqlen_q=params.max_seqlen_q,
+            max_seqlen_k=params.max_seqlen_kv,
+            dropout_p=dropout,
+            causal=True,
+        )
+
+
 class GenRecCausalLMModel(BaseGenRecModel):
-    """An HF causal LM driven by a compiled prompt.
+    """A causal LM driven by a compiled prompt and the selected compute backend.
 
     Args:
         model_config: the model oneof.
@@ -163,6 +281,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         sample_weights: optional sample weight fields.
         compiled_prompt: the compiled prompt; required.
     """
+
+    _use_mcore = False
 
     def __init__(
         self,
@@ -188,6 +308,239 @@ class GenRecCausalLMModel(BaseGenRecModel):
         self._sid_only_response = len(response) == 1 and isinstance(
             response[0], SlotSeg
         )
+
+    def init_backbone(
+        self,
+        hf_model_name_or_path: str,
+        lm_parameter_dtype: int,
+        attn_kernel: str,
+    ) -> None:
+        """Construct the selected decoder inside the existing GenRec model.
+
+        Args:
+            hf_model_name_or_path: local HF architecture and pretrained weights.
+            lm_parameter_dtype: parameter precision, independent of autocast.
+            attn_kernel: attention implementation; MCore supports FA2 and FA3.
+        """
+        self._use_mcore = self._model_config.lm_backend == CausalLMConfig.MEGATRON_CORE
+        if not self._use_mcore:
+            super().init_backbone(
+                hf_model_name_or_path, lm_parameter_dtype, attn_kernel
+            )
+            return
+
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TENorm,
+        )
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.transformer.spec_utils import ModuleSpec
+        from megatron.core.transformer.transformer_block import (
+            TransformerBlock,
+            TransformerBlockSubmodules,
+        )
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        hf_config = AutoConfig.from_pretrained(hf_model_name_or_path)
+        if hf_config.model_type not in ("qwen2", "qwen3") or attn_kernel not in (
+            "flash_attention_2",
+            "flash_attention_3",
+        ):
+            raise ValueError(
+                "MEGATRON_CORE supports dense Qwen2/2.5/3 with FA2 or FA3."
+            )
+        is_qwen3 = hf_config.model_type == "qwen3"
+        if is_qwen3:
+            from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+
+            rotary_class = Qwen3RotaryEmbedding
+        else:
+            from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+
+            rotary_class = Qwen2RotaryEmbedding
+        if getattr(hf_config, "use_sliding_window", False):
+            raise ValueError("MEGATRON_CORE does not support sliding-window attention.")
+        if not torch.distributed.is_initialized():
+            raise RuntimeError("Initialize torch.distributed before MEGATRON_CORE.")
+
+        group = cast(
+            torch.distributed.ProcessGroup,
+            torch.distributed.new_group(
+                ranks=[torch.distributed.get_rank()], use_local_synchronization=True
+            ),
+        )
+        groups = ProcessGroupCollection()
+        groups.tp = groups.pp = groups.cp = groups.ep = groups.expt_tp = group
+        groups.gtp_remat = groups.expt_gtp_remat = group
+        groups.dp = groups.dp_cp = cast(
+            torch.distributed.ProcessGroup, torch.distributed.group.WORLD
+        )
+        config = TransformerConfig(
+            num_layers=hf_config.num_hidden_layers,
+            hidden_size=hf_config.hidden_size,
+            ffn_hidden_size=hf_config.intermediate_size,
+            num_attention_heads=hf_config.num_attention_heads,
+            num_query_groups=hf_config.num_key_value_heads,
+            kv_channels=getattr(
+                hf_config,
+                "head_dim",
+                hf_config.hidden_size // hf_config.num_attention_heads,
+            ),
+            normalization="RMSNorm",
+            layernorm_epsilon=hf_config.rms_norm_eps,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            add_qkv_bias=getattr(hf_config, "attention_bias", not is_qwen3),
+            qk_layernorm=is_qwen3,
+            hidden_dropout=0.0,
+            attention_dropout=hf_config.attention_dropout,
+            params_dtype=_PARAM_DTYPE[lm_parameter_dtype],
+            use_cpu_initialization=True,
+            gradient_accumulation_fusion=False,
+            bias_activation_fusion=True,
+            bias_dropout_fusion=False,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec()
+
+        def build_norm(config: Any, hidden_size: int, eps: float) -> torch.nn.Module:
+            """Preserve Qwen's parameter precision for RMSNorm under autocast.
+
+            Args:
+                config: transformer configuration and parameter precision.
+                hidden_size: normalized channel count.
+                eps: variance stabilizer from the pretrained configuration.
+
+            Returns:
+                Transformer Engine RMSNorm preserving input and weight precision.
+            """
+            norm = cast(torch.nn.Module, TENorm(config, hidden_size, eps))
+            norm.forward = torch.autocast("cuda", enabled=False)(norm.forward)
+            return norm
+
+        spec.submodules.input_layernorm = build_norm
+        spec.submodules.pre_mlp_layernorm = build_norm
+        spec.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+        spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
+            module=_MCoreFlashAttention, params={"attn_kernel": attn_kernel}
+        )
+        if is_qwen3:
+            from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+            def build_qk_norm(
+                config: Any, hidden_size: int, eps: float
+            ) -> torch.nn.Module:
+                """Keep Qwen3's rounding before its FP32 Q/K norm weight multiply.
+
+                Args:
+                    config: transformer configuration and parameter precision.
+                    hidden_size: channels per attention head.
+                    eps: variance stabilizer from the pretrained configuration.
+
+                Returns:
+                    The HF Qwen3 per-head normalization module.
+                """
+                return Qwen3RMSNorm(hidden_size, eps=eps).to(dtype=config.params_dtype)
+
+            spec.submodules.self_attention.submodules.q_layernorm = build_qk_norm
+            spec.submodules.self_attention.submodules.k_layernorm = build_qk_norm
+        spec.submodules.mlp.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+        block_spec = TransformerBlockSubmodules(
+            layer_specs=[spec] * config.num_layers, layer_norm=build_norm
+        )
+        hf_config.vocab_size = self._prompt.sid_space.target_vocab_size
+        self.lm = torch.nn.Module()
+        self.lm.config = hf_config
+        self.lm.embedding = torch.nn.Module()
+        self.lm.embedding.word_embeddings = torch.nn.Embedding(
+            hf_config.vocab_size, hf_config.hidden_size, dtype=config.params_dtype
+        )
+        self.lm.decoder = TransformerBlock(config, block_spec, pg_collection=groups)
+        self.lm.output_layer = torch.nn.Linear(
+            hf_config.hidden_size,
+            hf_config.vocab_size,
+            bias=False,
+            dtype=config.params_dtype,
+        )
+        if hf_config.tie_word_embeddings:
+            self.lm.output_layer.weight = self.lm.embedding.word_embeddings.weight
+        self.lm.rotary_emb = rotary_class(config=hf_config)
+
+    def input_embeddings(self) -> torch.nn.Module:
+        """Return the same token lookup used by the selected decoder."""
+        if self._use_mcore:
+            return self.lm.embedding.word_embeddings
+        return super().input_embeddings()
+
+    def causal_lm_loss(self, **kwargs: Any) -> torch.Tensor:
+        """Retain HF causal shifting for non-SID response windows."""
+        if self._use_mcore:
+            from transformers.loss.loss_utils import ForCausalLMLoss
+
+            return ForCausalLMLoss(**kwargs)
+        return super().causal_lm_loss(**kwargs)
+
+    def load_hf_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        """Load HF weights using the same layout mapping as export."""
+        if not self._use_mcore:
+            super().load_hf_state_dict(state)
+            return
+        from tzrec.utils.hf_export_util import convert_qwen_mcore_state
+
+        converted = convert_qwen_mcore_state(state, self.lm.config, to_mcore=True)
+        converted.update(
+            {
+                key: value
+                for key, value in self.lm.state_dict().items()
+                if key.endswith("_extra_state")
+            }
+        )
+        self.lm.load_state_dict(converted)
+
+    def _mcore_hidden(
+        self,
+        embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        layout: Optional[_MultiTargetLayout] = None,
+    ) -> torch.Tensor:
+        """Run the decoder with the existing packed positions and target layout.
+
+        Args:
+            embeds: unique input tokens, including differentiable projected slots.
+            position_ids: rotary position of each unique token.
+            cu_seqlens: packed row boundaries for a single-target batch.
+            max_seqlen: maximum query/key segment length.
+            layout: optional shared-prefix target branches.
+
+        Returns:
+            Hidden states in the original unique token order.
+        """
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens if layout is None else layout.cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens if layout is None else layout.cu_seqlens_k,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+        cos, sin = self.lm.rotary_emb(embeds.unsqueeze(0), position_ids.reshape(1, -1))
+        params.genrec_cos, params.genrec_sin = cos[0], sin[0]
+        if self._model_config.mcore_fused_rope:
+            half = cos.shape[-1] // 2
+            params.genrec_fused_rope_cos = cos[0, :, :half].contiguous()
+            params.genrec_fused_rope_sin = sin[0, :, :half].contiguous()
+        params.genrec_layout = layout
+        return self.lm.decoder(
+            hidden_states=embeds.unsqueeze(1),
+            attention_mask=None,
+            packed_seq_params=params,
+        )[:, 0]
 
     def _read_beam_config(self, common: GenRecModelConfig) -> None:
         """Parse the decode knobs; the schedule must match the codebook.
@@ -240,6 +593,19 @@ class GenRecCausalLMModel(BaseGenRecModel):
             infos[RESPONSE_LENGTHS],
             embeds.shape[0],
         )
+        if self._use_mcore:
+            hidden = self._mcore_hidden(
+                embeds,
+                layout.position_ids,
+                infos[CU_SEQLENS],
+                layout.max_seqlen,
+                layout,
+            )
+            return {
+                "logits": self.lm.output_layer(hidden[layout.score_indices]),
+                "labels": infos[INPUT_IDS][layout.label_indices],
+                "target_weights": layout.target_weights,
+            }
         if self._attn_kernel == "flash_attention_2":
             attention, attention_mask = _SHARED_PREFIX_ATTENTION, None
             inputs_embeds = embeds.unsqueeze(0)
@@ -415,7 +781,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             suffix_offsets[None, :] < -infos[RESPONSE_LENGTHS][:, None],
             self._ignore_index,
         )
-        if self._attn_kernel == "flash_attention_2":
+        if self._use_mcore or self._attn_kernel == "flash_attention_2":
             logits = self._varlen_logits(embeds, batch, keep)
         else:
             logits = self._padded_logits(embeds, batch, suffix)
@@ -449,6 +815,11 @@ class GenRecCausalLMModel(BaseGenRecModel):
         # varlen flash-attention wants int32 boundaries
         flash_cu_seqlens = cu_seqlens.to(torch.int32)
         max_seqlen = int(infos[MAX_SEQLEN])
+        if self._use_mcore:
+            hidden = self._mcore_hidden(
+                embeds, position_ids, flash_cu_seqlens, max_seqlen
+            )
+            return self.lm.output_layer(hidden[keep])
         outputs = self.lm(
             inputs_embeds=embeds.unsqueeze(0),
             attention_mask=None,
@@ -506,6 +877,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
         Returns:
             ``(B, self._capped_widths[-1], num_levels)`` local codes, best first.
         """
+        if self._use_mcore:
+            raise ValueError("Export MEGATRON_CORE weights to HF before generation.")
         infos = batch.additional_infos
         return generate_codes(
             self.lm,

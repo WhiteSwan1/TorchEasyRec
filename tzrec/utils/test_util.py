@@ -28,7 +28,7 @@ from tzrec.acc.aot_utils import export_model_aot, load_model_aot
 from tzrec.models.model import BaseModel, ScriptWrapper
 from tzrec.prompt.types import CompiledPrompt
 from tzrec.protos import feature_pb2
-from tzrec.protos.models.genrec_model_pb2 import GenRecModelConfig
+from tzrec.protos.models.genrec_model_pb2 import GenRecCausalLMModel, GenRecModelConfig
 from tzrec.protos.prompt_pb2 import PromptSlot
 from tzrec.utils.export_util import split_model
 
@@ -497,6 +497,8 @@ def create_genrec_test_model(
     attn_kernel: Optional[str] = None,
     model_type: str = "qwen2",
     init_seed: Optional[int] = None,
+    lm_backend: "GenRecCausalLMModel.LMBackend" = GenRecCausalLMModel.HUGGING_FACE,
+    mcore_fused_rope: bool = False,
 ) -> Tuple[BaseModel, CompiledPrompt]:
     """Build a GenRecCausalLMModel over a tiny backbone and a compiled prompt.
 
@@ -517,6 +519,8 @@ def create_genrec_test_model(
         model_type (str): hugging-face ``model_type`` of the backbone.
         init_seed (int, optional): seed the random init draws from, when the
             caller needs two builds to agree.
+        lm_backend (int): causal LM compute backend.
+        mcore_fused_rope (bool): enable fused rotary in the MCore backend.
 
     Returns:
         Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was built on.
@@ -533,6 +537,8 @@ def create_genrec_test_model(
     model_config = ModelConfig()
     lm_config = model_config.genrec_causal_lm_model
     lm_config.hf_model_name_or_path = backbone
+    lm_config.lm_backend = lm_backend
+    lm_config.mcore_fused_rope = mcore_fused_rope
     lm_config.common.beam_widths.extend(beam_widths)
     if lm_parameter_dtype is not None:
         lm_config.common.lm_parameter_dtype = lm_parameter_dtype

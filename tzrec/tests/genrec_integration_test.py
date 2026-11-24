@@ -11,6 +11,7 @@
 
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -34,6 +35,7 @@ from tzrec.prompt.assembler import (
 )
 from tzrec.prompt.compile import compile_prompt
 from tzrec.prompt.hole_keys import HOLE_KEYS, HoleKeyBuilder
+from tzrec.protos.models.genrec_model_pb2 import GenRecCausalLMModel
 from tzrec.protos.pipeline_pb2 import EasyRecConfig
 from tzrec.tests import utils
 from tzrec.utils import config_util
@@ -100,12 +102,15 @@ class GenRecIntegrationTest(unittest.TestCase):
         if self.success and os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir)
 
-    def _prepare_config(self, attn_kernel: Optional[str] = None) -> str:
+    def _prepare_config(
+        self, attn_kernel: Optional[str] = None, num_rows: int = 8
+    ) -> str:
         """Write the tiny backbone, tokenizer, manifest and data; return the config.
 
         Args:
             attn_kernel (str, optional): transformers attn_implementation to run
                 the pipeline on; the config's own default when None.
+            num_rows (int): samples available for training and checkpoint resume.
 
         Returns:
             str: path to the written pipeline config.
@@ -122,6 +127,7 @@ class GenRecIntegrationTest(unittest.TestCase):
             os.path.join(self.test_dir, "data"),
             _CODEBOOK,
             [word for word in _WORDS if not word.startswith("<")],
+            num_rows=num_rows,
         )
 
         # parse rather than load: loading would default the tokenize features'
@@ -172,6 +178,79 @@ class GenRecIntegrationTest(unittest.TestCase):
             {name: table.column(name).combine_chunks() for name in table.column_names}
         )
         return {k: v for k, v in data.items() if k.split(".")[0] in _MEMBERS}
+
+    @unittest.skipIf(*nv_gpu_unavailable)
+    @unittest.skipIf(*flash_attn_unavailable)
+    @unittest.skipUnless(
+        importlib.util.find_spec("megatron") is not None
+        and importlib.util.find_spec("transformer_engine") is not None,
+        "MCore and Transformer Engine are required",
+    )
+    @mark_ci_scope("gpu")
+    def test_mcore_sparse_train_resume_export(self):
+        from torch.distributed.checkpoint.state_dict_loader import (
+            _load_state_dict_from_keys,
+        )
+
+        from tzrec.utils.checkpoint_util import latest_checkpoint
+
+        config_path = self._prepare_config("flash_attention_2", num_rows=256)
+        config = config_util.load_pipeline_config(config_path)
+        config.model_config.genrec_causal_lm_model.lm_backend = (
+            GenRecCausalLMModel.MEGATRON_CORE
+        )
+        config.train_config.sparse_optimizer.adagrad_optimizer.lr = 0.01
+        config.train_config.dense_optimizer.adam_optimizer.fused = True
+        config.train_config.ClearField("num_epochs")
+        config.train_config.ClearField("save_checkpoints_epochs")
+        config.train_config.num_steps = 4
+        config.train_config.save_checkpoints_steps = 2
+        config.train_config.gradient_accumulation_steps = 2
+        config_util.save_message(config, config_path)
+        with mock.patch.dict(os.environ, {"TEST_NPROC_PER_NODE": "2"}):
+            self.assertTrue(utils.test_train_eval(config_path, self.test_dir))
+            model_dir = os.path.join(self.test_dir, "train")
+            checkpoint, step = latest_checkpoint(model_dir)
+            assert checkpoint is not None
+            before = _load_state_dict_from_keys(
+                checkpoint_id=os.path.join(checkpoint, "model")
+            )
+            trained = os.path.join(self.test_dir, "pipeline.config")
+            config = config_util.load_pipeline_config(trained)
+            config.train_config.num_steps = 6
+            config_util.save_message(config, config_path)
+            os.rename(
+                os.path.join(self.test_dir, "log_train_eval.txt"),
+                os.path.join(self.test_dir, "log_train_initial.txt"),
+            )
+            self.assertTrue(
+                utils.test_train_eval(
+                    config_path, self.test_dir, args_str="--continue_train"
+                )
+            )
+            checkpoint, resumed_step = latest_checkpoint(model_dir)
+            assert checkpoint is not None
+            self.assertGreater(resumed_step, step)
+            after = _load_state_dict_from_keys(
+                checkpoint_id=os.path.join(checkpoint, "model")
+            )
+            for component in ("embedding_group.", "projections.", "lm.decoder."):
+                keys = [
+                    key for key in before if component in key and key.endswith("weight")
+                ]
+                self.assertTrue(keys, component)
+                self.assertTrue(
+                    any(not torch.equal(before[key], after[key]) for key in keys),
+                    component,
+                )
+            self.assertTrue(utils.test_eval(trained, self.test_dir))
+            self.assertTrue(
+                utils.test_export(trained, self.test_dir, env_str="QUANT_EMB=0")
+            )
+        self.assertTrue(
+            os.path.isfile(os.path.join(self.test_dir, "export/model.safetensors"))
+        )
+        self.success = True
 
     def test_genrec_train_eval_export(self):
         trained = self._train_eval_export()

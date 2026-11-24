@@ -27,10 +27,21 @@ message GenRecModelConfig {
 }
 
 message GenRecCausalLMModel {
+    enum LMBackend {
+        HUGGING_FACE = 0;
+        MEGATRON_CORE = 1;
+    }
+
     optional GenRecModelConfig common = 1;
 
     // HF hub id or local path. Names the architecture used for every model build
     // and the weights loaded by init_from_pretrained at cold start; the vocabulary
     // is prompt_config's.
     optional string hf_model_name_or_path = 2 [default = "Qwen/Qwen2.5-0.5B"];
+
+    // Training compute backend; both use the same prompt and TorchRec pipeline.
+    optional LMBackend lm_backend = 3 [default = HUGGING_FACE];
+
+    // Fuse rotary operations inside the MCore FlashAttention training backend.
+    optional bool mcore_fused_rope = 4 [default = false];
 }

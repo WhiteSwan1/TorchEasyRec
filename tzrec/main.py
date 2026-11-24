@@ -1353,8 +1353,13 @@ def export(
         use_distributed_embedding=use_dist_emb, input_tile=create_input_tile
     ):
         # Build model
+        model_config = pipeline_config.model_config
+        if model_config.HasField("genrec_causal_lm_model"):
+            # Export reads decoder weights from DCP and only needs its HF config.
+            model_config = copy.deepcopy(model_config)
+            model_config.genrec_causal_lm_model.ClearField("lm_backend")
         model = _create_model(
-            pipeline_config.model_config,
+            model_config,
             features,
             list(data_config.label_fields),
             sampler_type=None,
