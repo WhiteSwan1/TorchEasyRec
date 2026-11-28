@@ -206,6 +206,33 @@ genrec_causal_lm_model {
 
 上述为字段片段，合入原有 `model_config`，并设置 `train_config.mixed_precision: "BF16"`。验证 FA3 依赖可用后，可将 `attn_kernel` 改为 `"flash_attention_3"`。融合 RoPE 仍依赖 FA2 的 rotary 扩展，即使 attention 选择 FA3 也需保留该依赖。HF 和 MCore 均可通过现有 dense optimizer 的 Adam 配置启用 `fused`，无需使用 Megatron 优化器。训练 checkpoint 的骨干参数布局随后端变化，切换后端时应通过现有 `dcp_to_hf` 导出再加载；不应直接将另一后端的 optimizer 状态当作续训状态。
 
+### MCore 紧凑计算与长度均衡
+
+在已有 MCore 配置上可按需开启以下选项，默认均为 `false`：
+
+| 参数                       | 作用                                                                                             |
+| -------------------------- | ------------------------------------------------------------------------------------------------ |
+| `mcore_share_batch_prefix` | 在当前 batch 内复用 prompt 的静态前缀，重复 K/V 的梯度使用 FP32 累加；不跨参数更新缓存           |
+| `mcore_prune_final_layer`  | 末层仅计算监督位置的 attention 输出及 MLP，保留必要 K/V、全部 SID 标签及多目标权重               |
+| `mcore_fused_norm`         | 保留 Transformer Engine 的 RMSNorm 前向与统计量，直接输出计算 dtype，并调用 FA2 反向算子减少转换 |
+| `mcore_fused_residual`     | 启用 MCore 自带的 bias/dropout/residual 融合                                                     |
+
+前两项要求 `lm_backend: MEGATRON_CORE` 和 `common.attn_kernel: "flash_attention_3"`，作用于 SID response 的 packed 路径；普通文本 response 沿用完整计算。Norm 融合使用外部库的内部接口，已验证 MCore 0.21、Transformer Engine 2.21、FA2 2.8.3；更新依赖后应重新运行数值回归。以上选项保持参数名称、形状及 HF 导出映射，稀疏参数和 dense optimizer 仍由框架管理。建议保持 FP32 参数和 BF16 混合精度，先验证业务效果再用于长期训练。
+
+对于长度差异较大的 Parquet 训练数据，可预生成固定样本数的跨 rank 均衡计划。准备一个 NPY 数组，每个值为对应父样本的估计计算成本（例如 prompt、历史及标签的逻辑 token 数）。数组顺序必须与 `list_input_files` 返回的文件顺序及文件内部行顺序一致。然后在项目 Docker 环境中运行：
+
+```bash
+python -m tzrec.tools.create_parquet_row_plan \
+  --input_path 'data/train/*.parquet' \
+  --cost_file data/train_costs.npy \
+  --batch_size 80 --world_size 16 --num_workers 8 \
+  --output_path data/train_row_plan.npz
+```
+
+在原 `data_config` 中设置 `parquet_row_plan_path: "data/train_row_plan.npz"`，保持 `shuffle: false`、`shuffle_mode: "BATCH"`、`in_order: true`，保持 `min_batch_size: 0`、`drop_remainder: false`，不启用 `batch_cost_size`。该计划只用于训练；评估保持原 reader。原 Parquet 文件不重写，读取仍在训练过程中执行。计划生成时间属于独立准备成本。
+
+计划在每个原始全局微步内均衡成本，保持该步的父样本集合和每 rank 样本数，尾批沿用原分配。断点恢复要求源数据、计划、batch、卡数和 worker 数保持不变；不要覆盖源文件。改变这些条件需生成新计划并开始新的数据遍历，不支持按旧数据位置弹性恢复。计划生成器采用内存中的逐行索引，适合能容纳该索引的数据规模；ODPS 直读尚未接入。
+
 模型自动计算交叉熵损失 `ce_loss`，并在评估时输出同名指标，无需额外声明 `model_config.losses` 或 `metrics`。召回的 HitRate、Recall 等指标需将预测 SID 映射为物品后，与真实物品另行计算。
 
 ## 模型输出

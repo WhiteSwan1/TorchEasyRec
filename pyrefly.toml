@@ -23,6 +23,7 @@ ignore-missing-imports = [
     "hstu.*",
     "easy_rec.*",
     "pangudfs_client.*",
+    "transformer_engine_torch",
 ]
 
 # faiss ships SWIG-generated stubs that describe the C++ signatures rather than the

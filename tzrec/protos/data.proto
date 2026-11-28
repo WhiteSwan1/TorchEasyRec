@@ -176,6 +176,9 @@ message DataConfig {
     // main ranks log cumulative offset progress every log_step_count_steps
     optional uint32 kafka_log_every_n_messages = 32 [default = 0];
 
+    // Optional fixed-count row plan for length-balanced Parquet training.
+    optional string parquet_row_plan_path = 33;
+
     // negative sampler
     oneof sampler {
         NegativeSampler negative_sampler = 101;

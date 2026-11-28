@@ -684,10 +684,12 @@ class MCoreCausalLMTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [multi_target, response, model_type, fused_rope, attn_kernel]
+            [multi_target, response, model_type, fused_rope, attn_kernel, compact]
             for model_type in ("qwen2", "qwen3")
             for fused_rope in (False, True)
             for attn_kernel in ("flash_attention_2", "flash_attention_3")
+            for compact in (False, True)
+            if not compact or (attn_kernel == "flash_attention_3" and fused_rope)
             for multi_target, response in (
                 (False, "{{answer}}"),
                 (True, "{{answer}}"),
@@ -697,7 +699,7 @@ class MCoreCausalLMTest(unittest.TestCase):
         name_func=parameterized_name_func,
     )
     def test_logits_loss_and_gradients_match_hf_fa2(
-        self, multi_target, response, model_type, fused_rope, attn_kernel
+        self, multi_target, response, model_type, fused_rope, attn_kernel, compact
     ) -> None:
         if (
             attn_kernel == "flash_attention_3"
@@ -718,6 +720,7 @@ class MCoreCausalLMTest(unittest.TestCase):
             lm_backend=CausalLMConfig.MEGATRON_CORE,
             model_type=model_type,
             mcore_fused_rope=fused_rope,
+            mcore_compact_training=compact,
         )
         mcore.load_hf_state_dict(hf.lm.state_dict())
         hf, mcore = hf.cuda().eval(), mcore.cuda().eval()
@@ -759,14 +762,16 @@ class MCoreCausalLMTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [fused, kernel]
+            [fused, kernel, compact]
             for fused in (False, True)
             for kernel in ("flash_attention_2", "flash_attention_3")
+            for compact in (False, True)
+            if not compact or (kernel == "flash_attention_3" and fused)
         ],
         name_func=parameterized_name_func,
     )
     def test_sparse_projection_and_decoder_update_together(
-        self, fused_rope, attn_kernel
+        self, fused_rope, attn_kernel, compact
     ) -> None:
         if (
             attn_kernel == "flash_attention_3"
@@ -784,6 +789,7 @@ class MCoreCausalLMTest(unittest.TestCase):
             attn_kernel=attn_kernel,
             lm_backend=CausalLMConfig.MEGATRON_CORE,
             mcore_fused_rope=fused_rope,
+            mcore_compact_training=compact,
         )
         init_parameters(model, torch.device("cpu"))
         model.init_from_pretrained()

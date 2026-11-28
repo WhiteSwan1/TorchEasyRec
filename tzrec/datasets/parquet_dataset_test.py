@@ -9,6 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import itertools
 import json
 import multiprocessing as mp
 import os
@@ -32,7 +33,7 @@ from tzrec.constant import Mode
 from tzrec.datasets import sample_shuffle
 from tzrec.datasets.dataset import create_dataloader
 from tzrec.datasets.parquet_dataset import ParquetDataset, ParquetReader, ParquetWriter
-from tzrec.datasets.utils import CKPT_SOURCE_ID, DATA_TIMESTAMP
+from tzrec.datasets.utils import CKPT_ROW_IDX, CKPT_SOURCE_ID, DATA_TIMESTAMP
 from tzrec.features.feature import create_features
 from tzrec.protos import data_pb2, feature_pb2
 from tzrec.tests.utils import (
@@ -41,6 +42,7 @@ from tzrec.tests.utils import (
     sample_data_config,
     stop_sample,
 )
+from tzrec.tools.create_parquet_row_plan import create_row_plan
 from tzrec.utils import misc_util
 from tzrec.utils.checkpoint_util import EPOCHS_COMPLETED, update_dataloder_state
 from tzrec.utils.test_util import ci_resources, make_test_dir, parameterized_name_func
@@ -477,6 +479,75 @@ class ParquetDatasetTest(unittest.TestCase):
 
 @ci_resources(split="case", timeout=600)
 class ParquetReaderTest(unittest.TestCase):
+    def test_row_plan_resume_preserves_worker_order_and_tail(self):
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir, True)
+        path = os.path.join(test_dir, "data.parquet")
+        plan = os.path.join(test_dir, "plan.npz")
+        parquet.write_table(pa.table({"id": list(range(43))}), path, row_group_size=5)
+        create_row_plan(path, np.arange(43), 4, 1, 3, plan)
+        reader = ParquetReader(path, 4, row_plan_path=plan)
+
+        def batches(state):
+            reader.load_state_dict(state)
+            streams = [reader._planned_batches(worker, 3) for worker in range(3)]
+            return [
+                b
+                for group in itertools.zip_longest(*streams)
+                for b in group
+                if b is not None
+            ]
+
+        full = batches(None)
+        self.assertEqual(
+            sorted(x for b in full for x in b["id"].to_pylist()), list(range(43))
+        )
+        for cut in range(len(full) + 1):
+            state = {
+                b[CKPT_SOURCE_ID][0].as_py(): b[CKPT_ROW_IDX][-1].as_py()
+                for b in full[:cut]
+            }
+            restored = batches(state)
+            self.assertEqual(len(restored), len(full) - cut)
+            self.assertTrue(all(a.equals(b) for a, b in zip(restored, full[cut:])))
+        with self.assertRaisesRegex(ValueError, "worker count"):
+            list(reader._planned_batches(0, 1))
+        reader.load_state_dict({"other_plan": 3})
+        with self.assertRaisesRegex(ValueError, "changed since"):
+            list(reader.to_batches(0, 3, 1))
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            ParquetReader(path, 8, row_plan_path=plan)
+        with self.assertRaisesRegex(ValueError, "shuffle=false"):
+            ParquetReader(path, 4, row_plan_path=plan, shuffle=True)
+        with self.assertRaisesRegex(ValueError, "drop_remainder=false"):
+            ParquetReader(path, 4, row_plan_path=plan, drop_remainder=True)
+        parquet.write_table(pa.table({"id": list(range(44))}), path)
+        with self.assertRaisesRegex(ValueError, "row counts changed"):
+            ParquetReader(path, 4, row_plan_path=plan)
+
+    def test_row_plan_preserves_global_batches_and_balances_cost(self):
+        test_dir = make_test_dir()
+        self.addCleanup(shutil.rmtree, test_dir, True)
+        path = os.path.join(test_dir, "data.parquet")
+        plan = os.path.join(test_dir, "plan.npz")
+        parquet.write_table(pa.table({"id": list(range(96))}), path)
+        costs = np.arange(96) + 1
+        create_row_plan(path, costs, 4, 2, 1, plan)
+        with np.load(plan) as data:
+            balanced = data["balanced"]
+        for step, rows in enumerate(balanced):
+            original = np.stack(
+                (
+                    np.arange(step * 4, step * 4 + 4),
+                    np.arange(48 + step * 4, 52 + step * 4),
+                )
+            )
+            np.testing.assert_array_equal(
+                np.sort(rows.reshape(-1)), np.sort(original.reshape(-1))
+            )
+            self.assertLess(np.ptp(costs[rows].sum(1)), np.ptp(costs[original].sum(1)))
+        np.testing.assert_array_equal(np.sort(balanced.reshape(-1)), np.arange(96))
+
     def setUp(self):
         self.test_dir = make_test_dir()
 

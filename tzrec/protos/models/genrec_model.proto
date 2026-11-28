@@ -44,4 +44,15 @@ message GenRecCausalLMModel {
 
     // Fuse rotary operations inside the MCore FlashAttention training backend.
     optional bool mcore_fused_rope = 4 [default = false];
+    // Reuse the prompt's static causal prefix within a packed FA3 batch.
+    optional bool mcore_share_batch_prefix = 5 [default = false];
+
+    // Evaluate final-layer attention and MLP only at supervised positions.
+    optional bool mcore_prune_final_layer = 6 [default = false];
+
+    // Preserve Transformer Engine FP32 RMSNorm forward with compute-dtype output and FA2 backward.
+    optional bool mcore_fused_norm = 7 [default = false];
+
+    // Use the MCore fused bias/dropout/residual operation.
+    optional bool mcore_fused_residual = 8 [default = false];
 }

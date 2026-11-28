@@ -50,6 +50,84 @@ from tzrec.protos.models.genrec_model_pb2 import (
 )
 
 
+class _GatherFP32Grad(torch.autograd.Function):
+    """Gather BF16 activations while accumulating repeated gradients in FP32."""
+
+    @staticmethod
+    def forward(ctx, value, indices):
+        """Preserve the original gather values without float intermediate copies."""
+        ctx.save_for_backward(indices)
+        ctx.shape = value.shape
+        return value.index_select(0, indices)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        """Sum repeated rows before rounding back to the activation dtype."""
+        (grad,) = grad_outputs
+        (indices,) = ctx.saved_tensors
+        result = torch.zeros(ctx.shape, dtype=torch.float32, device=grad.device)
+        result.index_add_(0, indices, grad.float())
+        return result.to(grad.dtype), None
+
+
+class _TENormOutput(torch.autograd.Function):
+    """Keep native FP32 RMSNorm math while selecting its output storage dtype."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        weight,
+        eps,
+        output_dtype,
+        forward_margin,
+        zero_centered,
+    ):
+        """Preserve native forward input and weight precision."""
+        from transformer_engine.pytorch.constants import TE_DType
+        from transformer_engine_torch import rmsnorm_fwd
+
+        flat = x.contiguous().view(-1, weight.numel())
+        output, _, rstdev = rmsnorm_fwd(
+            flat,
+            weight,
+            eps,
+            None,
+            None,
+            TE_DType[output_dtype],
+            forward_margin,
+            zero_centered,
+        )
+        ctx.save_for_backward(flat, weight, rstdev)
+        ctx.shape = x.shape
+        ctx.eps = eps
+
+        ctx.zero_centered = zero_centered
+        return output.view(x.shape)
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        """Read the upstream gradient directly and accumulate dx/dw in FP32."""
+        (grad,) = grad_outputs
+        x, weight, rstdev = ctx.saved_tensors
+        grad = grad.contiguous().view_as(x)
+        from flash_attn.ops.triton.layer_norm import _layer_norm_bwd
+
+        dx, dw = _layer_norm_bwd(
+            grad,
+            x,
+            weight,
+            None,
+            ctx.eps,
+            None,
+            rstdev,
+            is_rms_norm=True,
+            x_dtype=x.dtype,
+            zero_centered_weight=ctx.zero_centered,
+        )[:2]
+        return dx.view(ctx.shape), dw.view_as(weight), None, None, None, None
+
+
 @dataclass
 class _MultiTargetLayout:
     """Training-only SID branches that share each row's packed prompt prefix.
@@ -165,15 +243,21 @@ class _MCoreFlashAttention(torch.nn.Module):
     Args:
         config: MCore transformer configuration.
         attn_kernel: FA2 or FA3 implementation for the packed attention core.
+        fp32_kv_grad: accumulate repeated packed K/V gradients in FP32.
         **kwargs: attention construction arguments supplied by MCore.
     """
 
     def __init__(
-        self, config: Any, attn_kernel: str = "flash_attention_2", **kwargs: Any
+        self,
+        config: Any,
+        attn_kernel: str = "flash_attention_2",
+        fp32_kv_grad: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.dropout = config.attention_dropout
         self.attn_kernel = attn_kernel
+        self.fp32_kv_grad = fp32_kv_grad
         if attn_kernel == "flash_attention_3" and self.dropout != 0:
             raise ValueError("FlashAttention-3 requires attention_dropout=0.")
 
@@ -231,9 +315,35 @@ class _MCoreFlashAttention(torch.nn.Module):
             from flash_attn_3.flash_attn_interface import flash_attn_varlen_func
 
             layout = params.genrec_layout
+            self.scored_indices = None
+            if getattr(self, "score_final_queries", False) and layout is not None:
+                self.scored_indices = layout.score_indices.reshape(-1)
+                query = query.index_select(0, self.scored_indices)
+                indices = params.genrec_final_kv_indices
+                if self.fp32_kv_grad:
+                    key = _GatherFP32Grad.apply(key, indices)
+                    value = _GatherFP32Grad.apply(value, indices)
+                else:
+                    key = key.index_select(0, indices)
+                    value = value.index_select(0, indices)
+                return flash_attn_varlen_func(
+                    query.to(value.dtype),
+                    key.to(value.dtype),
+                    value,
+                    cu_seqlens_q=params.genrec_final_cu_q,
+                    cu_seqlens_k=params.genrec_final_cu_k,
+                    max_seqlen_q=layout.score_indices.shape[1],
+                    max_seqlen_k=params.max_seqlen_kv,
+                    causal=True,
+                    num_splits=1,
+                )
             if layout is not None:
-                key = key.index_select(0, layout.kv_indices)
-                value = value.index_select(0, layout.kv_indices)
+                if self.fp32_kv_grad:
+                    key = _GatherFP32Grad.apply(key, layout.kv_indices)
+                    value = _GatherFP32Grad.apply(value, layout.kv_indices)
+                else:
+                    key = key.index_select(0, layout.kv_indices)
+                    value = value.index_select(0, layout.kv_indices)
             return flash_attn_varlen_func(
                 query.to(value.dtype),
                 key.to(value.dtype),
@@ -323,6 +433,21 @@ class GenRecCausalLMModel(BaseGenRecModel):
             attn_kernel: attention implementation; MCore supports FA2 and FA3.
         """
         self._use_mcore = self._model_config.lm_backend == CausalLMConfig.MEGATRON_CORE
+        packed_optimizations = (
+            self._model_config.mcore_share_batch_prefix
+            or self._model_config.mcore_prune_final_layer
+        )
+        if packed_optimizations and (
+            not self._use_mcore or attn_kernel != "flash_attention_3"
+        ):
+            raise ValueError(
+                "Packed MCore optimizations require MEGATRON_CORE with FA3."
+            )
+        if (
+            self._model_config.mcore_fused_norm
+            or self._model_config.mcore_fused_residual
+        ) and not self._use_mcore:
+            raise ValueError("MCore fusion options require MEGATRON_CORE.")
         if not self._use_mcore:
             super().init_backbone(
                 hf_model_name_or_path, lm_parameter_dtype, attn_kernel
@@ -402,7 +527,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             use_cpu_initialization=True,
             gradient_accumulation_fusion=False,
             bias_activation_fusion=True,
-            bias_dropout_fusion=False,
+            bias_dropout_fusion=self._model_config.mcore_fused_residual,
         )
         spec = get_gpt_layer_with_transformer_engine_spec()
 
@@ -418,14 +543,40 @@ class GenRecCausalLMModel(BaseGenRecModel):
                 Transformer Engine RMSNorm preserving input and weight precision.
             """
             norm = cast(torch.nn.Module, TENorm(config, hidden_size, eps))
-            norm.forward = torch.autocast("cuda", enabled=False)(norm.forward)
+            if self._model_config.mcore_fused_norm:
+
+                def te_norm_output(x):
+                    """Preserve forward statistics and fuse the backward cast."""
+                    output_dtype = (
+                        torch.get_autocast_dtype("cuda")
+                        if torch.is_autocast_enabled()
+                        else x.dtype
+                    )
+                    stage = "forward" if torch.is_grad_enabled() else "inference"
+                    return _TENormOutput.apply(
+                        x,
+                        norm.weight,
+                        eps,
+                        output_dtype,
+                        cast(Dict[str, int], norm._sm_margins)[stage],
+                        norm.zero_centered_gamma,
+                    )
+
+                norm.forward = te_norm_output
+            else:
+                norm.forward = torch.autocast("cuda", enabled=False)(norm.forward)
             return norm
 
         spec.submodules.input_layernorm = build_norm
         spec.submodules.pre_mlp_layernorm = build_norm
         spec.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
         spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
-            module=_MCoreFlashAttention, params={"attn_kernel": attn_kernel}
+            module=_MCoreFlashAttention,
+            params={
+                "attn_kernel": attn_kernel,
+                "fp32_kv_grad": self._model_config.mcore_share_batch_prefix
+                or self._model_config.mcore_prune_final_layer,
+            },
         )
         if is_qwen3:
             from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
@@ -459,6 +610,21 @@ class GenRecCausalLMModel(BaseGenRecModel):
             hf_config.vocab_size, hf_config.hidden_size, dtype=config.params_dtype
         )
         self.lm.decoder = TransformerBlock(config, block_spec, pg_collection=groups)
+        self._prune_final_layer = self._model_config.mcore_prune_final_layer
+        if self._prune_final_layer:
+            last = self.lm.decoder.layers[-1]
+            core = last.self_attention.core_attention
+            core.score_final_queries = True
+            core.scored_indices = None
+            original_bda = last.attention_bda_and_cross_attention
+
+            def scored_attention_residual(output, residual, *args, **kwargs):
+                """Align the residual with the supervised attention queries."""
+                if core.scored_indices is not None:
+                    residual = residual.index_select(0, core.scored_indices)
+                return original_bda(output, residual, *args, **kwargs)
+
+            last.attention_bda_and_cross_attention = scored_attention_residual
         self.lm.output_layer = torch.nn.Linear(
             hf_config.hidden_size,
             hf_config.vocab_size,
@@ -518,7 +684,7 @@ class GenRecCausalLMModel(BaseGenRecModel):
             layout: optional shared-prefix target branches.
 
         Returns:
-            Hidden states in the original unique token order.
+            Hidden states in packed order, or supervised order when pruning.
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -536,6 +702,34 @@ class GenRecCausalLMModel(BaseGenRecModel):
             params.genrec_fused_rope_cos = cos[0, :, :half].contiguous()
             params.genrec_fused_rope_sin = sin[0, :, :half].contiguous()
         params.genrec_layout = layout
+        if self._prune_final_layer and layout is not None:
+            segments = torch.searchsorted(
+                layout.cu_seqlens_q[1:].long(),
+                layout.score_indices[:, -1].contiguous(),
+                right=True,
+            )
+            key_lengths = layout.cu_seqlens_k.long().diff()[segments] - 1
+            total_keys = int(key_lengths.sum())
+            cu_keys = torch.nn.functional.pad(key_lengths.cumsum(0), (1, 0))
+            key_segments = torch.repeat_interleave(
+                torch.arange(segments.numel(), device=embeds.device),
+                key_lengths,
+                output_size=total_keys,
+            )
+            offsets = (
+                torch.arange(total_keys, device=embeds.device) - cu_keys[key_segments]
+            )
+            old_positions = layout.cu_seqlens_k.long()[segments[key_segments]] + offsets
+            params.genrec_final_kv_indices = layout.kv_indices[old_positions]
+            params.genrec_final_cu_k = cu_keys.int()
+            params.genrec_final_cu_q = (
+                torch.arange(
+                    segments.numel() + 1,
+                    device=embeds.device,
+                    dtype=torch.int32,
+                )
+                * layout.score_indices.shape[1]
+            )
         return self.lm.decoder(
             hidden_states=embeds.unsqueeze(1),
             attention_mask=None,
@@ -594,6 +788,8 @@ class GenRecCausalLMModel(BaseGenRecModel):
             embeds.shape[0],
         )
         if self._use_mcore:
+            if self._model_config.mcore_share_batch_prefix:
+                embeds, layout = self._share_static_batch_prefix(embeds, infos, layout)
             hidden = self._mcore_hidden(
                 embeds,
                 layout.position_ids,
@@ -602,7 +798,11 @@ class GenRecCausalLMModel(BaseGenRecModel):
                 layout,
             )
             return {
-                "logits": self.lm.output_layer(hidden[layout.score_indices]),
+                "logits": self.lm.output_layer(
+                    hidden.view(*layout.score_indices.shape, -1)
+                    if self._prune_final_layer
+                    else hidden[layout.score_indices]
+                ),
                 "labels": infos[INPUT_IDS][layout.label_indices],
                 "target_weights": layout.target_weights,
             }
@@ -644,6 +844,52 @@ class GenRecCausalLMModel(BaseGenRecModel):
             "labels": infos[INPUT_IDS][layout.label_indices],
             "target_weights": layout.target_weights,
         }
+
+    def _share_static_batch_prefix(
+        self, embeds: torch.Tensor, infos: Dict[str, Any], layout: _MultiTargetLayout
+    ) -> Tuple[torch.Tensor, _MultiTargetLayout]:
+        """Reuse request-invariant causal prefix activations within this batch."""
+        prefix = self._prompt.prompt_plan.static_prefix_len
+        if prefix == 0:
+            return embeds, layout
+        cu = infos[CU_SEQLENS].long()
+        lengths = cu.diff()
+        rows = torch.repeat_interleave(
+            torch.arange(lengths.numel(), device=embeds.device),
+            lengths,
+            output_size=embeds.shape[0],
+        )
+        offsets = torch.arange(embeds.shape[0], device=embeds.device) - cu[rows]
+        keep = ((rows == 0) | (offsets >= prefix)).nonzero().flatten()
+        mapping = torch.where(
+            offsets < prefix,
+            offsets,
+            torch.arange(embeds.shape[0], device=embeds.device) - rows * prefix,
+        )
+        counts = (infos[RESPONSE_LENGTHS] // self._prompt.sid_space.num_levels).clamp(
+            min=1
+        )
+        first_segments = counts.cumsum(0) - counts
+        query_lengths = layout.cu_seqlens_q.long().diff()
+        query_lengths[first_segments.long()] -= prefix
+        query_lengths = torch.cat((query_lengths.new_tensor([prefix]), query_lengths))
+        key_lengths = torch.cat(
+            (query_lengths.new_tensor([prefix]), layout.cu_seqlens_k.long().diff())
+        )
+        compact = _MultiTargetLayout(
+            position_ids=layout.position_ids[keep],
+            cu_seqlens_q=torch.nn.functional.pad(query_lengths.cumsum(0), (1, 0)).int(),
+            cu_seqlens_k=torch.nn.functional.pad(key_lengths.cumsum(0), (1, 0)).int(),
+            kv_indices=torch.cat(
+                (torch.arange(prefix, device=embeds.device), mapping[layout.kv_indices])
+            ),
+            max_seqlen=layout.max_seqlen,
+            label_indices=layout.label_indices,
+            score_indices=mapping[layout.score_indices],
+            target_weights=layout.target_weights,
+            token_targets=layout.token_targets[keep],
+        )
+        return embeds.index_select(0, keep), compact
 
     def _build_multi_target_layout(
         self,

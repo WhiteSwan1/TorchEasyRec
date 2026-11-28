@@ -10,6 +10,7 @@
 # limitations under the License.
 
 
+import hashlib
 import os
 import sys
 import time
@@ -17,6 +18,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import pyarrow as pa
 from pyarrow import parquet
 from torch import distributed as dist
@@ -115,6 +117,55 @@ def _get_metadata(input_file: str) -> Tuple[str, parquet.FileMetaData]:
     return input_file, metadata
 
 
+class _IndexedParquetRows:
+    """Gather original rows with a bounded cache of decoded parquet row groups."""
+
+    def __init__(self, paths, metadata, columns=None, cache_bytes=512 * 2**20):
+        """Index row groups without decoding the original wide table."""
+        self.columns = columns
+        self.cache_bytes = cache_bytes
+        self.cache = OrderedDict()
+        self.cached_bytes = 0
+        self.groups = []
+        starts = []
+        cursor = 0
+        for path in paths:
+            meta = metadata[path]
+            for group in range(meta.num_row_groups):
+                starts.append(cursor)
+                self.groups.append((path, group))
+                cursor += meta.row_group(group).num_rows
+        self.starts = np.asarray(starts, dtype=np.int64)
+        self.ends = np.r_[self.starts[1:], cursor]
+
+    def take(self, row_ids):
+        """Return requested rows in exact plan order, including repeated IDs."""
+        row_ids = np.asarray(row_ids, dtype=np.int64)
+        assert len(row_ids) and row_ids.min() >= 0 and row_ids.max() < self.ends[-1]
+        group_ids = np.searchsorted(self.ends, row_ids, side="right")
+        order = np.argsort(group_ids, kind="stable")
+        sorted_groups = group_ids[order]
+        boundaries = np.r_[0, np.flatnonzero(np.diff(sorted_groups)) + 1, len(order)]
+        parts = []
+        for begin, end in zip(boundaries[:-1], boundaries[1:]):
+            group_id = int(sorted_groups[begin])
+            table = self.cache.pop(group_id, None)
+            if table is None:
+                path, group = self.groups[group_id]
+                with parquet.ParquetFile(path) as source:
+                    table = source.read_row_group(
+                        group, columns=self.columns, use_threads=False
+                    )
+                self.cached_bytes += table.nbytes
+            self.cache[group_id] = table
+            while self.cached_bytes > self.cache_bytes and self.cache:
+                _, evicted = self.cache.popitem(last=False)
+                self.cached_bytes -= evicted.nbytes
+            local_ids = row_ids[order[begin:end]] - self.starts[group_id]
+            parts.append(table.take(pa.array(local_ids)))
+        return pa.concat_tables(parts).take(pa.array(np.argsort(order)))
+
+
 class ParquetDataset(BaseDataset):
     """Dataset for reading data with parquet format.
 
@@ -133,6 +184,15 @@ class ParquetDataset(BaseDataset):
     ) -> None:
         super().__init__(data_config, features, input_path, **kwargs)
         # pyre-ignore [29]
+        row_plan = (
+            self._data_config.parquet_row_plan_path if self._mode == Mode.TRAIN else ""
+        )
+        if row_plan and (
+            not self._data_config.in_order or self._data_config.shuffle_mode != "BATCH"
+        ):
+            raise ValueError(
+                "Parquet row plans require in_order=true and shuffle_mode=BATCH."
+            )
         self._reader = ParquetReader(
             input_path,
             self._batch_size,
@@ -144,6 +204,7 @@ class ParquetDataset(BaseDataset):
             batch_cost_size=self._data_config.batch_cost_size,
             min_batch_size=self._min_batch_size,
             equalize_rank_steps=self._mode != Mode.PREDICT,
+            row_plan_path=row_plan,
         )
 
 
@@ -162,6 +223,7 @@ class ParquetReader(BaseReader):
         batch_cost_size (int): batch cost limit size.
         min_batch_size (int): drop a final batch with fewer rows, 0 disables.
         equalize_rank_steps (bool): make every rank yield the same number of batches.
+        row_plan_path (str): optional fixed-count length-balanced row assignment.
     """
 
     def __init__(
@@ -175,6 +237,7 @@ class ParquetReader(BaseReader):
         rebalance: bool = True,
         sample_cost_field: Optional[str] = None,
         batch_cost_size: Optional[int] = None,
+        row_plan_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -236,6 +299,75 @@ class ParquetReader(BaseReader):
 
             for input_file in self._input_files:
                 self._num_rows.append(self._parquet_metas[input_file].num_rows)
+
+        self._row_assignment = None
+        self._row_plan_hash = ""
+        self._row_plan_workers = 0
+        if row_plan_path:
+            if shuffle or self._use_sample_cost or not rebalance:
+                raise ValueError(
+                    "Row plans require fixed batches, rebalance=true and shuffle=false."
+                )
+            if self._min_batch_size:
+                raise ValueError(
+                    "Row plans require min_batch_size=0 and drop_remainder=false."
+                )
+            with open(row_plan_path, "rb") as stream:
+                self._row_plan_hash = hashlib.sha256(stream.read()).hexdigest()
+            with np.load(row_plan_path, allow_pickle=False) as plan:
+                if (
+                    plan["input_files"].tolist() != self._input_files
+                    or plan["num_rows"].tolist() != self._num_rows
+                ):
+                    raise ValueError(
+                        "Parquet row plan input files or row counts changed."
+                    )
+                self._row_assignment = plan["balanced"]
+                self._row_plan_workers = int(plan["num_workers"])
+            if self._row_assignment.shape[1:] != (world_size, batch_size):
+                raise ValueError("Parquet row plan world size or batch size changed.")
+
+    def _planned_batches(
+        self, worker_id: int, num_workers: int
+    ) -> Iterator[pa.RecordBatch]:
+        """Read planned rows using checkpoint offsets in each logical worker stream."""
+        assignment = self._row_assignment
+        local_workers = num_workers // self._world_size
+        if local_workers != self._row_plan_workers:
+            raise ValueError("Parquet row plan worker count changed.")
+        rank, local_worker = divmod(worker_id, local_workers)
+        prefix = f"parquet_plan:{self._row_plan_hash}:workers={num_workers}:"
+        state = self._checkpoint_state or {}
+        if any(not key.startswith(prefix) for key in state):
+            raise ValueError("Parquet row plan changed since the checkpoint.")
+        consumed_steps = sum(
+            (
+                state.get(f"{prefix}worker={rank * local_workers + w}", -1)
+                + self._batch_size
+            )
+            // self._batch_size
+            for w in range(local_workers)
+        )
+        local_worker = (local_worker + consumed_steps) % local_workers
+        source_id = f"{prefix}worker={rank * local_workers + local_worker}"
+        rows = assignment[local_worker::local_workers, rank].reshape(-1)
+        rows = rows[rows >= 0]
+        start = state.get(source_id, -1) + 1
+        if start == len(rows):
+            return
+        if start < 0 or start > len(rows) or start % self._batch_size:
+            raise ValueError("Invalid Parquet row-plan checkpoint offset.")
+        source = _IndexedParquetRows(
+            self._input_files, self._parquet_metas, self._ordered_cols
+        )
+        for offset in range(start, len(rows), self._batch_size):
+            table = source.take(
+                rows[offset : offset + self._batch_size]
+            ).combine_chunks()
+            batch, _ = inject_checkpoint_metadata(
+                table.to_batches()[0], source_id, offset
+            )
+            yield batch
 
     @property
     def schema(self) -> pa.Schema:
@@ -305,6 +437,12 @@ class ParquetReader(BaseReader):
     ) -> Iterator[Dict[str, pa.Array]]:
         """Get batch iterator."""
         if len(self._input_files) == 0:
+            return
+
+        if self._row_assignment is not None:
+            yield from self._arrow_reader_iter(
+                self._planned_batches(worker_id, num_workers)
+            )
             return
 
         worker_intervals = [(0, sys.maxsize)]
