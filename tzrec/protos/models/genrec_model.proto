@@ -55,4 +55,7 @@ message GenRecCausalLMModel {
 
     // Use the MCore fused bias/dropout/residual operation.
     optional bool mcore_fused_residual = 8 [default = false];
+
+    // Experimental E4M3 current-scaling FP8 for MLP GEMMs; changes numerics.
+    optional bool mcore_mlp_fp8 = 9 [default = false];
 }

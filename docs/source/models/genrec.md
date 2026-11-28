@@ -235,6 +235,12 @@ python -m tzrec.tools.create_parquet_row_plan \
 
 模型自动计算交叉熵损失 `ce_loss`，并在评估时输出同名指标，无需额外声明 `model_config.losses` 或 `metrics`。召回的 HitRate、Recall 等指标需将预测 SID 映射为物品后，与真实物品另行计算。
 
+### 实验性 MLP FP8
+
+在 `genrec_causal_lm_model` 中设置 `mcore_mlp_fp8: true`，可仅对 MCore MLP 的两个线性层使用 Transformer Engine 的 E4M3 current scaling FP8。默认关闭；使用时保持 `train_config.mixed_precision: "BF16"`。注意力、Norm、参数 dtype、稀疏参数和框架优化器仍沿用原配置，支持与上述紧凑计算选项组合。该选项使用 Transformer Engine 2.21 的接口，要求设备支持 FP8。
+
+FP8 会引入量化偏差，并非无损加速。量化缩放依赖当前线性层输入，batch 组成可能影响数值；多目标 attention 的边界和标签不变。开启前需单独验证 loss、梯度和业务指标，短期吞吐提升不能证明训练效果一致。checkpoint 参数名称、形状以及 HF 权重导出映射不变；关闭此选项可恢复原有 BF16 计算路径。
+
 ## 模型输出
 
 默认输出列 `generated_sids` 的每行形状为 `(实际返回数量, 码本层数)`，实际返回数量不超过末层配置宽度和候选池容量，各 SID 按预测得分从高到低排列。例如 `[[3, 5, 7], [8, 4, 12], ...]`。**输出是每层从 0 开始的编码**，应与最终 SID 映射表的 `codebook` 列对齐；若使用 `offset_codebook` 做关联，需先加回层偏移。

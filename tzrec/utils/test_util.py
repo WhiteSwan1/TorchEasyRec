@@ -500,6 +500,7 @@ def create_genrec_test_model(
     lm_backend: "GenRecCausalLMModel.LMBackend" = GenRecCausalLMModel.HUGGING_FACE,
     mcore_fused_rope: bool = False,
     mcore_compact_training: bool = False,
+    mcore_mlp_fp8: bool = False,
 ) -> Tuple[BaseModel, CompiledPrompt]:
     """Build a GenRecCausalLMModel over a tiny backbone and a compiled prompt.
 
@@ -523,6 +524,7 @@ def create_genrec_test_model(
         lm_backend (int): causal LM compute backend.
         mcore_fused_rope (bool): enable fused rotary in the MCore backend.
         mcore_compact_training (bool): enable packed compute and Norm/residual fusion.
+        mcore_mlp_fp8 (bool): enable experimental FP8 MLP computation.
 
     Returns:
         Tuple[BaseModel, CompiledPrompt]: the model and the prompt it was built on.
@@ -545,6 +547,7 @@ def create_genrec_test_model(
     lm_config.mcore_prune_final_layer = mcore_compact_training
     lm_config.mcore_fused_norm = mcore_compact_training
     lm_config.mcore_fused_residual = mcore_compact_training
+    lm_config.mcore_mlp_fp8 = mcore_mlp_fp8
     lm_config.common.beam_widths.extend(beam_widths)
     if lm_parameter_dtype is not None:
         lm_config.common.lm_parameter_dtype = lm_parameter_dtype

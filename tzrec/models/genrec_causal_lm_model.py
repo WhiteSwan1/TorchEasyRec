@@ -22,6 +22,7 @@ not supported; Qwen2.5/Qwen3 are what CI covers.
 """
 
 from dataclasses import dataclass
+from math import prod
 from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
@@ -48,6 +49,38 @@ from tzrec.protos.models.genrec_model_pb2 import (
 from tzrec.protos.models.genrec_model_pb2 import (
     GenRecModelConfig,
 )
+
+
+def _enable_mlp_fp8(linear: torch.nn.Module) -> None:
+    """Use current-scaling FP8 only inside one MLP linear operation.
+
+    Args:
+        linear: MCore Transformer Engine linear with framework-owned parameters.
+    """
+    from transformer_engine.common.recipe import Float8CurrentScaling, Format
+    from transformer_engine.pytorch import fp8_autocast
+
+    recipe = Float8CurrentScaling(fp8_format=Format.E4M3)
+    original_forward = linear.forward
+    # TorchRec owns updates and does not drive MCore's weight-cache lifecycle.
+    linear.disable_parameter_transpose_cache = True
+
+    def fp8_forward(value: torch.Tensor) -> Tuple[torch.Tensor, Any]:
+        """Pad token rows for FP8 GEMMs without changing attention boundaries."""
+        shape = value.shape
+        rows = prod(shape[:-1])
+        padding = -rows % 16
+        if padding:
+            value = torch.nn.functional.pad(
+                value.reshape(rows, shape[-1]), (0, 0, 0, padding)
+            )
+        with fp8_autocast(enabled=True, fp8_recipe=recipe):
+            output, bias = original_forward(value)
+        if padding:
+            output = output[:rows].reshape(*shape[:-1], output.shape[-1])
+        return output, bias
+
+    linear.forward = fp8_forward
 
 
 class _GatherFP32Grad(torch.autograd.Function):
@@ -446,8 +479,9 @@ class GenRecCausalLMModel(BaseGenRecModel):
         if (
             self._model_config.mcore_fused_norm
             or self._model_config.mcore_fused_residual
+            or self._model_config.mcore_mlp_fp8
         ) and not self._use_mcore:
-            raise ValueError("MCore fusion options require MEGATRON_CORE.")
+            raise ValueError("MCore compute options require MEGATRON_CORE.")
         if not self._use_mcore:
             super().init_backbone(
                 hf_model_name_or_path, lm_parameter_dtype, attn_kernel
@@ -610,6 +644,10 @@ class GenRecCausalLMModel(BaseGenRecModel):
             hf_config.vocab_size, hf_config.hidden_size, dtype=config.params_dtype
         )
         self.lm.decoder = TransformerBlock(config, block_spec, pg_collection=groups)
+        if self._model_config.mcore_mlp_fp8:
+            for layer in self.lm.decoder.layers:
+                _enable_mlp_fp8(layer.mlp.linear_fc1)
+                _enable_mlp_fp8(layer.mlp.linear_fc2)
         self._prune_final_layer = self._model_config.mcore_prune_final_layer
         if self._prune_final_layer:
             last = self.lm.decoder.layers[-1]

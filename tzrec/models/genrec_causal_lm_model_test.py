@@ -762,16 +762,20 @@ class MCoreCausalLMTest(unittest.TestCase):
 
     @parameterized.expand(
         [
-            [fused, kernel, compact]
+            [fused, kernel, compact, False]
             for fused in (False, True)
             for kernel in ("flash_attention_2", "flash_attention_3")
             for compact in (False, True)
             if not compact or (kernel == "flash_attention_3" and fused)
+        ]
+        + [
+            [True, "flash_attention_2", False, True],
+            [True, "flash_attention_3", True, True],
         ],
         name_func=parameterized_name_func,
     )
     def test_sparse_projection_and_decoder_update_together(
-        self, fused_rope, attn_kernel, compact
+        self, fused_rope, attn_kernel, compact, mlp_fp8
     ) -> None:
         if (
             attn_kernel == "flash_attention_3"
@@ -790,6 +794,7 @@ class MCoreCausalLMTest(unittest.TestCase):
             lm_backend=CausalLMConfig.MEGATRON_CORE,
             mcore_fused_rope=fused_rope,
             mcore_compact_training=compact,
+            mcore_mlp_fp8=mlp_fp8,
         )
         init_parameters(model, torch.device("cpu"))
         model.init_from_pretrained()
@@ -823,6 +828,57 @@ class MCoreCausalLMTest(unittest.TestCase):
                 any(not torch.equal(value, before[key]) for key, value in parameters),
                 prefix,
             )
+
+    def test_fp8_requires_mcore(self) -> None:
+        with self.assertRaisesRegex(ValueError, "require MEGATRON_CORE"):
+            create_genrec_test_model(self.test_dir, mcore_mlp_fp8=True)
+
+    @parameterized.expand([["qwen2"], ["qwen3"]], name_func=parameterized_name_func)
+    def test_fp8_updated_weights_export_and_reload(self, model_type) -> None:
+        model, compiled = create_genrec_test_model(
+            self.test_dir,
+            attn_kernel="flash_attention_2",
+            lm_backend=CausalLMConfig.MEGATRON_CORE,
+            model_type=model_type,
+            mcore_mlp_fp8=True,
+        )
+        model = model.cuda().train()
+        batch = _packed_batch(
+            compiled,
+            _TWO_ROWS[0],
+            [GENREC_ANSWER_CODES + _OTHERGENREC_ANSWER_CODES, GENREC_ANSWER_CODES],
+        ).to(torch.device("cuda"))
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        for _ in range(2):
+            optimizer.zero_grad()
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss = model.loss(model.predict(batch), batch)["ce_loss"]
+            self.assertTrue(torch.isfinite(loss))
+            loss.backward()
+            optimizer.step()
+        exported = convert_qwen_mcore_state(
+            model.lm.state_dict(), model.lm.config, to_mcore=False
+        )
+        self.assertTrue(
+            all(value.dtype == torch.float32 for value in exported.values())
+        )
+        restored, _ = create_genrec_test_model(
+            self.test_dir,
+            attn_kernel="flash_attention_2",
+            lm_backend=CausalLMConfig.MEGATRON_CORE,
+            model_type=model_type,
+            mcore_mlp_fp8=True,
+        )
+        restored.load_hf_state_dict(exported)
+        restored = restored.cuda().eval()
+        for key, parameter in model.lm.named_parameters():
+            torch.testing.assert_close(
+                parameter, restored.lm.get_parameter(key), atol=0, rtol=0
+            )
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            actual = model.eval().predict(batch)["logits"]
+            expected = restored.predict(batch)["logits"]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
